@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Runtime artifacts
+out/
+*_backup_*.xls
+*_vba.txt
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/

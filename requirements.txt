@@ -1,0 +1,5 @@
+xlrd==2.0.2
+xlwt==1.3.0
+xlutils==2.0.0
+# Optional on Windows for full Excel/Word automation:
+# pywin32>=306
