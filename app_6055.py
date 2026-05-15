@@ -3,6 +3,7 @@ import argparse
 import datetime as dt
 import os
 import platform
+import subprocess
 import re
 import shutil
 import sys
@@ -286,146 +287,816 @@ def windows_transfer_all(source_6055: Path, moto_template: Path, dogovir_templat
             pass
 
 
+FIELD_SECTIONS = [
+    (
+        "Документ",
+        [
+            ("A3", "Номер і дата", True),
+            ("A51", "Дата набуття права", False),
+            ("C47", "Митна декларація", False),
+        ],
+    ),
+    (
+        "Покупець",
+        [
+            ("C15", "ПІБ покупця", True),
+            ("E15", "ПІБ скорочено", False),
+            ("C12", "Дата народження", False),
+            ("C16", "Адреса", True),
+            ("C17", "Паспорт", True),
+            ("C18", "ІПН / код", True),
+        ],
+    ),
+    (
+        "Транспорт 1",
+        [
+            ("C20", "Марка, модель", True),
+            ("C21", "Тип ТЗ", False),
+            ("C22", "Призначення", False),
+            ("C25", "Категорія", False),
+            ("C26", "Тип кузова", False),
+            ("C27", "Паливо", False),
+            ("C28", "Колір", True),
+            ("C29", "Рік випуску", True),
+            ("C30", "Повна маса", False),
+            ("C31", "Маса без навантаження", False),
+            ("C33", "Кількість місць", False),
+        ],
+    ),
+    (
+        "Транспорт 2",
+        [
+            ("C35", "Кількість циліндрів", False),
+            ("C36", "Об'єм двигуна", True),
+            ("C37", "Потужність кВт", False),
+            ("C39", "VIN / номер рами", True),
+            ("C41", "Номер двигуна", True),
+            ("C42", "Номер шасі", True),
+            ("C43", "Номер рами", True),
+            ("C44", "Ціна без ПДВ", True),
+            ("C45", "ПДВ", True),
+            ("C46", "Ціна з ПДВ", True),
+            ("C50", "Номерні знаки", False),
+        ],
+    ),
+    (
+        "Додатково",
+        [
+            ("C23", "Сертифікат відповідності", False),
+            ("C24", "Номер сертифіката типу", False),
+            ("C32", "Кількість дверей", False),
+            ("C34", "Кількість стоячих місць", False),
+            ("C38", "Потужність к.с.", False),
+            ("C40", "Номер кузова", False),
+            ("C48", "Акт приймання-передачі", False),
+            ("C49", "Свідоцтво про реєстрацію", False),
+            ("C51", "Дата набуття права", False),
+            ("C53", "Висновок", False),
+            ("A56", "Продавець", False),
+            ("D56", "Покупець (підпис)", False),
+        ],
+    ),
+]
+
+
+def iter_field_specs():
+    for group_name, fields in FIELD_SECTIONS:
+        for cell, label, required in fields:
+            yield group_name, cell, label, required
+
+
+FORM_CELLS = [cell for _, cell, _, _ in iter_field_specs()]
+
+
+def safe_read_cell(sheet, addr: str):
+    try:
+        r, c = a1_to_rc(addr)
+        if r < 0 or c < 0 or r >= sheet.nrows or c >= sheet.ncols:
+            return ""
+        value = sheet.cell_value(r, c)
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        return value
+    except Exception:
+        return ""
+
+
+def load_form_state(source_path: Path) -> Dict[str, str]:
+    wb = xlrd.open_workbook(str(source_path), formatting_info=False)
+    sh = wb.sheet_by_name("Worksheet")
+    state: Dict[str, str] = {}
+    for cell in FORM_CELLS:
+        state[cell] = str(safe_read_cell(sh, cell)).strip()
+    if not state.get("E15"):
+        state["E15"] = short_name(state.get("C15", ""))
+    return state
+
+
+def parse_state(state: Dict[str, str]) -> Dict[str, str]:
+    payload = dict(state)
+    number, date_txt = split_number_date(payload.get("A3", ""))
+    payload["Number"] = number
+    payload["Data"] = date_txt
+    payload["FIO"] = payload.get("C15", "")
+    payload["FIO2"] = payload.get("C15", "")
+    payload["TaxNumber"] = payload.get("C18", "")
+    payload["BirthDay"] = payload.get("C12", "")
+    payload["adres"] = payload.get("C16", "")
+    payload["decl"] = payload.get("C47", "")
+    payload["model"] = payload.get("C20", "")
+    payload["year"] = payload.get("C29", "")
+    payload["color"] = payload.get("C28", "")
+    payload["numberdv"] = payload.get("C41", "")
+    payload["cuzov"] = payload.get("C39", "") or payload.get("C42", "") or payload.get("C43", "")
+    payload["cub"] = payload.get("C36", "")
+    payload["znak"] = payload.get("C50", "")
+    payload["price"] = payload.get("C46", "")
+    payload["sumtext"] = amount_to_words_uah(payload.get("C46", ""))
+    payload["fio_short"] = short_name(payload.get("C15", ""))
+    return payload
+
+
+def amount_to_words_uah(value) -> str:
+    try:
+        amount = int(float(str(value).replace(",", ".")))
+    except Exception:
+        return ""
+
+    if amount <= 0:
+        return "нуль грн. 00 коп."
+
+    ones = ["", "один", "два", "три", "чотири", "п'ять", "шість", "сім", "вісім", "дев'ять"]
+    ones_f = ["", "одна", "дві", "три", "чотири", "п'ять", "шість", "сім", "вісім", "дев'ять"]
+    teens = ["десять", "одинадцять", "дванадцять", "тринадцять", "чотирнадцять", "п'ятнадцять", "шістнадцять", "сімнадцять", "вісімнадцять", "дев'ятнадцять"]
+    tens = ["", "", "двадцять", "тридцять", "сорок", "п'ятдесят", "шістдесят", "сімдесят", "вісімдесят", "дев'яносто"]
+    hundreds = ["", "сто", "двісті", "триста", "чотириста", "п'ятсот", "шістсот", "сімсот", "вісімсот", "дев'ятсот"]
+
+    def triad_words(num: int, feminine: bool = False) -> str:
+        if num == 0:
+            return ""
+        parts = []
+        h = num // 100
+        t = (num // 10) % 10
+        u = num % 10
+        if h:
+            parts.append(hundreds[h])
+        if t == 1:
+            parts.append(teens[u])
+        else:
+            if t:
+                parts.append(tens[t])
+            if u:
+                parts.append((ones_f if feminine else ones)[u])
+        return " ".join([p for p in parts if p])
+
+    groups = [
+        (amount % 1000, False, ""),
+        ((amount // 1000) % 1000, True, "тисяч"),
+        ((amount // 1000000) % 1000, False, "мільйонів"),
+    ]
+
+    chunks = []
+    for idx, (value_part, feminine, suffix) in enumerate(groups):
+        if not value_part:
+            continue
+        text = triad_words(value_part, feminine=feminine)
+        if idx == 1:
+            last_two = value_part % 100
+            last = value_part % 10
+            if 10 < last_two < 20:
+                suffix = "тисяч"
+            elif last == 1:
+                suffix = "тисяча"
+            elif last in (2, 3, 4):
+                suffix = "тисячі"
+            else:
+                suffix = "тисяч"
+        elif idx == 2:
+            last_two = value_part % 100
+            last = value_part % 10
+            if 10 < last_two < 20:
+                suffix = "мільйонів"
+            elif last == 1:
+                suffix = "мільйон"
+            elif last in (2, 3, 4):
+                suffix = "мільйона"
+            else:
+                suffix = "мільйонів"
+        if suffix:
+            chunks.append(f"{text} {suffix}".strip())
+        else:
+            chunks.append(text)
+
+    return " ".join(reversed([chunk for chunk in chunks if chunk])).strip() + " грн. 00 коп."
+
+
+def validate_state(state: Dict[str, str]) -> Tuple[Dict[str, str], list[str], list[str]]:
+    payload = parse_state(state)
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    required = [cell for _, cell, _, req in iter_field_specs() if req]
+    for cell in required:
+        if not str(state.get(cell, "")).strip():
+            errors.append(f"{cell} порожнє")
+
+    if not payload["Number"] or not payload["Data"]:
+        errors.append("A3 не парситься як номер + дата")
+
+    frame_values = [str(state.get(c, "")).strip() for c in ("C39", "C42", "C43") if str(state.get(c, "")).strip()]
+    if len(set(frame_values)) > 1:
+        warnings.append("C39 / C42 / C43 не збігаються")
+
+    if payload.get("C41") and len(payload["C41"].strip()) < 4:
+        warnings.append("Номер двигуна схожий на короткий або неповний")
+
+    if payload.get("C28") and payload["C28"].strip().isdigit():
+        warnings.append("Колір виглядає як число")
+
+    if payload.get("C29"):
+        try:
+            year = int(str(payload["C29"]).strip())
+            if year < 1900 or year > dt.datetime.now().year + 1:
+                warnings.append("Рік випуску поза нормальним діапазоном")
+        except Exception:
+            warnings.append("Рік випуску не є числом")
+
+    if payload.get("C46"):
+        try:
+            float(str(payload["C46"]).replace(",", "."))
+        except Exception:
+            errors.append("C46 не є числом")
+
+    return payload, errors, warnings
+
+
+def preview_text_for_act(payload: Dict[str, str]) -> str:
+    return "\n".join([
+        "ЧОРНОВИК АКТА 6055",
+        "",
+        f"Номер: {payload.get('Number', '')}",
+        f"Дата: {payload.get('Data', '')}",
+        f"Покупець: {payload.get('C15', '')}",
+        f"Адреса: {payload.get('C16', '')}",
+        f"Паспорт: {payload.get('C17', '')}",
+        f"ІПН / код: {payload.get('C18', '')}",
+        f"Модель: {payload.get('C20', '')}",
+        f"Рік: {payload.get('C29', '')}",
+        f"Рама / VIN: {payload.get('cuzov', '')}",
+        f"Колір: {payload.get('C28', '')}",
+        f"Скорочений ПІБ: {payload.get('fio_short', '')}",
+    ])
+
+
+def preview_text_for_contract(payload: Dict[str, str]) -> str:
+    lines = ["ЧОРНОВИК ДОГОВОРУ", ""]
+    for key in [
+        ("Number", "Number"),
+        ("Data", "Data"),
+        ("FIO", "FIO"),
+        ("pasport", "pasport"),
+        ("TaxNumber", "TaxNumber"),
+        ("BirthDay", "BirthDay"),
+        ("adres", "adres"),
+        ("decl", "decl"),
+        ("model", "model"),
+        ("year", "year"),
+        ("color", "color"),
+        ("numberdv", "numberdv"),
+        ("cuzov", "cuzov"),
+        ("cub", "cub"),
+        ("znak", "znak"),
+        ("price", "price"),
+        ("sumtext", "sumtext"),
+        ("FIO2", "FIO2"),
+    ]:
+        lines.append(f"{key[0]}: {payload.get(key[1], '')}")
+    return "\n".join(lines)
+
+
+def preview_text_for_vidatkova(payload: Dict[str, str]) -> str:
+    return "\n".join([
+        "ЧОРНОВИК ВИДАТКОВОЇ",
+        "",
+        f"Одержувач: {payload.get('C15', '')}",
+        f"Дата / номер: {payload.get('A3', '')}",
+        f"Марка, модель: {payload.get('C20', '')}",
+        f"Номер рами: {payload.get('cuzov', '')}",
+        f"Ціна без ПДВ: {payload.get('C44', '')}",
+        f"ПДВ: {payload.get('C45', '')}",
+        f"Всього: {payload.get('C46', '')}",
+        f"Сума прописом: {payload.get('sumtext', '')}",
+    ])
+
+
+def generate_act_xls_from_state(state: Dict[str, str], moto_template: Path, out_path: Path) -> Path:
+    payload = parse_state(state)
+    shutil.copy2(moto_template, out_path)
+    updates = {
+        "B12": payload["Number"],
+        "L12": payload["Data"],
+        "H18": payload["FIO"],
+        "C24": payload["model"],
+        "E24": payload["year"],
+        "H24": payload["cuzov"],
+        "K24": payload["color"],
+        "N33": payload["fio_short"],
+    }
+    write_xls_cells(out_path, "Worksheet", updates, backup=False)
+    return out_path
+
+
+def generate_vidatkova_xls_from_state(state: Dict[str, str], template_path: Path, out_path: Path) -> Path:
+    payload = parse_state(state)
+    shutil.copy2(template_path, out_path)
+    updates = {
+        "C6": payload["FIO"],
+        "C7": "той самий",
+        "G9": payload["A3"],
+        "D10": payload["A3"],
+        "B13": payload.get("C21", "МОПЕД"),
+        "C13": payload["model"],
+        "D13": payload["cuzov"],
+        "E13": "шт",
+        "F13": 1,
+        "G13": payload.get("C44", ""),
+        "H13": payload.get("C44", ""),
+        "H15": payload.get("C44", ""),
+        "H16": payload.get("C45", ""),
+        "H17": payload.get("C46", ""),
+        "A19": payload.get("sumtext", ""),
+        "B20": payload.get("C45", ""),
+        "F23": payload["FIO"],
+    }
+    write_xls_cells(out_path, "Лист1", updates, backup=False)
+    return out_path
+
+
+def generate_contract_doc_windows_from_state(state: Dict[str, str], dogovir_template: Path, out_path: Path) -> Path:
+    payload = parse_state(state)
+    import win32com.client as win32  # type: ignore
+
+    word = win32.Dispatch("Word.Application")
+    word.Visible = False
+    try:
+        doc = word.Documents.Open(str(dogovir_template.resolve()))
+        bookmark_map = {
+            "Number": "Number",
+            "Data": "Data",
+            "FIO": "FIO",
+            "pasport": "pasport",
+            "TaxNumber": "TaxNumber",
+            "BirthDay": "BirthDay",
+            "adres": "adres",
+            "decl": "decl",
+            "model": "model",
+            "year": "year",
+            "color": "color",
+            "numberdv": "numberdv",
+            "cuzov": "cuzov",
+            "cub": "cub",
+            "znak": "znak",
+            "price": "price",
+            "sumtext": "sumtext",
+            "FIO2": "FIO2",
+        }
+        for key, bookmark_name in bookmark_map.items():
+            if doc.Bookmarks.Exists(bookmark_name):
+                doc.Bookmarks(bookmark_name).Range.Text = str(payload.get(key, ""))
+        doc.SaveAs(str(out_path.resolve()))
+        doc.Close(SaveChanges=False)
+    finally:
+        try:
+            word.Quit()
+        except Exception:
+            pass
+    return out_path
+
+
+def save_text_preview(path: Path, title: str, body: str) -> Path:
+    path.write_text(f"{title}\n\n{body}\n", encoding="utf-8")
+    return path
+
+
+def open_file_with_preference(path: Path, editor_path: str = "") -> None:
+    if editor_path:
+        subprocess.Popen([editor_path, str(path)])
+        return
+    if IS_WINDOWS:
+        os.startfile(str(path))  # type: ignore[attr-defined]
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
+
+
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("6055 Transfer Tool")
         self.base_dir = runtime_base_dir()
         self.out_dir = default_output_dir(self.base_dir)
+
+        self.root.title("MotoCalc 6055")
+        self.root.geometry("1280x900")
+        self.root.minsize(1120, 760)
 
         self.source_path = tk.StringVar(value=str(self.base_dir / "6055.xls"))
         self.moto_path = tk.StringVar(value=str(self.base_dir / "6055_MOTO_template.xls"))
         self.dogovir_path = tk.StringVar(value=str(self.base_dir / "DOGOVIR_6055_template.doc"))
+        self.vidatkova_path = tk.StringVar(value=str(self.base_dir / "vidatkova.xls"))
+        self.editor_path = tk.StringVar(value="")
+        self.open_after_save = tk.BooleanVar(value=True)
 
-        self.a3_text = tk.StringVar(value=str(read_xls_cell(Path(self.source_path.get()), "Worksheet", "A3")))
-        self.fio_text = tk.StringVar(value=str(read_xls_cell(Path(self.source_path.get()), "Worksheet", "C15")))
-        self.frame_text = tk.StringVar(value=str(read_xls_cell(Path(self.source_path.get()), "Worksheet", "C43")))
+        self.state_vars: Dict[str, tk.StringVar] = {}
+        self.widgets: Dict[str, tk.Entry] = {}
+        self.summary_var = tk.StringVar(value="")
+        self.error_var = tk.StringVar(value="")
+        self.warning_var = tk.StringVar(value="")
+        self.status_var = tk.StringVar(value="Готово")
+        self.log_lines: list[str] = []
 
+        self._load_state_from_source()
         self._build_ui()
+        self.refresh_validation()
+
+    def _load_state_from_source(self) -> None:
+        source = Path(self.source_path.get())
+        state = load_form_state(source)
+        for _, cell, _, _ in iter_field_specs():
+            self.state_vars[cell] = tk.StringVar(value=state.get(cell, ""))
+        self.state_vars["E15"].set(short_name(self.state_vars["C15"].get()))
 
     def _build_ui(self) -> None:
-        frm = ttk.Frame(self.root, padding=12)
-        frm.grid(sticky="nsew")
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
+        self.root.rowconfigure(1, weight=1)
 
-        for i in range(2):
-            frm.columnconfigure(i, weight=1)
+        header = tk.Frame(self.root, bg="#1f2937", padx=18, pady=14)
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
 
-        ttk.Label(frm, text="Source 6055.xls").grid(row=0, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.source_path).grid(row=0, column=1, sticky="ew", padx=6)
+        tk.Label(header, text="MotoCalc 6055", fg="white", bg="#1f2937", font=("Segoe UI", 20, "bold")).grid(row=0, column=0, sticky="w")
+        tk.Label(header, text="Одна форма для акта, договору та видаткової", fg="#d1d5db", bg="#1f2937", font=("Segoe UI", 10)).grid(row=1, column=0, sticky="w", pady=(4, 0))
 
-        ttk.Label(frm, text="MOTO template").grid(row=1, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.moto_path).grid(row=1, column=1, sticky="ew", padx=6)
+        main = ttk.Frame(self.root, padding=12)
+        main.grid(row=1, column=0, sticky="nsew")
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(1, weight=1)
 
-        ttk.Label(frm, text="DOGOVIR template").grid(row=2, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.dogovir_path).grid(row=2, column=1, sticky="ew", padx=6)
+        actions = ttk.Frame(main)
+        actions.grid(row=0, column=0, sticky="ew")
+        for i in range(6):
+            actions.columnconfigure(i, weight=1)
 
-        ttk.Separator(frm, orient="horizontal").grid(row=3, column=0, columnspan=2, sticky="ew", pady=10)
+        ttk.Button(actions, text="Перевірити", command=self.refresh_validation).grid(row=0, column=0, sticky="ew", padx=4)
+        ttk.Button(actions, text="Чорновик акту", command=lambda: self.open_draft("act")).grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(actions, text="Чорновик договору", command=lambda: self.open_draft("contract")).grid(row=0, column=2, sticky="ew", padx=4)
+        ttk.Button(actions, text="Чорновик видаткової", command=lambda: self.open_draft("vidatkova")).grid(row=0, column=3, sticky="ew", padx=4)
+        ttk.Button(actions, text="Зберегти 6055", command=self.save_source_changes).grid(row=0, column=4, sticky="ew", padx=4)
+        ttk.Button(actions, text="Згенерувати все", command=self.generate_all).grid(row=0, column=5, sticky="ew", padx=4)
 
-        ttk.Label(frm, text="A3 (номер + дата)").grid(row=4, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.a3_text).grid(row=4, column=1, sticky="ew", padx=6)
+        summary = ttk.Frame(main)
+        summary.grid(row=1, column=0, sticky="ew", pady=(10, 8))
+        summary.columnconfigure(0, weight=1)
+        summary.columnconfigure(1, weight=1)
 
-        ttk.Label(frm, text="C15 (ПІБ)").grid(row=5, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.fio_text).grid(row=5, column=1, sticky="ew", padx=6)
+        ttk.Label(summary, textvariable=self.summary_var, anchor="w", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, columnspan=2, sticky="ew")
+        ttk.Label(summary, textvariable=self.error_var, foreground="#9f1239", anchor="w", wraplength=1100).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        ttk.Label(summary, textvariable=self.warning_var, foreground="#a16207", anchor="w", wraplength=1100).grid(row=2, column=0, columnspan=2, sticky="ew")
 
-        ttk.Label(frm, text="C43 (номер рами)").grid(row=6, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=self.frame_text).grid(row=6, column=1, sticky="ew", padx=6)
+        self.notebook = ttk.Notebook(main)
+        self.notebook.grid(row=2, column=0, sticky="nsew")
 
-        btns = ttk.Frame(frm)
-        btns.grid(row=7, column=0, columnspan=2, sticky="ew", pady=10)
-        for i in range(4):
-            btns.columnconfigure(i, weight=1)
+        data_tab = ttk.Frame(self.notebook)
+        settings_tab = ttk.Frame(self.notebook)
+        log_tab = ttk.Frame(self.notebook)
+        self.notebook.add(data_tab, text="Дані")
+        self.notebook.add(settings_tab, text="Налаштування")
+        self.notebook.add(log_tab, text="Лог")
 
-        ttk.Button(btns, text="1) Зберегти зміни в 6055", command=self.save_source_changes).grid(row=0, column=0, sticky="ew", padx=4)
-        ttk.Button(btns, text="2) Перенести в акт", command=self.transfer_act).grid(row=0, column=1, sticky="ew", padx=4)
-        ttk.Button(btns, text="3) Перенести в договір", command=self.transfer_dogovir).grid(row=0, column=2, sticky="ew", padx=4)
-        ttk.Button(btns, text="4) Зробити все", command=self.transfer_all).grid(row=0, column=3, sticky="ew", padx=4)
-
-        self.log = tk.Text(frm, height=12)
-        self.log.grid(row=8, column=0, columnspan=2, sticky="nsew")
-        frm.rowconfigure(8, weight=1)
+        self._build_data_tab(data_tab)
+        self._build_settings_tab(settings_tab)
+        self._build_log_tab(log_tab)
 
         self.write_log(f"Platform: {platform.system()}")
         self.write_log(f"Output folder: {self.out_dir}")
         if not IS_WINDOWS:
-            self.write_log("Linux mode: Word COM write is unavailable, preview file will be created.")
+            self.write_log("Linux mode: Word COM write is unavailable; preview text will be generated.")
+
+    def _build_data_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(0, weight=1)
+        inner = ttk.Notebook(parent)
+        inner.grid(row=0, column=0, sticky="nsew")
+
+        for group_name, fields in FIELD_SECTIONS:
+            frame = ttk.Frame(inner, padding=14)
+            inner.add(frame, text=group_name)
+            self._build_field_section(frame, fields)
+
+    def _build_field_section(self, parent: ttk.Frame, fields):
+        parent.columnconfigure(1, weight=1)
+        for row, (cell, label, required) in enumerate(fields):
+            display = f"{label} {'*' if required else ''} ({cell})"
+            ttk.Label(parent, text=display).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=4)
+
+            var = self.state_vars[cell]
+            entry = tk.Entry(parent, textvariable=var, relief="flat", highlightthickness=1, bd=0, bg="white", insertbackground="#111827")
+            if cell == "E15":
+                entry.configure(state="readonly", readonlybackground="#eef2ff", fg="#374151")
+            entry.grid(row=row, column=1, sticky="ew", pady=4)
+            self.widgets[cell] = entry
+
+            var.trace_add("write", self._on_state_change)
+
+        if {f[0] for f in fields} >= {"C39", "C42", "C43"}:
+            ttk.Button(parent, text="Синхронізувати C39/C42/C43", command=self.sync_frame_fields).grid(row=len(fields), column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+    def _build_settings_tab(self, parent: ttk.Frame) -> None:
+        parent.columnconfigure(1, weight=1)
+
+        rows = [
+            ("6055.xls", self.source_path, True),
+            ("6055_MOTO_template.xls", self.moto_path, True),
+            ("DOGOVIR_6055_template.doc", self.dogovir_path, True),
+            ("vidatkova.xls", self.vidatkova_path, False),
+            ("Output folder", tk.StringVar(value=str(self.out_dir)), False),
+            ("Editor path", self.editor_path, False),
+        ]
+
+        self.output_dir_var = rows[4][1]
+
+        for row, (label, var, editable) in enumerate(rows):
+            ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=5)
+            entry = ttk.Entry(parent, textvariable=var)
+            entry.grid(row=row, column=1, sticky="ew", pady=5)
+            if label in {"6055.xls", "6055_MOTO_template.xls", "DOGOVIR_6055_template.doc", "vidatkova.xls", "Output folder", "Editor path"}:
+                ttk.Button(parent, text="Огляд", command=lambda v=var: self.browse_path(v)).grid(row=row, column=2, padx=(8, 0))
+
+        ttk.Checkbutton(parent, text="Відкривати файл після генерації", variable=self.open_after_save).grid(row=6, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        ttk.Button(parent, text="Перезавантажити 6055", command=self.reload_source).grid(row=7, column=0, sticky="w", pady=(12, 0))
+        ttk.Button(parent, text="Зберегти 6055 зараз", command=self.save_source_changes).grid(row=7, column=1, sticky="w", pady=(12, 0))
+
+    def _build_log_tab(self, parent: ttk.Frame) -> None:
+        parent.rowconfigure(0, weight=1)
+        parent.columnconfigure(0, weight=1)
+        self.log = tk.Text(parent, height=12, wrap="word")
+        self.log.grid(row=0, column=0, sticky="nsew")
+
+    def browse_path(self, var: tk.StringVar) -> None:
+        if var is self.output_dir_var:
+            value = filedialog.askdirectory(initialdir=var.get() or str(self.out_dir)) if filedialog else ""
+        else:
+            value = filedialog.askopenfilename(initialdir=str(self.base_dir)) if filedialog else ""
+        if value:
+            var.set(value)
+
+    def _on_state_change(self, *_):
+        self.state_vars["E15"].set(short_name(self.state_vars["C15"].get()))
+        self.refresh_validation(silent=True)
+
+    def collect_state(self) -> Dict[str, str]:
+        state = {cell: var.get().strip() for cell, var in self.state_vars.items()}
+        state["E15"] = short_name(state.get("C15", ""))
+        return state
+
+    def refresh_validation(self, silent: bool = False):
+        state = self.collect_state()
+        payload, errors, warnings = validate_state(state)
+
+        invalid_cells: set[str] = set()
+        warning_cells: set[str] = set()
+
+        for err in errors:
+            if err.startswith("A3"):
+                invalid_cells.add("A3")
+            elif err.startswith("C46"):
+                invalid_cells.add("C46")
+            else:
+                match = re.match(r"([A-Z]+\d+)\s", err)
+                if match:
+                    invalid_cells.add(match.group(1))
+
+        for warn in warnings:
+            if "C39 / C42 / C43" in warn:
+                warning_cells.update({"C39", "C42", "C43"})
+            if "Номер двигуна" in warn:
+                warning_cells.add("C41")
+            if "Колір" in warn:
+                warning_cells.add("C28")
+            if "Рік випуску" in warn:
+                warning_cells.add("C29")
+
+        for cell, entry in self.widgets.items():
+            if cell == "E15":
+                continue
+            if cell in invalid_cells:
+                entry.configure(bg="#fee2e2")
+            elif cell in warning_cells:
+                entry.configure(bg="#fef3c7")
+            else:
+                entry.configure(bg="#ffffff")
+
+        self.summary_var.set(f"Заповнено: {sum(1 for v in state.values() if v)} полів. Номер: {payload.get('Number', '')} | Дата: {payload.get('Data', '')}")
+        self.error_var.set("Помилки: " + ("; ".join(errors) if errors else "немає"))
+        self.warning_var.set("Попередження: " + ("; ".join(warnings) if warnings else "немає"))
+
+        if not silent:
+            self.write_log(self.error_var.get())
+            self.write_log(self.warning_var.get())
+
+        return payload, errors, warnings
+
+    def sync_frame_fields(self) -> None:
+        state = self.collect_state()
+        frame_value = state.get("C39") or state.get("C42") or state.get("C43")
+        if frame_value:
+            for cell in ("C39", "C42", "C43"):
+                self.state_vars[cell].set(frame_value)
+            self.write_log(f"Синхронізовано рамні поля: {frame_value}")
+            self.refresh_validation(silent=True)
+
+    def reload_source(self) -> None:
+        source = Path(self.source_path.get())
+        state = load_form_state(source)
+        for cell in FORM_CELLS:
+            self.state_vars[cell].set(state.get(cell, ""))
+        self.state_vars["E15"].set(short_name(self.state_vars["C15"].get()))
+        self.write_log(f"Перезавантажено дані з {source}")
+        self.refresh_validation(silent=True)
 
     def write_log(self, text: str) -> None:
-        self.log.insert("end", text + "\n")
-        self.log.see("end")
+        self.log_lines.append(text)
+        if hasattr(self, "log"):
+            self.log.insert("end", text + "\n")
+            self.log.see("end")
 
     def save_source_changes(self) -> None:
         source = Path(self.source_path.get())
-        updates = {
-            "A3": self.a3_text.get(),
-            "C15": self.fio_text.get(),
-            "E15": short_name(self.fio_text.get()),
-            # Keep VIN/chassis/frame synchronized for this workflow.
-            "C39": self.frame_text.get(),
-            "C42": self.frame_text.get(),
-            "C43": self.frame_text.get(),
-            "D39": "",
-            "D42": "",
-            "D43": "",
-        }
+        state = self.collect_state()
+        updates = {cell: state.get(cell, "") for cell in FORM_CELLS if cell != "E15"}
+        updates["E15"] = short_name(state.get("C15", ""))
+        updates["C39"] = state.get("C39", "")
+        updates["C42"] = state.get("C42", "")
+        updates["C43"] = state.get("C43", "")
         write_xls_cells(source, "Worksheet", updates, backup=True)
-        self.write_log(f"Saved source updates into: {source}")
+        self.write_log(f"Збережено 6055 у {source}")
 
-    def transfer_act(self) -> None:
-        source = Path(self.source_path.get())
-        moto = Path(self.moto_path.get())
-        out_dir = self.out_dir
+    def current_payload(self) -> Dict[str, str]:
+        payload, errors, warnings = validate_state(self.collect_state())
+        return payload
+
+    def open_draft(self, kind: str) -> None:
+        DraftWindow(self, kind)
+
+    def _ensure_output_dir(self) -> Path:
+        out_dir = Path(self.output_dir_var.get().strip() or str(self.out_dir))
         out_dir.mkdir(parents=True, exist_ok=True)
-        ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_act = out_dir / f"6055_MOTO_filled_{ts}.xls"
+        return out_dir
 
-        if IS_WINDOWS:
-            self.write_log("On Windows, use 'Зробити все' to run COM transfer with Word.")
-            transfer_to_act_non_windows(source, moto, out_act)
-        else:
-            transfer_to_act_non_windows(source, moto, out_act)
+    def save_draft(self, kind: str, open_after: bool = True) -> Path:
+        state = self.collect_state()
+        payload, errors, warnings = validate_state(state)
+        if errors:
+            raise ValueError("Потрібно виправити помилки перед збереженням: " + "; ".join(errors))
 
-        self.write_log(f"ACT created: {out_act}")
-
-    def transfer_dogovir(self) -> None:
-        source = Path(self.source_path.get())
-        out_dir = self.out_dir
-        out_dir.mkdir(parents=True, exist_ok=True)
+        out_dir = self._ensure_output_dir()
         ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        if IS_WINDOWS:
-            self.write_log("Use 'Зробити все' for full COM pipeline on Windows.")
+        if kind == "act":
+            out_path = out_dir / f"6055_MOTO_filled_{ts}.xls"
+            generate_act_xls_from_state(state, Path(self.moto_path.get()), out_path)
+        elif kind == "contract":
+            if IS_WINDOWS:
+                out_path = out_dir / f"DOGOVIR_6055_filled_{ts}.doc"
+                generate_contract_doc_windows_from_state(state, Path(self.dogovir_path.get()), out_path)
+            else:
+                out_path = out_dir / f"DOGOVIR_preview_{ts}.txt"
+                save_text_preview(out_path, "ЧОРНОВИК ДОГОВОРУ", preview_text_for_contract(payload))
+        elif kind == "vidatkova":
+            out_path = out_dir / f"vidatkova_filled_{ts}.xls"
+            generate_vidatkova_xls_from_state(state, Path(self.vidatkova_path.get()), out_path)
         else:
-            out_preview = out_dir / f"DOGOVIR_preview_{ts}.txt"
-            transfer_to_word_preview(source, out_preview)
-            self.write_log(f"DOGOVIR preview created: {out_preview}")
+            raise ValueError(f"Невідомий тип чорновика: {kind}")
 
-    def transfer_all(self) -> None:
+        self.write_log(f"Згенеровано: {out_path}")
+        if open_after and self.open_after_save.get():
+            try:
+                open_file_with_preference(out_path, self.editor_path.get().strip())
+            except Exception as exc:
+                self.write_log(f"Не вдалося відкрити файл: {exc}")
+        return out_path
+
+    def generate_all(self) -> None:
         try:
             self.save_source_changes()
-            source = Path(self.source_path.get())
-            moto = Path(self.moto_path.get())
-            dog = Path(self.dogovir_path.get())
-            out_dir = self.out_dir
-            out_dir.mkdir(parents=True, exist_ok=True)
-
-            if IS_WINDOWS:
-                windows_transfer_all(source, moto, dog, out_dir)
-                self.write_log("Windows COM transfer complete (ACT + DOGOVIR).")
-            else:
-                ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-                out_act = out_dir / f"6055_MOTO_filled_{ts}.xls"
-                out_prev = out_dir / f"DOGOVIR_preview_{ts}.txt"
-                transfer_to_act_non_windows(source, moto, out_act)
-                transfer_to_word_preview(source, out_prev)
-                self.write_log(f"ACT created: {out_act}")
-                self.write_log(f"DOGOVIR preview created: {out_prev}")
+            self.save_draft("act")
+            self.save_draft("contract")
+            self.save_draft("vidatkova")
         except Exception as exc:
             self.write_log(f"ERROR: {exc}")
             self.write_log(traceback.format_exc())
             if messagebox:
                 messagebox.showerror("Error", str(exc))
+
+
+if tk is not None:
+    class DraftWindow(tk.Toplevel):
+        def __init__(self, app: App, kind: str):
+            super().__init__(app.root)
+            self.app = app
+            self.kind = kind
+            self.title(self._title())
+            self.geometry("860x720")
+            self.minsize(720, 560)
+
+            self.columnconfigure(0, weight=1)
+            self.rowconfigure(1, weight=1)
+
+            header = tk.Frame(self, bg="#0f766e", padx=14, pady=12)
+            header.grid(row=0, column=0, sticky="ew")
+            header.columnconfigure(0, weight=1)
+            tk.Label(header, text=self._title(), fg="white", bg="#0f766e", font=("Segoe UI", 16, "bold")).grid(row=0, column=0, sticky="w")
+            tk.Label(header, text=self._subtitle(), fg="#ccfbf1", bg="#0f766e", font=("Segoe UI", 10)).grid(row=1, column=0, sticky="w", pady=(2, 0))
+
+            self.notice = tk.Label(self, text="", fg="#991b1b", anchor="w", justify="left", wraplength=820)
+            self.notice.grid(row=1, column=0, sticky="ew", padx=14, pady=(10, 0))
+
+            self.preview = tk.Text(self, wrap="word", bg="#ffffff", relief="flat", font=("Consolas", 10))
+            self.preview.grid(row=2, column=0, sticky="nsew", padx=14, pady=10)
+
+            actions = ttk.Frame(self, padding=(14, 0, 14, 14))
+            actions.grid(row=3, column=0, sticky="ew")
+            actions.columnconfigure(0, weight=1)
+            actions.columnconfigure(1, weight=1)
+            actions.columnconfigure(2, weight=1)
+
+            ttk.Button(actions, text="Зберегти", command=self.save).grid(row=0, column=0, sticky="ew", padx=4)
+            ttk.Button(actions, text="Відкрити у редакторі", command=self.open_external).grid(row=0, column=1, sticky="ew", padx=4)
+            ttk.Button(actions, text="Закрити", command=self.destroy).grid(row=0, column=2, sticky="ew", padx=4)
+
+            self._refresh_preview()
+
+        def _title(self) -> str:
+            return {
+                "act": "Чорновик акту 6055",
+                "contract": "Чорновик договору",
+                "vidatkova": "Чорновик видаткової",
+            }[self.kind]
+
+        def _subtitle(self) -> str:
+            return {
+                "act": "Це попередній перегляд перед генерацією фінального файлу.",
+                "contract": "На Windows зберігає Word-документ, на інших системах створює текстовий чорновик.",
+                "vidatkova": "Окрема видаткова накладна, заповнена з тієї ж форми даних.",
+            }[self.kind]
+
+        def _refresh_preview(self) -> None:
+            payload, errors, warnings = validate_state(self.app.collect_state())
+            self.notice.configure(text=("\n".join(errors + warnings) if errors or warnings else "Помилок і попереджень немає."))
+
+            if self.kind == "act":
+                text = preview_text_for_act(payload)
+            elif self.kind == "contract":
+                text = preview_text_for_contract(payload)
+            else:
+                text = preview_text_for_vidatkova(payload)
+
+            self.preview.delete("1.0", "end")
+            self.preview.insert("1.0", text)
+            self.preview.configure(state="disabled")
+
+        def save(self) -> None:
+            try:
+                path = self.app.save_draft(self.kind)
+                self.app.write_log(f"Чорновик збережено: {path}")
+                if messagebox:
+                    messagebox.showinfo("Збережено", f"Файл збережено:\n{path}")
+            except Exception as exc:
+                if messagebox:
+                    messagebox.showerror("Помилка", str(exc))
+                self.app.write_log(f"ERROR: {exc}")
+
+        def open_external(self) -> None:
+            try:
+                out_dir = self.app._ensure_output_dir()
+                if self.kind == "act":
+                    matches = sorted(out_dir.glob("6055_MOTO_filled_*.xls"))
+                    file_name = matches[-1] if matches else None
+                elif self.kind == "contract":
+                    patterns = ["DOGOVIR_6055_filled_*.doc", "DOGOVIR_preview_*.txt"]
+                    matches = []
+                    for pattern in patterns:
+                        matches.extend(sorted(out_dir.glob(pattern)))
+                    file_name = matches[-1] if matches else None
+                else:
+                    matches = sorted(out_dir.glob("vidatkova_filled_*.xls"))
+                    file_name = matches[-1] if matches else None
+                if file_name:
+                    open_file_with_preference(file_name, self.app.editor_path.get().strip())
+            except Exception as exc:
+                if messagebox:
+                    messagebox.showerror("Помилка", str(exc))
+else:
+    class DraftWindow:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("Tkinter is unavailable in this environment")
 
 
 def run_demo(base_dir: Path) -> None:
