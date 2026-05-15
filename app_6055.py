@@ -292,7 +292,7 @@ FIELD_SECTIONS = [
         "Документ",
         [
             ("A3", "Номер і дата", True),
-            ("A51", "Дата набуття права", False),
+            ("C51", "Дата набуття права", False),
             ("C47", "Митна декларація", False),
         ],
     ),
@@ -490,6 +490,117 @@ def amount_to_words_uah(value) -> str:
     return " ".join(reversed([chunk for chunk in chunks if chunk])).strip() + " грн. 00 коп."
 
 
+def parse_decimal(value: str) -> float | None:
+    try:
+        cleaned = str(value).strip().replace(" ", "").replace(",", ".")
+        if not cleaned:
+            return None
+        return float(cleaned)
+    except Exception:
+        return None
+
+
+def normalize_token(value: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(value).upper())
+
+
+def valid_date_text(value: str) -> bool:
+    value = str(value).strip()
+    if not value:
+        return False
+    if re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", value):
+        return True
+    return bool(re.search(r"\b\d{1,2}\b.+\b\d{4}\b", value))
+
+
+def preview_blocks_for_act(payload: Dict[str, str]) -> list[tuple[str, list[tuple[str, str]]]]:
+    return [
+        ("Реквізити акта", [("Номер", payload.get("Number", "")), ("Дата", payload.get("Data", ""))]),
+        (
+            "Покупець",
+            [
+                ("ПІБ", payload.get("C15", "")),
+                ("Адреса", payload.get("C16", "")),
+                ("Паспорт", payload.get("C17", "")),
+                ("ІПН", payload.get("C18", "")),
+            ],
+        ),
+        (
+            "Транспортний засіб",
+            [
+                ("Марка / модель", payload.get("C20", "")),
+                ("Тип", payload.get("C21", "")),
+                ("Рік", payload.get("C29", "")),
+                ("Колір", payload.get("C28", "")),
+                ("VIN / рама", payload.get("cuzov", "")),
+                ("Номер двигуна", payload.get("C41", "")),
+            ],
+        ),
+        ("Підписні дані", [("Скорочений ПІБ", payload.get("fio_short", "")), ("Дата набуття права", payload.get("C51", ""))]),
+    ]
+
+
+def preview_blocks_for_contract(payload: Dict[str, str]) -> list[tuple[str, list[tuple[str, str]]]]:
+    return [
+        ("Договір", [("Номер", payload.get("Number", "")), ("Дата", payload.get("Data", "")), ("Ціна", payload.get("price", "")), ("Сума прописом", payload.get("sumtext", ""))]),
+        (
+            "Покупець",
+            [
+                ("ПІБ", payload.get("FIO", "")),
+                ("Дата народження", payload.get("BirthDay", "")),
+                ("Паспорт", payload.get("pasport", "")),
+                ("ІПН", payload.get("TaxNumber", "")),
+                ("Адреса", payload.get("adres", "")),
+            ],
+        ),
+        (
+            "Мотоцикл",
+            [
+                ("Модель", payload.get("model", "")),
+                ("Рік", payload.get("year", "")),
+                ("Колір", payload.get("color", "")),
+                ("Рама / кузов", payload.get("cuzov", "")),
+                ("Двигун", payload.get("numberdv", "")),
+                ("Об'єм", payload.get("cub", "")),
+                ("Номерні знаки", payload.get("znak", "")),
+            ],
+        ),
+        ("Митні дані", [("Декларація", payload.get("decl", ""))]),
+    ]
+
+
+def preview_blocks_for_vidatkova(payload: Dict[str, str]) -> list[tuple[str, list[tuple[str, str]]]]:
+    return [
+        ("Видаткова накладна", [("Дата / номер", payload.get("A3", "")), ("Одержувач", payload.get("C15", ""))]),
+        (
+            "Позиція",
+            [
+                ("Тип ТЗ", payload.get("C21", "")),
+                ("Марка, модель", payload.get("C20", "")),
+                ("Номер рами", payload.get("cuzov", "")),
+                ("Кількість", "1"),
+            ],
+        ),
+        (
+            "Суми",
+            [
+                ("Ціна без ПДВ", payload.get("C44", "")),
+                ("ПДВ", payload.get("C45", "")),
+                ("Всього", payload.get("C46", "")),
+                ("Сума прописом", payload.get("sumtext", "")),
+            ],
+        ),
+    ]
+
+
+def preview_blocks(kind: str, payload: Dict[str, str]) -> list[tuple[str, list[tuple[str, str]]]]:
+    if kind == "act":
+        return preview_blocks_for_act(payload)
+    if kind == "contract":
+        return preview_blocks_for_contract(payload)
+    return preview_blocks_for_vidatkova(payload)
+
+
 def validate_state(state: Dict[str, str]) -> Tuple[Dict[str, str], list[str], list[str]]:
     payload = parse_state(state)
     errors: list[str] = []
@@ -502,16 +613,40 @@ def validate_state(state: Dict[str, str]) -> Tuple[Dict[str, str], list[str], li
 
     if not payload["Number"] or not payload["Data"]:
         errors.append("A3 не парситься як номер + дата")
+    elif not re.fullmatch(r"\d{4}/\d{2}/\d{6}", payload["Number"]):
+        warnings.append("Номер документа в A3 має незвичний формат")
+
+    if state.get("C51") and not valid_date_text(state.get("C51", "")):
+        warnings.append("C51 має підозрілий формат дати")
+
+    if state.get("C12") and not valid_date_text(state.get("C12", "")):
+        warnings.append("C12 має підозрілий формат дати народження")
 
     frame_values = [str(state.get(c, "")).strip() for c in ("C39", "C42", "C43") if str(state.get(c, "")).strip()]
     if len(set(frame_values)) > 1:
         warnings.append("C39 / C42 / C43 не збігаються")
 
-    if payload.get("C41") and len(payload["C41"].strip()) < 4:
-        warnings.append("Номер двигуна схожий на короткий або неповний")
+    if payload.get("cuzov"):
+        vin_token = normalize_token(payload["cuzov"])
+        if len(vin_token) < 8:
+            errors.append("VIN / рама занадто короткий")
+        elif len(vin_token) not in (8, 9, 10, 11, 12, 13, 14, 15, 16, 17):
+            warnings.append("VIN / рама має незвичну довжину")
+
+    if payload.get("C41"):
+        engine_token = normalize_token(payload["C41"])
+        if len(engine_token) < 5:
+            warnings.append("Номер двигуна схожий на короткий або неповний")
+        if payload.get("cuzov") and engine_token == normalize_token(payload["cuzov"]):
+            warnings.append("Номер двигуна збігається з VIN / рамою, перевірте дані")
 
     if payload.get("C28") and payload["C28"].strip().isdigit():
         warnings.append("Колір виглядає як число")
+
+    if payload.get("C18"):
+        tax = re.sub(r"\D", "", payload["C18"])
+        if len(tax) not in (8, 10):
+            warnings.append("ІПН / код має незвичну довжину")
 
     if payload.get("C29"):
         try:
@@ -526,6 +661,18 @@ def validate_state(state: Dict[str, str]) -> Tuple[Dict[str, str], list[str], li
             float(str(payload["C46"]).replace(",", "."))
         except Exception:
             errors.append("C46 не є числом")
+
+    price_no_vat = parse_decimal(payload.get("C44", ""))
+    vat = parse_decimal(payload.get("C45", ""))
+    price_total = parse_decimal(payload.get("C46", ""))
+    if price_no_vat is not None and vat is not None and price_total is not None:
+        if abs((price_no_vat + vat) - price_total) > 0.01:
+            errors.append("C44 + C45 не дорівнює C46")
+
+    if price_no_vat is not None and price_total is not None and vat is not None and price_total > 0:
+        vat_rate = round(vat / price_no_vat * 100, 2) if price_no_vat else None
+        if price_no_vat and vat_rate is not None and vat_rate not in (20.0, 7.0, 0.0):
+            warnings.append("Ставка ПДВ має незвичне значення")
 
     return payload, errors, warnings
 
@@ -1105,8 +1252,21 @@ if tk is not None:
             self.notice = tk.Label(self, text="", fg="#991b1b", anchor="w", justify="left", wraplength=820)
             self.notice.grid(row=1, column=0, sticky="ew", padx=14, pady=(10, 0))
 
-            self.preview = tk.Text(self, wrap="word", bg="#ffffff", relief="flat", font=("Consolas", 10))
-            self.preview.grid(row=2, column=0, sticky="nsew", padx=14, pady=10)
+            preview_host = tk.Frame(self, bg="#dbe4ea")
+            preview_host.grid(row=2, column=0, sticky="nsew", padx=14, pady=10)
+            preview_host.columnconfigure(0, weight=1)
+            preview_host.rowconfigure(0, weight=1)
+
+            self.preview_canvas = tk.Canvas(preview_host, bg="#dbe4ea", highlightthickness=0)
+            preview_scroll = ttk.Scrollbar(preview_host, orient="vertical", command=self.preview_canvas.yview)
+            self.preview_canvas.configure(yscrollcommand=preview_scroll.set)
+            self.preview_canvas.grid(row=0, column=0, sticky="nsew")
+            preview_scroll.grid(row=0, column=1, sticky="ns")
+
+            self.preview_frame = tk.Frame(self.preview_canvas, bg="#dbe4ea")
+            self.preview_window = self.preview_canvas.create_window((0, 0), window=self.preview_frame, anchor="nw")
+            self.preview_frame.bind("<Configure>", lambda e: self.preview_canvas.configure(scrollregion=self.preview_canvas.bbox("all")))
+            self.preview_canvas.bind("<Configure>", self._resize_preview_window)
 
             actions = ttk.Frame(self, padding=(14, 0, 14, 14))
             actions.grid(row=3, column=0, sticky="ew")
@@ -1134,20 +1294,47 @@ if tk is not None:
                 "vidatkova": "Окрема видаткова накладна, заповнена з тієї ж форми даних.",
             }[self.kind]
 
+        def _resize_preview_window(self, event) -> None:
+            self.preview_canvas.itemconfigure(self.preview_window, width=event.width)
+
+        def _render_preview_document(self, payload: Dict[str, str]) -> None:
+            for child in self.preview_frame.winfo_children():
+                child.destroy()
+
+            paper = tk.Frame(self.preview_frame, bg="#fffdf8", highlightbackground="#cbd5e1", highlightthickness=1, padx=24, pady=22)
+            paper.grid(row=0, column=0, sticky="ew", padx=20, pady=12)
+            paper.columnconfigure(0, weight=1)
+            paper.columnconfigure(1, weight=1)
+
+            tk.Label(paper, text=self._title().upper(), font=("Segoe UI", 18, "bold"), bg="#fffdf8", fg="#111827").grid(row=0, column=0, columnspan=2, sticky="w")
+            tk.Label(paper, text=self._subtitle(), font=("Segoe UI", 10), bg="#fffdf8", fg="#6b7280").grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 14))
+
+            sections = preview_blocks(self.kind, payload)
+            for index, (section_title, rows) in enumerate(sections):
+                row = index // 2 + 2
+                col = index % 2
+                card = tk.Frame(paper, bg="#ffffff", highlightbackground="#e5e7eb", highlightthickness=1, padx=14, pady=12)
+                card.grid(row=row, column=col, sticky="nsew", padx=8, pady=8)
+                paper.grid_columnconfigure(col, weight=1)
+
+                tk.Label(card, text=section_title, font=("Segoe UI", 11, "bold"), bg="#ffffff", fg="#7c2d12").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+                card.columnconfigure(1, weight=1)
+                for item_index, (label, value) in enumerate(rows, start=1):
+                    tk.Label(card, text=label, font=("Segoe UI", 9, "bold"), bg="#ffffff", fg="#374151").grid(row=item_index, column=0, sticky="nw", padx=(0, 10), pady=3)
+                    value_box = tk.Label(card, text=value or "-", font=("Segoe UI", 10), bg="#f8fafc", fg="#111827", anchor="w", justify="left", wraplength=280, padx=8, pady=6)
+                    value_box.grid(row=item_index, column=1, sticky="ew", pady=3)
+
+            footer = tk.Frame(paper, bg="#fffdf8")
+            footer.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+            footer.columnconfigure(0, weight=1)
+            footer.columnconfigure(1, weight=1)
+            tk.Label(footer, text="Перевірте реквізити перед збереженням.", font=("Segoe UI", 9, "italic"), bg="#fffdf8", fg="#6b7280").grid(row=0, column=0, sticky="w")
+            tk.Label(footer, text=f"Покупець: {payload.get('C15', payload.get('FIO', ''))}", font=("Segoe UI", 9), bg="#fffdf8", fg="#6b7280").grid(row=0, column=1, sticky="e")
+
         def _refresh_preview(self) -> None:
             payload, errors, warnings = validate_state(self.app.collect_state())
             self.notice.configure(text=("\n".join(errors + warnings) if errors or warnings else "Помилок і попереджень немає."))
-
-            if self.kind == "act":
-                text = preview_text_for_act(payload)
-            elif self.kind == "contract":
-                text = preview_text_for_contract(payload)
-            else:
-                text = preview_text_for_vidatkova(payload)
-
-            self.preview.delete("1.0", "end")
-            self.preview.insert("1.0", text)
-            self.preview.configure(state="disabled")
+            self._render_preview_document(payload)
 
         def save(self) -> None:
             try:
