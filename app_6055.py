@@ -688,6 +688,27 @@ def open_file_with_preference(path: Path, editor_path: str = "") -> None:
         subprocess.Popen(["xdg-open", str(path)])
 
 
+def slugify_case_name(text: str) -> str:
+    raw = re.sub(r"\s+", "_", str(text).strip())
+    raw = re.sub(r"[^0-9A-Za-zА-Яа-яІіЇїЄєҐґ_\-]", "", raw)
+    return raw.strip("_") or "case"
+
+
+def build_case_folder_name(state: Dict[str, str]) -> str:
+    short_fio = short_name(state.get("C15", "")).replace(".", "")
+    return slugify_case_name(short_fio)
+
+
+def ensure_case_dir(base_out_dir: Path, state: Dict[str, str], unique: bool = False) -> Path:
+    folder_name = build_case_folder_name(state)
+    case_dir = base_out_dir / folder_name
+    if unique and case_dir.exists():
+        stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        case_dir = base_out_dir / f"{folder_name}_{stamp}"
+    case_dir.mkdir(parents=True, exist_ok=True)
+    return case_dir
+
+
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -712,6 +733,7 @@ class App:
         self.warning_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="Готово")
         self.log_lines: list[str] = []
+        self._syncing_form = False
 
         self._load_state_from_source()
         self._build_ui()
@@ -727,6 +749,7 @@ class App:
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
+        self.root.configure(bg="#f4efe7")
 
         header = tk.Frame(self.root, bg="#1f2937", padx=18, pady=14)
         header.grid(row=0, column=0, sticky="ew")
@@ -742,15 +765,17 @@ class App:
 
         actions = ttk.Frame(main)
         actions.grid(row=0, column=0, sticky="ew")
-        for i in range(6):
+        for i in range(8):
             actions.columnconfigure(i, weight=1)
 
         ttk.Button(actions, text="Перевірити", command=self.refresh_validation).grid(row=0, column=0, sticky="ew", padx=4)
-        ttk.Button(actions, text="Чорновик акту", command=lambda: self.open_draft("act")).grid(row=0, column=1, sticky="ew", padx=4)
-        ttk.Button(actions, text="Чорновик договору", command=lambda: self.open_draft("contract")).grid(row=0, column=2, sticky="ew", padx=4)
-        ttk.Button(actions, text="Чорновик видаткової", command=lambda: self.open_draft("vidatkova")).grid(row=0, column=3, sticky="ew", padx=4)
-        ttk.Button(actions, text="Зберегти 6055", command=self.save_source_changes).grid(row=0, column=4, sticky="ew", padx=4)
-        ttk.Button(actions, text="Згенерувати все", command=self.generate_all).grid(row=0, column=5, sticky="ew", padx=4)
+        ttk.Button(actions, text="Заповнити з 6055", command=self.reload_source).grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(actions, text="Очистити форму", command=self.clear_form).grid(row=0, column=2, sticky="ew", padx=4)
+        ttk.Button(actions, text="Акт", command=lambda: self.open_draft("act")).grid(row=0, column=3, sticky="ew", padx=4)
+        ttk.Button(actions, text="Договір", command=lambda: self.open_draft("contract")).grid(row=0, column=4, sticky="ew", padx=4)
+        ttk.Button(actions, text="Видаткова", command=lambda: self.open_draft("vidatkova")).grid(row=0, column=5, sticky="ew", padx=4)
+        ttk.Button(actions, text="Зберегти 6055", command=self.save_source_changes).grid(row=0, column=6, sticky="ew", padx=4)
+        ttk.Button(actions, text="Генерувати", command=self.generate_all).grid(row=0, column=7, sticky="ew", padx=4)
 
         summary = ttk.Frame(main)
         summary.grid(row=1, column=0, sticky="ew", pady=(10, 8))
@@ -779,22 +804,50 @@ class App:
         self.write_log(f"Output folder: {self.out_dir}")
         if not IS_WINDOWS:
             self.write_log("Linux mode: Word COM write is unavailable; preview text will be generated.")
+        ttk.Label(main, textvariable=self.status_var, anchor="w").grid(row=3, column=0, sticky="ew", pady=(8, 0))
 
     def _build_data_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
-        inner = ttk.Notebook(parent)
-        inner.grid(row=0, column=0, sticky="nsew")
+        parent.rowconfigure(0, weight=1)
 
-        for group_name, fields in FIELD_SECTIONS:
-            frame = ttk.Frame(inner, padding=14)
-            inner.add(frame, text=group_name)
-            self._build_field_section(frame, fields)
+        outer = tk.Frame(parent, bg="#f4efe7")
+        outer.grid(row=0, column=0, sticky="nsew")
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
 
-    def _build_field_section(self, parent: ttk.Frame, fields):
+        canvas = tk.Canvas(outer, bg="#f4efe7", highlightthickness=0)
+        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+        content = tk.Frame(canvas, bg="#f4efe7")
+        content.columnconfigure(0, weight=1)
+        content.columnconfigure(1, weight=1)
+        canvas.create_window((0, 0), window=content, anchor="nw")
+        content.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure("all", width=e.width))
+
+        title = tk.Frame(content, bg="#f4efe7", padx=10, pady=10)
+        title.grid(row=0, column=0, columnspan=2, sticky="ew")
+        tk.Label(title, text="АКТ / ГОЛОВНА ФОРМА 6055", font=("Segoe UI", 18, "bold"), bg="#f4efe7", fg="#111827").pack(anchor="w")
+        tk.Label(title, text="Заповніть поля один раз, далі формуйте чорновик акту, договору або видаткової.", font=("Segoe UI", 10), bg="#f4efe7", fg="#4b5563").pack(anchor="w", pady=(4, 0))
+
+        for index, (group_name, fields) in enumerate(FIELD_SECTIONS):
+            row = index // 2 + 1
+            col = index % 2
+            card = tk.Frame(content, bg="#fffdf8", highlightbackground="#d6c7ad", highlightthickness=1, padx=14, pady=14)
+            card.grid(row=row, column=col, sticky="nsew", padx=8, pady=8)
+            content.grid_columnconfigure(col, weight=1)
+            self._build_field_section(card, group_name, fields)
+
+    def _build_field_section(self, parent, group_name: str, fields):
+        tk.Label(parent, text=group_name, bg="#fffdf8", fg="#7c2d12", font=("Segoe UI", 12, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
         parent.columnconfigure(1, weight=1)
         for row, (cell, label, required) in enumerate(fields):
+            row += 1
             display = f"{label} {'*' if required else ''} ({cell})"
-            ttk.Label(parent, text=display).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=4)
+            tk.Label(parent, text=display, bg="#fffdf8", fg="#374151", anchor="w").grid(row=row, column=0, sticky="w", padx=(0, 10), pady=4)
 
             var = self.state_vars[cell]
             entry = tk.Entry(parent, textvariable=var, relief="flat", highlightthickness=1, bd=0, bg="white", insertbackground="#111827")
@@ -803,10 +856,11 @@ class App:
             entry.grid(row=row, column=1, sticky="ew", pady=4)
             self.widgets[cell] = entry
 
-            var.trace_add("write", self._on_state_change)
+            if cell != "E15":
+                var.trace_add("write", self._on_state_change)
 
         if {f[0] for f in fields} >= {"C39", "C42", "C43"}:
-            ttk.Button(parent, text="Синхронізувати C39/C42/C43", command=self.sync_frame_fields).grid(row=len(fields), column=0, columnspan=2, sticky="w", pady=(10, 0))
+            ttk.Button(parent, text="Синхронізувати C39/C42/C43", command=self.sync_frame_fields).grid(row=len(fields) + 1, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
     def _build_settings_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(1, weight=1)
@@ -848,8 +902,12 @@ class App:
             var.set(value)
 
     def _on_state_change(self, *_):
+        if self._syncing_form:
+            return
+        self._syncing_form = True
         self.state_vars["E15"].set(short_name(self.state_vars["C15"].get()))
         self.refresh_validation(silent=True)
+        self._syncing_form = False
 
     def collect_state(self) -> Dict[str, str]:
         state = {cell: var.get().strip() for cell, var in self.state_vars.items()}
@@ -907,18 +965,35 @@ class App:
         state = self.collect_state()
         frame_value = state.get("C39") or state.get("C42") or state.get("C43")
         if frame_value:
+            self._syncing_form = True
             for cell in ("C39", "C42", "C43"):
                 self.state_vars[cell].set(frame_value)
+            self._syncing_form = False
             self.write_log(f"Синхронізовано рамні поля: {frame_value}")
             self.refresh_validation(silent=True)
+
+    def clear_form(self) -> None:
+        self._syncing_form = True
+        for cell in FORM_CELLS:
+            if cell == "E15":
+                self.state_vars[cell].set("")
+            else:
+                self.state_vars[cell].set("")
+        self._syncing_form = False
+        self.status_var.set("Форму очищено")
+        self.write_log("Форму очищено")
+        self.refresh_validation(silent=True)
 
     def reload_source(self) -> None:
         source = Path(self.source_path.get())
         state = load_form_state(source)
+        self._syncing_form = True
         for cell in FORM_CELLS:
             self.state_vars[cell].set(state.get(cell, ""))
         self.state_vars["E15"].set(short_name(self.state_vars["C15"].get()))
+        self._syncing_form = False
         self.write_log(f"Перезавантажено дані з {source}")
+        self.status_var.set(f"Дані завантажено з {source.name}")
         self.refresh_validation(silent=True)
 
     def write_log(self, text: str) -> None:
@@ -937,6 +1012,7 @@ class App:
         updates["C43"] = state.get("C43", "")
         write_xls_cells(source, "Worksheet", updates, backup=True)
         self.write_log(f"Збережено 6055 у {source}")
+        self.status_var.set(f"Збережено у {source.name}")
 
     def current_payload(self) -> Dict[str, str]:
         payload, errors, warnings = validate_state(self.collect_state())
@@ -950,13 +1026,13 @@ class App:
         out_dir.mkdir(parents=True, exist_ok=True)
         return out_dir
 
-    def save_draft(self, kind: str, open_after: bool = True) -> Path:
+    def save_draft(self, kind: str, open_after: bool = True, output_dir: Path | None = None) -> Path:
         state = self.collect_state()
         payload, errors, warnings = validate_state(state)
         if errors:
             raise ValueError("Потрібно виправити помилки перед збереженням: " + "; ".join(errors))
 
-        out_dir = self._ensure_output_dir()
+        out_dir = output_dir or self._ensure_output_dir()
         ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
 
         if kind == "act":
@@ -976,6 +1052,7 @@ class App:
             raise ValueError(f"Невідомий тип чорновика: {kind}")
 
         self.write_log(f"Згенеровано: {out_path}")
+        self.status_var.set(f"Створено {out_path.name}")
         if open_after and self.open_after_save.get():
             try:
                 open_file_with_preference(out_path, self.editor_path.get().strip())
@@ -986,9 +1063,19 @@ class App:
     def generate_all(self) -> None:
         try:
             self.save_source_changes()
-            self.save_draft("act")
-            self.save_draft("contract")
-            self.save_draft("vidatkova")
+            state = self.collect_state()
+            base_out_dir = self._ensure_output_dir()
+            case_dir = ensure_case_dir(base_out_dir, state, unique=True)
+            self.save_draft("act", output_dir=case_dir)
+            self.save_draft("contract", output_dir=case_dir)
+            self.save_draft("vidatkova", output_dir=case_dir)
+            self.status_var.set(f"Усі документи збережено у {case_dir}")
+            self.write_log(f"Усі документи збережено у {case_dir}")
+            if self.open_after_save.get():
+                try:
+                    open_file_with_preference(case_dir, self.editor_path.get().strip())
+                except Exception as exc:
+                    self.write_log(f"Не вдалося відкрити папку кейсу: {exc}")
         except Exception as exc:
             self.write_log(f"ERROR: {exc}")
             self.write_log(traceback.format_exc())

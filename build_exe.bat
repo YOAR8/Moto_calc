@@ -17,6 +17,7 @@ if exist dist rmdir /s /q dist
 pyinstaller ^
   --noconfirm ^
   --clean ^
+  --noupx ^
   --windowed ^
   --name MotoCalc ^
   --collect-submodules win32com ^
@@ -32,3 +33,4 @@ copy /Y vidatkova.xls dist\MotoCalc\vidatkova.xls >nul
 echo.
 echo Build complete. Run: dist\MotoCalc\MotoCalc.exe
 echo Output files will be created in %%USERPROFILE%%\Documents\MotoCalc\out
+echo Full generation creates a separate buyer folder using the short FIO.
