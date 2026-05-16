@@ -843,22 +843,6 @@ def generate_vidatkova_xls_from_state(state: Dict[str, str], template_path: Path
     return out_path
 
 
-def _try_libreoffice_to_doc(src_docx: Path, out_dir: Path) -> "Path | None":
-    """Convert .docx → .doc via LibreOffice CLI. Returns .doc Path on success, None otherwise."""
-    try:
-        result = subprocess.run(
-            ["libreoffice", "--headless", "--convert-to", "doc",
-             "--outdir", str(out_dir), str(src_docx)],
-            capture_output=True, timeout=60,
-        )
-        if result.returncode == 0:
-            candidate = out_dir / (src_docx.stem + ".doc")
-            return candidate if candidate.exists() else None
-    except Exception:
-        pass
-    return None
-
-
 def generate_contract_docx_fallback(state: Dict[str, str], out_path: Path) -> "Path | None":
     """Generate full-text contract .docx without Word COM. Returns None if python-docx unavailable."""
     try:
@@ -984,12 +968,12 @@ def generate_contract_docx_fallback(state: Dict[str, str], out_path: Path) -> "P
     doc.add_paragraph()
     add_centered_bold("ПІДПИСИ:")
     tbl = doc.add_table(rows=3, cols=2)
-    tbl.cell(0, 0).text = "ПОКУПЕЦЬ:"
-    tbl.cell(0, 1).text = "ПРОДАВЕЦЬ:"
-    tbl.cell(1, 0).text = f"{v('FIO2')}"
-    tbl.cell(1, 1).text = "Директор КОЛІЙЧУК ІГОР МИКОЛАЙОВИЧ"
-    tbl.cell(2, 0).text = "(підпис) ________________________"
-    tbl.cell(2, 1).text = "ПП ВКФ МОСТ:  (підпис) ________________________"
+    tbl.cell(0, 0).text = "ПРОДАВЕЦЬ:"
+    tbl.cell(0, 1).text = "ПОКУПЕЦЬ:"
+    tbl.cell(1, 0).text = "Директор КОЛІЙЧУК ІГОР МИКОЛАЙОВИЧ"
+    tbl.cell(1, 1).text = f"{v('FIO2')}"
+    tbl.cell(2, 0).text = "ПП ВКФ МОСТ:  (підпис) ________________________"
+    tbl.cell(2, 1).text = "(підпис) ________________________"
 
     out_docx = out_path.with_suffix(".docx")
     doc.save(str(out_docx))
@@ -998,6 +982,10 @@ def generate_contract_docx_fallback(state: Dict[str, str], out_path: Path) -> "P
 
 def generate_contract_doc_windows_from_state(state: Dict[str, str], dogovir_template: Path, out_path: Path) -> Path:
     payload = parse_state(state)
+    if not dogovir_template.exists():
+        raise FileNotFoundError(f"Шаблон договору не знайдено: {dogovir_template}")
+
+    word = None
     try:
         import win32com.client as win32  # type: ignore
 
@@ -1030,23 +1018,15 @@ def generate_contract_doc_windows_from_state(state: Dict[str, str], dogovir_temp
         doc.SaveAs(str(out_path.resolve()))
         doc.Close(SaveChanges=False)
         return out_path
-    except Exception:
-        fb_docx = generate_contract_docx_fallback(state, out_path.with_suffix(".docx"))
-        if fb_docx:
-            doc_result = _try_libreoffice_to_doc(fb_docx, out_path.parent)
-            if doc_result:
-                try:
-                    fb_docx.unlink()
-                except Exception:
-                    pass
-                return doc_result
-            return fb_docx
-        fb_txt = out_path.with_suffix(".txt")
-        save_text_preview(fb_txt, "ЧОРНОВИК ДОГОВОРУ", preview_text_for_contract(payload))
-        return fb_txt
+    except Exception as exc:
+        raise RuntimeError(
+            "Не вдалося сформувати договір через шаблон Word. "
+            "Для формату 1:1 потрібен встановлений Microsoft Word і доступний COM."
+        ) from exc
     finally:
         try:
-            word.Quit()  # type: ignore[name-defined]
+            if word is not None:
+                word.Quit()
         except Exception:
             pass
 
@@ -1189,7 +1169,7 @@ class SmartEntry(tk.Frame if tk is not None else object):
         typed = self._var.get().strip().upper()
         all_ = AutocompleteEntry._suggestions.get(self._cell, [])
         if not typed:
-            return all_[:8]
+            return all_[:4]
         return [v for v in all_ if v.upper().startswith(typed)][:8]
 
     def _open_popup(self, candidates: list) -> None:
@@ -1350,7 +1330,7 @@ class AutocompleteEntry(tk.Entry if tk is not None else object):
         typed = self._var.get().strip().upper()
         all_ = self._suggestions.get(self._cell, [])
         if not typed:
-            return all_[:8]
+            return all_[:4]
         return [v for v in all_ if v.upper().startswith(typed)][:8]
 
     def _open(self, candidates: list) -> None:
@@ -1542,7 +1522,7 @@ class App:
         self.write_log(f"Platform: {platform.system()}")
         self.write_log(f"Output folder: {self.out_dir}")
         if not IS_WINDOWS:
-            self.write_log("Linux mode: Word COM write is unavailable; preview text will be generated.")
+            self.write_log("Демо-режим поза Windows: формування договору через Word-шаблон недоступне.")
 
     def _make_toolbar_button(self, parent, text: str, command, column: int) -> None:
         button = tk.Button(parent, text=text, command=command, bg="#111827", fg="white", activebackground="#1f2937", activeforeground="white", bd=0, relief="flat", padx=10, pady=4, cursor="hand2")
@@ -1862,25 +1842,12 @@ class App:
             out_path = out_dir / f"Акт{num_part}{ts}.xls"
             generate_act_xls_from_state(state, Path(self.source_path.get()), out_path)
         elif kind == "contract":
-            if IS_WINDOWS:
-                out_path = out_dir / f"Договір{num_part}{ts}.doc"
-                out_path = generate_contract_doc_windows_from_state(state, Path(self.dogovir_path.get()), out_path)
-            else:
-                tmp_docx = out_dir / f"Договір{num_part}{ts}.docx"
-                result = generate_contract_docx_fallback(state, tmp_docx)
-                if result:
-                    doc_result = _try_libreoffice_to_doc(result, out_dir)
-                    if doc_result:
-                        try:
-                            result.unlink()
-                        except Exception:
-                            pass
-                        out_path = doc_result
-                    else:
-                        out_path = result
-                else:
-                    out_path = tmp_docx.with_suffix(".txt")
-                    save_text_preview(out_path, "ЧОРНОВИК ДОГОВОРУ", preview_text_for_contract(payload))
+            if not IS_WINDOWS:
+                raise RuntimeError(
+                    "Договір підтримується тільки у Windows-оточенні через шаблон DOGOVIR_6055_template.doc (1:1)."
+                )
+            out_path = out_dir / f"Договір{num_part}{ts}.doc"
+            out_path = generate_contract_doc_windows_from_state(state, Path(self.dogovir_path.get()), out_path)
         elif kind == "vidatkova":
             out_path = out_dir / f"Видаткова{num_part}{ts}.xls"
             generate_vidatkova_xls_from_state(state, Path(self.vidatkova_path.get()), out_path)
