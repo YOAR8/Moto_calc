@@ -748,19 +748,9 @@ def preview_text_for_vidatkova(payload: Dict[str, str]) -> str:
     ])
 
 
-def generate_act_xls_from_state(state: Dict[str, str], moto_template: Path, out_path: Path) -> Path:
-    payload = parse_state(state)
-    shutil.copy2(moto_template, out_path)
-    updates = {
-        "B12": payload["Number"],
-        "L12": payload["Data"],
-        "H18": payload["FIO"],
-        "C24": payload["model"],
-        "E24": payload["year"],
-        "H24": payload["cuzov"],
-        "K24": payload["color"],
-        "N33": payload["fio_short"],
-    }
+def generate_act_xls_from_state(state: Dict[str, str], source_6055: Path, out_path: Path) -> Path:
+    shutil.copy2(source_6055, out_path)
+    updates = {cell: state.get(cell, "") for cell in FORM_CELLS}
     write_xls_cells(out_path, "Worksheet", updates, backup=False)
     return out_path
 
@@ -837,7 +827,7 @@ def generate_contract_doc_windows_from_state(state: Dict[str, str], dogovir_temp
 
 
 def save_text_preview(path: Path, title: str, body: str) -> Path:
-    path.write_text(f"{title}\n\n{body}\n", encoding="utf-8")
+    path.write_text(f"{title}\n\n{body}\n", encoding="utf-8-sig")
     return path
 
 
@@ -941,7 +931,7 @@ class App:
         main = ttk.Frame(self.root, padding=12)
         main.grid(row=1, column=0, sticky="nsew")
         main.columnconfigure(0, weight=1)
-        main.rowconfigure(1, weight=1)
+        main.rowconfigure(0, weight=1)
         self._build_data_tab(main)
 
         bottom = tk.Frame(self.root, bg="#111827", padx=12, pady=6)
@@ -981,20 +971,37 @@ class App:
         content = tk.Frame(canvas, bg="#f4efe7")
         content.columnconfigure(0, weight=1)
         content.columnconfigure(1, weight=1)
-        canvas.create_window((0, 0), window=content, anchor="nw")
+        content_win = canvas.create_window((0, 0), window=content, anchor="nw")
         content.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda e: canvas.itemconfigure("all", width=e.width))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(content_win, width=e.width))
+
+        def _scroll(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+
+        def _scroll_up(e):
+            canvas.yview_scroll(-1, "units")
+
+        def _scroll_dn(e):
+            canvas.yview_scroll(1, "units")
+
+        canvas.bind_all("<MouseWheel>", _scroll)
+        canvas.bind_all("<Button-4>", _scroll_up)
+        canvas.bind_all("<Button-5>", _scroll_dn)
 
         title = tk.Frame(content, bg="#f4efe7", padx=10, pady=10)
         title.grid(row=0, column=0, columnspan=2, sticky="ew")
         tk.Label(title, text="АКТ / ГОЛОВНА ФОРМА 6055", font=("Segoe UI", 18, "bold"), bg="#f4efe7", fg="#111827").pack(anchor="w")
         tk.Label(title, text="Заповніть поля один раз, далі формуйте чорновик акту, договору або видаткової.", font=("Segoe UI", 10), bg="#f4efe7", fg="#4b5563").pack(anchor="w", pady=(4, 0))
 
+        last_idx = len(FIELD_SECTIONS) - 1
         for index, (group_name, fields) in enumerate(FIELD_SECTIONS):
             row = index // 2 + 1
             col = index % 2
             card = tk.Frame(content, bg="#fffdf8", highlightbackground="#d6c7ad", highlightthickness=1, padx=14, pady=14)
-            card.grid(row=row, column=col, sticky="nsew", padx=8, pady=8)
+            if index == last_idx and last_idx % 2 == 0:
+                card.grid(row=row, column=0, columnspan=2, sticky="nsew", padx=8, pady=8)
+            else:
+                card.grid(row=row, column=col, sticky="nsew", padx=8, pady=8)
             content.grid_columnconfigure(col, weight=1)
             self._build_field_section(card, group_name, fields)
 
@@ -1003,7 +1010,7 @@ class App:
         parent.columnconfigure(1, weight=1)
         for row, (cell, label, required) in enumerate(fields):
             row += 1
-            display = f"{label} {'*' if required else ''} ({cell})"
+            display = f"{label}{' *' if required else ''}"
             tk.Label(parent, text=display, bg="#fffdf8", fg="#374151", anchor="w").grid(row=row, column=0, sticky="w", padx=(0, 10), pady=4)
 
             var = self.state_vars[cell]
@@ -1079,6 +1086,8 @@ class App:
             tk.Button(dialog, text="Огляд", command=lambda v=var: self.browse_path(v)).grid(row=row, column=2, padx=12)
 
         tk.Checkbutton(dialog, text="Відкривати файл після генерації", variable=self.open_after_save).grid(row=7, column=0, columnspan=3, sticky="w", padx=16, pady=(10, 6))
+        tk.Button(dialog, text="↺ Перезавантажити 6055", command=lambda: [self.reload_source(), dialog.destroy()]).grid(row=8, column=0, sticky="w", padx=16, pady=8)
+        tk.Button(dialog, text="Зберегти 6055", command=lambda: [self.save_source_changes(), dialog.destroy()]).grid(row=8, column=1, sticky="w", pady=8)
         tk.Button(dialog, text="Закрити", command=dialog.destroy).grid(row=8, column=2, sticky="e", padx=12, pady=12)
 
     def _on_state_change(self, *_):
@@ -1206,27 +1215,27 @@ class App:
         out_dir.mkdir(parents=True, exist_ok=True)
         return out_dir
 
-    def save_draft(self, kind: str, open_after: bool = True, output_dir: Path | None = None) -> Path:
+    def save_draft(self, kind: str, open_after: bool = True, output_dir: Path | None = None, use_timestamp: bool = True) -> Path:
         state = self.collect_state()
         payload, errors, warnings = validate_state(state)
         if errors:
             raise ValueError("Потрібно виправити помилки перед збереженням: " + "; ".join(errors))
 
         out_dir = output_dir or self._ensure_output_dir()
-        ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts = f"_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}" if use_timestamp else ""
 
         if kind == "act":
-            out_path = out_dir / f"6055_MOTO_filled_{ts}.xls"
-            generate_act_xls_from_state(state, Path(self.moto_path.get()), out_path)
+            out_path = out_dir / f"6055_akt{ts}.xls"
+            generate_act_xls_from_state(state, Path(self.source_path.get()), out_path)
         elif kind == "contract":
             if IS_WINDOWS:
-                out_path = out_dir / f"DOGOVIR_6055_filled_{ts}.doc"
-                generate_contract_doc_windows_from_state(state, Path(self.dogovir_path.get()), out_path)
+                out_path = out_dir / f"dogovir{ts}.doc"
+                out_path = generate_contract_doc_windows_from_state(state, Path(self.dogovir_path.get()), out_path)
             else:
-                out_path = out_dir / f"DOGOVIR_preview_{ts}.txt"
+                out_path = out_dir / f"dogovir{ts}.txt"
                 save_text_preview(out_path, "ЧОРНОВИК ДОГОВОРУ", preview_text_for_contract(payload))
         elif kind == "vidatkova":
-            out_path = out_dir / f"vidatkova_filled_{ts}.xls"
+            out_path = out_dir / f"vidatkova{ts}.xls"
             generate_vidatkova_xls_from_state(state, Path(self.vidatkova_path.get()), out_path)
         else:
             raise ValueError(f"Невідомий тип чорновика: {kind}")
@@ -1243,12 +1252,23 @@ class App:
     def generate_all(self) -> None:
         try:
             state = self.collect_state()
+            payload, errors, _ = validate_state(state)
+            if errors:
+                messagebox.showerror("Помилки валідації", "\n".join(errors))
+                return
             base_out_dir = self._ensure_output_dir()
-            case_dir = ensure_case_dir(base_out_dir, state, unique=True)
-            self.save_draft("act", output_dir=case_dir)
-            self.save_draft("contract", output_dir=case_dir)
-            self.save_draft("vidatkova", output_dir=case_dir)
-            self.status_var.set(f"Усі документи збережено у {case_dir}")
+            case_dir = base_out_dir / build_case_folder_name(state)
+            if case_dir.exists():
+                if not messagebox.askyesno(
+                    "Перезаписати?",
+                    f"Папка вже існує:\n{case_dir}\n\nПерезаписати всі документи?",
+                ):
+                    return
+            case_dir.mkdir(parents=True, exist_ok=True)
+            self.save_draft("act", open_after=False, output_dir=case_dir, use_timestamp=False)
+            self.save_draft("contract", open_after=False, output_dir=case_dir, use_timestamp=False)
+            self.save_draft("vidatkova", open_after=False, output_dir=case_dir, use_timestamp=False)
+            self.status_var.set(f"Усі документи збережено у {case_dir.name}")
             self.write_log(f"Усі документи збережено у {case_dir}")
             if self.open_after_save.get():
                 try:
@@ -1259,146 +1279,88 @@ class App:
             self.write_log(f"ERROR: {exc}")
             self.write_log(traceback.format_exc())
             if messagebox:
-                messagebox.showerror("Error", str(exc))
+                messagebox.showerror("Помилка", str(exc))
 
 
 if tk is not None:
     class DraftWindow(tk.Toplevel):
+        _DEST_STEMS = {"act": "6055_akt", "contract": "dogovir", "vidatkova": "vidatkova"}
+
         def __init__(self, app: App, kind: str):
             super().__init__(app.root)
             self.app = app
             self.kind = kind
+            self._temp_path: "Path | None" = None
             self.title(self._title())
-            self.geometry("860x720")
-            self.minsize(720, 560)
+            self.geometry("640x240")
+            self.resizable(False, False)
+            self.transient(app.root)
 
             self.columnconfigure(0, weight=1)
-            self.rowconfigure(1, weight=1)
 
             header = tk.Frame(self, bg="#0f766e", padx=14, pady=12)
             header.grid(row=0, column=0, sticky="ew")
             header.columnconfigure(0, weight=1)
-            tk.Label(header, text=self._title(), fg="white", bg="#0f766e", font=("Segoe UI", 16, "bold")).grid(row=0, column=0, sticky="w")
-            tk.Label(header, text=self._subtitle(), fg="#ccfbf1", bg="#0f766e", font=("Segoe UI", 10)).grid(row=1, column=0, sticky="w", pady=(2, 0))
+            tk.Label(header, text=self._title(), fg="white", bg="#0f766e", font=("Segoe UI", 15, "bold")).grid(row=0, column=0, sticky="w")
+            tk.Label(header, text="Файл відкрито у системній програмі. Перевірте і збережіть.", fg="#ccfbf1", bg="#0f766e", font=("Segoe UI", 9)).grid(row=1, column=0, sticky="w")
 
-            self.notice = tk.Label(self, text="", fg="#991b1b", anchor="w", justify="left", wraplength=820)
-            self.notice.grid(row=1, column=0, sticky="ew", padx=14, pady=(10, 0))
+            body = tk.Frame(self, bg="#f4efe7", padx=16, pady=14)
+            body.grid(row=1, column=0, sticky="ew")
+            body.columnconfigure(0, weight=1)
+            self.status_lbl = tk.Label(body, text="Генерація файлу...", bg="#f4efe7", fg="#374151", anchor="w", wraplength=600)
+            self.status_lbl.grid(row=0, column=0, sticky="ew")
+            self.path_lbl = tk.Label(body, text="", bg="#f4efe7", fg="#6b7280", anchor="w", wraplength=600, font=("Segoe UI", 9))
+            self.path_lbl.grid(row=1, column=0, sticky="ew", pady=(4, 0))
 
-            preview_host = tk.Frame(self, bg="#dbe4ea")
-            preview_host.grid(row=2, column=0, sticky="nsew", padx=14, pady=10)
-            preview_host.columnconfigure(0, weight=1)
-            preview_host.rowconfigure(0, weight=1)
+            actions = tk.Frame(self, bg="#f4efe7", padx=16, pady=12)
+            actions.grid(row=2, column=0, sticky="ew")
+            ttk.Button(actions, text="Зберегти в папку клієнта", command=self.save_to_case).pack(side="left", padx=(0, 8))
+            ttk.Button(actions, text="Відкрити знову", command=self._open_in_app).pack(side="left", padx=(0, 8))
+            ttk.Button(actions, text="Закрити", command=self.destroy).pack(side="left")
 
-            self.preview_canvas = tk.Canvas(preview_host, bg="#dbe4ea", highlightthickness=0)
-            preview_scroll = ttk.Scrollbar(preview_host, orient="vertical", command=self.preview_canvas.yview)
-            self.preview_canvas.configure(yscrollcommand=preview_scroll.set)
-            self.preview_canvas.grid(row=0, column=0, sticky="nsew")
-            preview_scroll.grid(row=0, column=1, sticky="ns")
-
-            self.preview_frame = tk.Frame(self.preview_canvas, bg="#dbe4ea")
-            self.preview_window = self.preview_canvas.create_window((0, 0), window=self.preview_frame, anchor="nw")
-            self.preview_frame.bind("<Configure>", lambda e: self.preview_canvas.configure(scrollregion=self.preview_canvas.bbox("all")))
-            self.preview_canvas.bind("<Configure>", self._resize_preview_window)
-
-            actions = ttk.Frame(self, padding=(14, 0, 14, 14))
-            actions.grid(row=3, column=0, sticky="ew")
-            actions.columnconfigure(0, weight=1)
-            actions.columnconfigure(1, weight=1)
-            actions.columnconfigure(2, weight=1)
-
-            ttk.Button(actions, text="Зберегти", command=self.save).grid(row=0, column=0, sticky="ew", padx=4)
-            ttk.Button(actions, text="Відкрити у редакторі", command=self.open_external).grid(row=0, column=1, sticky="ew", padx=4)
-            ttk.Button(actions, text="Закрити", command=self.destroy).grid(row=0, column=2, sticky="ew", padx=4)
-
-            self._refresh_preview()
+            self.after(100, self._generate_and_open)
 
         def _title(self) -> str:
-            return {
-                "act": "Чорновик акту 6055",
-                "contract": "Чорновик договору",
-                "vidatkova": "Чорновик видаткової",
-            }[self.kind]
+            return {"act": "Акт 6055", "contract": "Договір", "vidatkova": "Видаткова"}[self.kind]
 
-        def _subtitle(self) -> str:
-            return {
-                "act": "Це попередній перегляд перед генерацією фінального файлу.",
-                "contract": "На Windows зберігає Word-документ, на інших системах створює текстовий чорновик.",
-                "vidatkova": "Окрема видаткова накладна, заповнена з тієї ж форми даних.",
-            }[self.kind]
-
-        def _resize_preview_window(self, event) -> None:
-            self.preview_canvas.itemconfigure(self.preview_window, width=event.width)
-
-        def _render_preview_document(self, payload: Dict[str, str]) -> None:
-            for child in self.preview_frame.winfo_children():
-                child.destroy()
-
-            paper = tk.Frame(self.preview_frame, bg="#fffdf8", highlightbackground="#cbd5e1", highlightthickness=1, padx=24, pady=22)
-            paper.grid(row=0, column=0, sticky="ew", padx=20, pady=12)
-            paper.columnconfigure(0, weight=1)
-            paper.columnconfigure(1, weight=1)
-
-            tk.Label(paper, text=self._title().upper(), font=("Segoe UI", 18, "bold"), bg="#fffdf8", fg="#111827").grid(row=0, column=0, columnspan=2, sticky="w")
-            tk.Label(paper, text=self._subtitle(), font=("Segoe UI", 10), bg="#fffdf8", fg="#6b7280").grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 14))
-
-            sections = preview_blocks(self.kind, payload)
-            for index, (section_title, rows) in enumerate(sections):
-                row = index // 2 + 2
-                col = index % 2
-                card = tk.Frame(paper, bg="#ffffff", highlightbackground="#e5e7eb", highlightthickness=1, padx=14, pady=12)
-                card.grid(row=row, column=col, sticky="nsew", padx=8, pady=8)
-                paper.grid_columnconfigure(col, weight=1)
-
-                tk.Label(card, text=section_title, font=("Segoe UI", 11, "bold"), bg="#ffffff", fg="#7c2d12").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
-                card.columnconfigure(1, weight=1)
-                for item_index, (label, value) in enumerate(rows, start=1):
-                    tk.Label(card, text=label, font=("Segoe UI", 9, "bold"), bg="#ffffff", fg="#374151").grid(row=item_index, column=0, sticky="nw", padx=(0, 10), pady=3)
-                    value_box = tk.Label(card, text=value or "-", font=("Segoe UI", 10), bg="#f8fafc", fg="#111827", anchor="w", justify="left", wraplength=280, padx=8, pady=6)
-                    value_box.grid(row=item_index, column=1, sticky="ew", pady=3)
-
-            footer = tk.Frame(paper, bg="#fffdf8")
-            footer.grid(row=10, column=0, columnspan=2, sticky="ew", pady=(16, 0))
-            footer.columnconfigure(0, weight=1)
-            footer.columnconfigure(1, weight=1)
-            tk.Label(footer, text="Перевірте реквізити перед збереженням.", font=("Segoe UI", 9, "italic"), bg="#fffdf8", fg="#6b7280").grid(row=0, column=0, sticky="w")
-            tk.Label(footer, text=f"Покупець: {payload.get('C15', payload.get('FIO', ''))}", font=("Segoe UI", 9), bg="#fffdf8", fg="#6b7280").grid(row=0, column=1, sticky="e")
-
-        def _refresh_preview(self) -> None:
-            payload, errors, warnings = validate_state(self.app.collect_state())
-            self.notice.configure(text=("\n".join(errors + warnings) if errors or warnings else "Помилок і попереджень немає."))
-            self._render_preview_document(payload)
-
-        def save(self) -> None:
+        def _generate_and_open(self) -> None:
+            import tempfile
             try:
-                path = self.app.save_draft(self.kind)
-                self.app.write_log(f"Чорновик збережено: {path}")
-                if messagebox:
-                    messagebox.showinfo("Збережено", f"Файл збережено:\n{path}")
+                tmp_dir = Path(tempfile.mkdtemp(prefix="japan_moto_"))
+                self._temp_path = self.app.save_draft(self.kind, open_after=False, output_dir=tmp_dir)
+                self.status_lbl.configure(text="Файл відкрито. Перевірте документ у системній програмі, потім збережіть або закрийте.")
+                self.path_lbl.configure(text=f"Тимчасовий файл: {self._temp_path}")
+                self._open_in_app()
             except Exception as exc:
-                if messagebox:
-                    messagebox.showerror("Помилка", str(exc))
-                self.app.write_log(f"ERROR: {exc}")
+                self.status_lbl.configure(text=f"Помилка генерації: {exc}", fg="#991b1b")
+                self.app.write_log(f"DraftWindow error: {exc}")
 
-        def open_external(self) -> None:
-            try:
-                out_dir = self.app._ensure_output_dir()
-                if self.kind == "act":
-                    matches = sorted(out_dir.glob("6055_MOTO_filled_*.xls"))
-                    file_name = matches[-1] if matches else None
-                elif self.kind == "contract":
-                    patterns = ["DOGOVIR_6055_filled_*.doc", "DOGOVIR_preview_*.txt"]
-                    matches = []
-                    for pattern in patterns:
-                        matches.extend(sorted(out_dir.glob(pattern)))
-                    file_name = matches[-1] if matches else None
-                else:
-                    matches = sorted(out_dir.glob("vidatkova_filled_*.xls"))
-                    file_name = matches[-1] if matches else None
-                if file_name:
-                    open_file_with_preference(file_name, self.app.editor_path.get().strip())
-            except Exception as exc:
-                if messagebox:
-                    messagebox.showerror("Помилка", str(exc))
+        def _open_in_app(self) -> None:
+            if self._temp_path and self._temp_path.exists():
+                try:
+                    open_file_with_preference(self._temp_path, self.app.editor_path.get().strip())
+                except Exception as exc:
+                    messagebox.showerror("Помилка", str(exc), parent=self)
+            else:
+                messagebox.showwarning("Немає файлу", "Файл не знайдено. Зачекайте генерацію.", parent=self)
+
+        def save_to_case(self) -> None:
+            if not self._temp_path or not self._temp_path.exists():
+                messagebox.showwarning("Немає файлу", "Спочатку дочекайтесь генерації.", parent=self)
+                return
+            state = self.app.collect_state()
+            base_out_dir = self.app._ensure_output_dir()
+            case_dir = base_out_dir / build_case_folder_name(state)
+            dest_name = self._DEST_STEMS.get(self.kind, self._temp_path.stem) + self._temp_path.suffix
+            dest = case_dir / dest_name
+            if dest.exists():
+                if not messagebox.askyesno("Перезаписати?", f"Файл вже існує:\n{dest}\n\nПерезаписати?", parent=self):
+                    return
+            case_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(self._temp_path, dest)
+            messagebox.showinfo("Збережено", f"Файл збережено:\n{dest}", parent=self)
+            self.app.write_log(f"Збережено: {dest}")
+            self.app.status_var.set(f"Збережено {dest.name}")
 else:
     class DraftWindow:
         def __init__(self, *args, **kwargs):

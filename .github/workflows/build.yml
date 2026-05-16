@@ -31,10 +31,10 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-windows.txt
 
-      - name: Build one-file exe
+      - name: Build onedir exe
         shell: pwsh
         run: |
-          python -m PyInstaller --noconfirm --clean --noupx --onefile --windowed --name JapanMoto `
+          python -m PyInstaller --noconfirm --clean --noupx --onedir --windowed --name JapanMoto `
             --collect-submodules win32com --collect-data win32com `
             --add-data "6055.xls;." `
             --add-data "6055_MOTO_template.xls;." `
@@ -42,11 +42,15 @@ jobs:
             --add-data "vidatkova.xls;." `
             app_6055.py
 
+      - name: Zip release folder
+        shell: pwsh
+        run: Compress-Archive -Path dist/JapanMoto -DestinationPath dist/JapanMoto.zip
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: JapanMoto-windows
-          path: dist/JapanMoto.exe
+          path: dist/JapanMoto.zip
 
       - name: Publish latest public release asset
         if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
@@ -60,9 +64,9 @@ jobs:
 
           gh release view $tag --repo $env:GITHUB_REPOSITORY 2>$null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag dist/JapanMoto.exe --title "$title" --notes "$notes" --latest --repo $env:GITHUB_REPOSITORY
+            gh release create $tag dist/JapanMoto.zip --title "$title" --notes "$notes" --latest --repo $env:GITHUB_REPOSITORY
           }
           else {
-            gh release upload $tag dist/JapanMoto.exe --clobber --repo $env:GITHUB_REPOSITORY
+            gh release upload $tag dist/JapanMoto.zip --clobber --repo $env:GITHUB_REPOSITORY
             gh release edit $tag --title "$title" --notes "$notes" --latest --repo $env:GITHUB_REPOSITORY
           }

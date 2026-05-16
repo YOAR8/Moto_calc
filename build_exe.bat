@@ -18,7 +18,7 @@ pyinstaller ^
   --noconfirm ^
   --clean ^
   --noupx ^
-  --onefile ^
+  --onedir ^
   --windowed ^
   --name JapanMoto ^
   --collect-submodules win32com ^
@@ -30,6 +30,16 @@ pyinstaller ^
   app_6055.py
 
 echo.
-echo Build complete. Run: dist\JapanMoto.exe
-echo Output files will be created in %%USERPROFILE%%\Documents\JapanMoto\out
-echo Full generation creates a separate buyer folder using the short FIO.
+echo Build complete.  Folder: dist\JapanMoto\
+echo Executable:      dist\JapanMoto\JapanMoto.exe
+
+:: Create desktop shortcut
+powershell -NoProfile -Command ^
+  "$ws = New-Object -ComObject WScript.Shell; ^
+   $s  = $ws.CreateShortcut([Environment]::GetFolderPath('Desktop') + '\Japan moto.lnk'); ^
+   $s.TargetPath   = '%~dp0dist\JapanMoto\JapanMoto.exe'; ^
+   $s.WorkingDirectory = '%~dp0dist\JapanMoto'; ^
+   $s.Description  = 'Japan moto — акт, договір, видаткова'; ^
+   $s.Save()"
+
+echo Desktop shortcut created: Japan moto.lnk
