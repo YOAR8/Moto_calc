@@ -95,9 +95,17 @@ def write_xls_cells(path: Path, sheet_name: str, updates: Dict[str, object], bac
         raise ValueError(f"Sheet not found: {sheet_name}")
 
     ws = wb.get_sheet(sheet_idx)
+    rs = rb.sheet_by_index(sheet_idx)
     for addr, value in updates.items():
         r, c = a1_to_rc(addr)
+        orig_xf = rs.cell_xf_index(r, c)
         ws.write(r, c, value)
+        # Restore original XF index so cell formatting (fonts, borders, etc.) is preserved
+        row_obj = ws._Worksheet__rows.get(r)
+        if row_obj is not None:
+            cell_obj = row_obj._Row__cells.get(c)
+            if cell_obj is not None:
+                cell_obj.xf_idx = orig_xf
 
     wb.save(str(path))
 
@@ -342,7 +350,7 @@ FIELD_SECTIONS = [
         ],
     ),
     (
-        "Ідентифікатори",
+        "",  # Ідентифікатори + Вартість — no section header
         [
             ("C35", "Кількість циліндрів", False),
             ("C36", "Об'єм двигуна", True),
@@ -354,11 +362,6 @@ FIELD_SECTIONS = [
             ("C42", "Номер шасі", True),
             ("C43", "Номер рами", True),
             ("C50", "Номерні знаки", False),
-        ],
-    ),
-    (
-        "Вартість",
-        [
             ("C44", "Ціна без ПДВ", True),
             ("C45", "ПДВ", True),
             ("C46", "Ціна з ПДВ", True),
@@ -366,16 +369,11 @@ FIELD_SECTIONS = [
         ],
     ),
     (
-        "Реквізити покупця",
-        [
-            ("C12", "Дата народження", False),
-        ],
-    ),
-    (
         "Покупець",
         [
             ("C15", "ПІБ покупця", True),
             ("E15", "ПІБ скорочено", False),
+            ("C12", "Дата народження", False),
             ("C16", "Адреса", True),
             ("C17", "Паспорт", True),
             ("C18", "ІПН / код", True),
@@ -845,6 +843,22 @@ def generate_vidatkova_xls_from_state(state: Dict[str, str], template_path: Path
     return out_path
 
 
+def _try_libreoffice_to_doc(src_docx: Path, out_dir: Path) -> "Path | None":
+    """Convert .docx → .doc via LibreOffice CLI. Returns .doc Path on success, None otherwise."""
+    try:
+        result = subprocess.run(
+            ["libreoffice", "--headless", "--convert-to", "doc",
+             "--outdir", str(out_dir), str(src_docx)],
+            capture_output=True, timeout=60,
+        )
+        if result.returncode == 0:
+            candidate = out_dir / (src_docx.stem + ".doc")
+            return candidate if candidate.exists() else None
+    except Exception:
+        pass
+    return None
+
+
 def generate_contract_docx_fallback(state: Dict[str, str], out_path: Path) -> "Path | None":
     """Generate full-text contract .docx without Word COM. Returns None if python-docx unavailable."""
     try:
@@ -861,6 +875,9 @@ def generate_contract_docx_fallback(state: Dict[str, str], out_path: Path) -> "P
         return val if val else "___"
 
     doc = Document()
+    # Use Times New Roman 12pt throughout for legal document appearance
+    doc.styles["Normal"].font.name = "Times New Roman"
+    doc.styles["Normal"].font.size = Pt(12)
     for sec in doc.sections:
         sec.top_margin = Cm(2)
         sec.bottom_margin = Cm(2)
@@ -939,7 +956,7 @@ def generate_contract_docx_fallback(state: Dict[str, str], out_path: Path) -> "P
     add_bold_para("2. ЦІНА ДОГОВОРУ")
     add_para(
         f"2.1. За домовленістю сторін ціна Транспортного засобу складає {v('price')} "
-        f"({v('sumtext')}) гривень 00 копійок.",
+        f"({v('sumtext')}).",
         indent=True,
     )
     add_para(
@@ -1016,6 +1033,13 @@ def generate_contract_doc_windows_from_state(state: Dict[str, str], dogovir_temp
     except Exception:
         fb_docx = generate_contract_docx_fallback(state, out_path.with_suffix(".docx"))
         if fb_docx:
+            doc_result = _try_libreoffice_to_doc(fb_docx, out_path.parent)
+            if doc_result:
+                try:
+                    fb_docx.unlink()
+                except Exception:
+                    pass
+                return doc_result
             return fb_docx
         fb_txt = out_path.with_suffix(".txt")
         save_text_preview(fb_txt, "ЧОРНОВИК ДОГОВОРУ", preview_text_for_contract(payload))
@@ -1074,6 +1098,184 @@ _BUILTIN_SUGGESTIONS: Dict[str, list] = {
     "C26": ["МОТОЦИКЛ", "МОПЕД", "СКУТЕР"],
     "C27": ["БЕНЗИН", "ДИЗЕЛЬ", "ЕЛЕКТРО"],
 }
+
+
+class SmartEntry(tk.Frame if tk is not None else object):
+    """Auto-expanding multiline entry (tk.Text, wrap=word, 1-4 lines) with StringVar sync and autocomplete."""
+
+    def __init__(self, master, cell: str, textvariable: "tk.StringVar", **kwargs):
+        kwargs.pop("relief", None)
+        kwargs.pop("highlightthickness", None)
+        kwargs.pop("bd", None)
+        bg = kwargs.pop("bg", "white")
+        super().__init__(master, bg=bg, highlightbackground="#d1d5db",
+                         highlightthickness=1, **kwargs)
+        self._cell = cell
+        self._var = textvariable
+        self._syncing = False
+        self._popup: "tk.Toplevel | None" = None
+        self._lb: "tk.Listbox | None" = None
+
+        self.columnconfigure(0, weight=1)
+        self._text = tk.Text(
+            self, height=1, wrap="word", relief="flat", bd=0,
+            bg=bg, fg="#374151", insertbackground="#111827",
+            font=("Segoe UI", 10), padx=4, pady=2, undo=True,
+        )
+        self._text.grid(row=0, column=0, sticky="ew")
+
+        textvariable.trace_add("write", self._on_var_change)
+        self._set_text_value(textvariable.get())
+        self.after(50, self._adjust_height)
+
+        self._text.bind("<<Modified>>", self._on_text_modified)
+        self._text.bind("<KeyRelease>", self._on_key)
+        self._text.bind("<FocusOut>", self._close_popup)
+        self._text.bind("<Escape>", self._close_popup)
+        self._text.bind("<Down>", self._move_down)
+        self._text.bind("<Up>", self._move_up)
+        self._text.bind("<Tab>", self._on_tab)
+        self._text.bind("<Return>", self._on_return)
+
+    def set_bg(self, color: str) -> None:
+        self._text.configure(bg=color)
+        self.configure(bg=color)
+
+    def _set_text_value(self, value: str) -> None:
+        self._text.delete("1.0", "end")
+        if value:
+            self._text.insert("1.0", str(value))
+        self._text.edit_modified(False)
+        self._adjust_height()
+
+    def _adjust_height(self) -> None:
+        content = self._text.get("1.0", "end-1c")
+        if not content:
+            self._text.configure(height=1)
+            return
+        w = self._text.winfo_width()
+        chars_per_line = max(20, w // 7) if w > 20 else 50
+        wrapped_lines = sum(
+            max(1, (len(seg) + chars_per_line - 1) // chars_per_line)
+            for seg in content.split("\n")
+        )
+        self._text.configure(height=min(max(1, wrapped_lines), 4))
+
+    def _on_var_change(self, *_) -> None:
+        if self._syncing:
+            return
+        self._syncing = True
+        new_val = self._var.get()
+        if self._text.get("1.0", "end-1c") != new_val:
+            self._set_text_value(new_val)
+        self._syncing = False
+
+    def _on_text_modified(self, *_) -> None:
+        if not self._text.edit_modified():
+            return
+        if self._syncing:
+            self._text.edit_modified(False)
+            return
+        self._syncing = True
+        new_val = self._text.get("1.0", "end-1c")
+        if self._var.get() != new_val:
+            self._var.set(new_val)
+        self._text.edit_modified(False)
+        self._adjust_height()
+        self._syncing = False
+
+    # ── autocomplete ────────────────────────────────────────────────────────
+    def _candidates(self) -> list:
+        typed = self._var.get().strip().upper()
+        all_ = AutocompleteEntry._suggestions.get(self._cell, [])
+        if not typed:
+            return all_[:8]
+        return [v for v in all_ if v.upper().startswith(typed)][:8]
+
+    def _open_popup(self, candidates: list) -> None:
+        if not candidates:
+            self._close_popup()
+            return
+        if self._popup is None or not self._popup.winfo_exists():
+            self._popup = tk.Toplevel(self._text)
+            self._popup.wm_overrideredirect(True)
+            self._popup.wm_attributes("-topmost", True)
+            self._lb = tk.Listbox(
+                self._popup, relief="solid", bd=1,
+                selectbackground="#e07b39", selectforeground="white",
+                font=("Segoe UI", 9), activestyle="none",
+            )
+            self._lb.pack(fill="both", expand=True)
+            self._lb.bind("<ButtonRelease-1>",
+                          lambda e: self._pick(self._lb.curselection()))
+        self._lb.delete(0, "end")
+        for c in candidates:
+            self._lb.insert("end", c)
+        self.update_idletasks()
+        x = self._text.winfo_rootx()
+        y = self._text.winfo_rooty() + self._text.winfo_height()
+        w = max(self._text.winfo_width(), 200)
+        h = min(len(candidates) * 22 + 4, 180)
+        self._popup.geometry(f"{w}x{h}+{x}+{y}")
+        self._popup.deiconify()
+
+    def _close_popup(self, *_) -> None:
+        if self._popup and self._popup.winfo_exists():
+            self._popup.withdraw()
+
+    def _on_key(self, event) -> None:
+        if event.keysym in ("Down", "Up", "Return", "Escape", "Tab"):
+            return
+        self._open_popup(self._candidates())
+
+    def _move_down(self, event) -> str:
+        if self._popup and self._popup.winfo_viewable() and self._lb:
+            cur = self._lb.curselection()
+            nxt = (cur[0] + 1) if cur else 0
+            if nxt < self._lb.size():
+                self._lb.selection_clear(0, "end")
+                self._lb.selection_set(nxt)
+                self._lb.see(nxt)
+        return "break"
+
+    def _move_up(self, event) -> str:
+        if self._popup and self._popup.winfo_viewable() and self._lb:
+            cur = self._lb.curselection()
+            if cur and cur[0] > 0:
+                self._lb.selection_clear(0, "end")
+                self._lb.selection_set(cur[0] - 1)
+                self._lb.see(cur[0] - 1)
+        return "break"
+
+    def _on_tab(self, event) -> "str | None":
+        if self._popup and self._popup.winfo_viewable() and self._lb:
+            cur = self._lb.curselection()
+            if not cur and self._lb.size() > 0:
+                self._lb.selection_set(0)
+                cur = (0,)
+            if cur:
+                self._pick(cur)
+                return "break"
+        return None
+
+    def _on_return(self, event) -> str:
+        if self._popup and self._popup.winfo_viewable() and self._lb:
+            cur = self._lb.curselection()
+            if cur:
+                self._pick(cur)
+        self._close_popup()
+        return "break"  # always prevent newline insertion
+
+    def _pick(self, sel) -> None:
+        if not sel or self._lb is None:
+            return
+        value = self._lb.get(sel[0])
+        self._syncing = True
+        self._var.set(value)
+        self._syncing = False
+        self._set_text_value(value)
+        self._close_popup()
+        self._text.focus_set()
 
 
 class AutocompleteEntry(tk.Entry if tk is not None else object):
@@ -1346,24 +1548,41 @@ class App:
         button = tk.Button(parent, text=text, command=command, bg="#111827", fg="white", activebackground="#1f2937", activeforeground="white", bd=0, relief="flat", padx=10, pady=4, cursor="hand2")
         button.grid(row=0, column=column, padx=(0, 6), sticky="e")
 
-    def _add_copy_paste_menu(self, entry: tk.Entry) -> None:
-        menu = tk.Menu(entry, tearoff=0)
-        menu.add_command(label="Вирізати", command=lambda: entry.event_generate("<<Cut>>"))
-        menu.add_command(label="Копіювати", command=lambda: entry.event_generate("<<Copy>>"))
-        menu.add_command(label="Вставити", command=lambda: entry.event_generate("<<Paste>>"))
+    def _add_copy_paste_menu(self, entry) -> None:
+        if isinstance(entry, SmartEntry):
+            target = entry._text
+
+            def _select_all_fn() -> None:
+                target.tag_add("sel", "1.0", "end")
+                target.focus_set()
+
+            def _select_all(event: "tk.Event") -> str:
+                target.tag_add("sel", "1.0", "end")
+                return "break"
+        else:
+            target = entry
+
+            def _select_all_fn() -> None:
+                target.select_range(0, "end")
+                target.focus_set()
+
+            def _select_all(event: "tk.Event") -> str:
+                event.widget.select_range(0, "end")
+                event.widget.icursor("end")
+                return "break"
+
+        menu = tk.Menu(target, tearoff=0)
+        menu.add_command(label="Вирізати", command=lambda: target.event_generate("<<Cut>>"))
+        menu.add_command(label="Копіювати", command=lambda: target.event_generate("<<Copy>>"))
+        menu.add_command(label="Вставити", command=lambda: target.event_generate("<<Paste>>"))
         menu.add_separator()
-        menu.add_command(label="Виділити все", command=lambda: (entry.select_range(0, "end"), entry.focus_set()))
+        menu.add_command(label="Виділити все", command=_select_all_fn)
 
         def _show_menu(event: "tk.Event") -> None:
             menu.tk_popup(event.x_root, event.y_root)
 
-        def _select_all(event: "tk.Event") -> str:
-            event.widget.select_range(0, "end")
-            event.widget.icursor("end")
-            return "break"
-
-        entry.bind("<Button-3>", _show_menu)
-        entry.bind("<Control-a>", _select_all)
+        target.bind("<Button-3>", _show_menu)
+        target.bind("<Control-a>", _select_all)
 
     def _build_data_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -1413,12 +1632,17 @@ class App:
             self._build_field_section(card, group_name, fields)
 
     def _build_field_section(self, parent, group_name: str, fields):
-        tk.Label(parent, text=group_name, bg="#fffdf8", fg="#7c2d12", font=("Segoe UI", 12, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
         parent.columnconfigure(1, weight=1)
+        row_offset = 0
+        if group_name:
+            tk.Label(parent, text=group_name, bg="#fffdf8", fg="#7c2d12",
+                     font=("Segoe UI", 12, "bold")).grid(
+                         row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+            row_offset = 1
         for row, (cell, label, required) in enumerate(fields):
-            row += 1
+            actual_row = row + row_offset
             display = f"{label}{' *' if required else ''}"
-            tk.Label(parent, text=display, bg="#fffdf8", fg="#374151", anchor="w").grid(row=row, column=0, sticky="w", padx=(0, 10), pady=4)
+            tk.Label(parent, text=display, bg="#fffdf8", fg="#374151", anchor="w").grid(row=actual_row, column=0, sticky="w", padx=(0, 10), pady=4)
 
             var = self.state_vars[cell]
             if cell == "E15":
@@ -1426,9 +1650,8 @@ class App:
                                  bg="#eef2ff", fg="#374151", insertbackground="#111827",
                                  state="readonly", readonlybackground="#eef2ff")
             else:
-                entry = AutocompleteEntry(parent, cell=cell, textvariable=var, relief="flat",
-                                         highlightthickness=1, bd=0, bg="white", insertbackground="#111827")
-            entry.grid(row=row, column=1, sticky="ew", pady=4)
+                entry = SmartEntry(parent, cell=cell, textvariable=var)
+            entry.grid(row=actual_row, column=1, sticky="ew", pady=4)
             self.widgets[cell] = entry
 
             self._add_copy_paste_menu(entry)
@@ -1511,12 +1734,19 @@ class App:
         _payload, errors, _warnings = self.refresh_validation(silent=True)
         self._syncing_form = False
         if not errors and not self._generation_suggested:
-            self._generation_suggested = True
-            if messagebox and messagebox.askyesno(
-                "Готово до генерації",
-                "Всі обов'язкові поля заповнено!\n\nСгенерувати всі документи зараз?",
-            ):
-                self.generate_all()
+            _countable = [c for c in FORM_CELLS if c not in ("E15", "DISC")]
+            _filled = sum(
+                1 for c in _countable
+                if self.state_vars.get(c, tk.StringVar()).get().strip()
+            )
+            _pct = _filled / len(_countable) if _countable else 1.0
+            if _pct >= 0.9:
+                self._generation_suggested = True
+                if messagebox and messagebox.askyesno(
+                    "Готово до генерації",
+                    "Всі обов'язкові поля заповнено!\n\nСгенерувати всі документи зараз?",
+                ):
+                    self.generate_all()
 
     def collect_state(self) -> Dict[str, str]:
         state = {cell: var.get().strip() for cell, var in self.state_vars.items()}
@@ -1534,11 +1764,15 @@ class App:
             if cell == "E15":
                 continue
             if cell in invalid_cells:
-                entry.configure(bg="#fee2e2")
+                bg = "#fee2e2"
             elif cell in warning_cells:
-                entry.configure(bg="#fef3c7")
+                bg = "#fef3c7"
             else:
-                entry.configure(bg="#ffffff")
+                bg = "#ffffff"
+            if isinstance(entry, SmartEntry):
+                entry.set_bg(bg)
+            else:
+                entry.configure(bg=bg)
 
         self.summary_var.set(f"Заповнено: {sum(1 for v in state.values() if v)} полів. Номер: {payload.get('Number', '')} | Дата: {payload.get('Data', '')}")
         self.error_var.set("Помилки: " + ("; ".join(errors) if errors else "немає"))
@@ -1632,12 +1866,20 @@ class App:
                 out_path = out_dir / f"Договір{num_part}{ts}.doc"
                 out_path = generate_contract_doc_windows_from_state(state, Path(self.dogovir_path.get()), out_path)
             else:
-                out_path = out_dir / f"Договір{num_part}{ts}.docx"
-                result = generate_contract_docx_fallback(state, out_path)
+                tmp_docx = out_dir / f"Договір{num_part}{ts}.docx"
+                result = generate_contract_docx_fallback(state, tmp_docx)
                 if result:
-                    out_path = result
+                    doc_result = _try_libreoffice_to_doc(result, out_dir)
+                    if doc_result:
+                        try:
+                            result.unlink()
+                        except Exception:
+                            pass
+                        out_path = doc_result
+                    else:
+                        out_path = result
                 else:
-                    out_path = out_path.with_suffix(".txt")
+                    out_path = tmp_docx.with_suffix(".txt")
                     save_text_preview(out_path, "ЧОРНОВИК ДОГОВОРУ", preview_text_for_contract(payload))
         elif kind == "vidatkova":
             out_path = out_dir / f"Видаткова{num_part}{ts}.xls"
