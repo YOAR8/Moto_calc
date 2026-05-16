@@ -6,9 +6,15 @@ on:
     branches:
       - main
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write
+
 jobs:
   build-windows:
-    runs-on: windows-latest
+    runs-on: windows-2025
 
     steps:
       - name: Checkout
@@ -41,3 +47,22 @@ jobs:
         with:
           name: JapanMoto-windows
           path: dist/JapanMoto.exe
+
+      - name: Publish latest public release asset
+        if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "latest-build"
+          $title = "JapanMoto latest build"
+          $notes = "Automated build from commit $env:GITHUB_SHA"
+
+          gh release view $tag --repo $env:GITHUB_REPOSITORY 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag dist/JapanMoto.exe --title "$title" --notes "$notes" --latest --repo $env:GITHUB_REPOSITORY
+          }
+          else {
+            gh release upload $tag dist/JapanMoto.exe --clobber --repo $env:GITHUB_REPOSITORY
+            gh release edit $tag --title "$title" --notes "$notes" --latest --repo $env:GITHUB_REPOSITORY
+          }
