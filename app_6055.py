@@ -5,6 +5,7 @@ import os
 import platform
 import subprocess
 import re
+import json
 import shutil
 import sys
 import tempfile
@@ -28,7 +29,7 @@ IS_WINDOWS = platform.system().lower().startswith("win")
 
 
 def detect_theme_mode() -> str:
-    """Return 'dark' or 'light' based on OS preference (Windows registry)."""
+    """Return 'dark' or 'light' based on OS preference."""
     if IS_WINDOWS:
         try:
             import winreg  # type: ignore
@@ -41,6 +42,21 @@ def detect_theme_mode() -> str:
             return "light" if int(apps_use_light) == 1 else "dark"
         except Exception:
             pass
+    else:
+        # Linux/macOS: try gsettings (GNOME/GTK)
+        for _gsettings_cmd in (
+            ["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"],
+            ["gsettings", "get", "org.gnome.desktop.interface", "gtk-theme"],
+        ):
+            try:
+                _r = subprocess.run(_gsettings_cmd, capture_output=True, text=True, timeout=2)
+                if "dark" in _r.stdout.lower():
+                    return "dark"
+            except Exception:
+                continue
+        # Time-based fallback: dark between 20:00 and 07:00
+        if dt.datetime.now().hour < 7 or dt.datetime.now().hour >= 20:
+            return "dark"
     return "light"
 
 
@@ -176,6 +192,32 @@ def _fill_docx_runs(para, values: Dict[str, str]) -> None:
                             r.text = ""
 
 
+def _remove_form_field_shading(doc) -> None:
+    """Remove gray form-field backgrounds from a filled .docx (w:sdt controls + w:shd shading)."""
+    try:
+        from docx.oxml.ns import qn  # type: ignore
+    except ImportError:
+        return
+    # Unwrap SDT content controls (structured document tags render as gray form boxes)
+    for sdt in list(doc.element.body.iter(qn("w:sdt"))):
+        sdt_content = sdt.find(qn("w:sdtContent"))
+        if sdt_content is not None:
+            parent = sdt.getparent()
+            if parent is None:
+                continue
+            idx = list(parent).index(sdt)
+            for child in list(sdt_content):
+                parent.insert(idx, child)
+                idx += 1
+            parent.remove(sdt)
+    # Remove run-level shading elements (w:shd causes gray highlight)
+    for run_elem in list(doc.element.body.iter(qn("w:r"))):
+        rpr = run_elem.find(qn("w:rPr"))
+        if rpr is not None:
+            for shd in list(rpr.findall(qn("w:shd"))):
+                rpr.remove(shd)
+
+
 def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out_docx: Path) -> "Path | None":
     """Copy template byte-for-byte then fill placeholders/bookmarks, preserving original formatting."""
     try:
@@ -239,6 +281,7 @@ def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out
                     break
                 node = node.getnext()
 
+    _remove_form_field_shading(doc)
     doc.save(str(out_docx))
     return out_docx if out_docx.exists() else None
 
@@ -1073,6 +1116,7 @@ def generate_act_xls_from_state(state: Dict[str, str], source_6055: Path, out_pa
     if full_fio and short_fio:
         updates["C15"] = f"{full_fio} / {short_fio}"
     updates["D56"] = short_fio or short_name(full_fio)
+    updates.pop("E15", None)  # E15 is app-internal; short name used only in D56
     write_xls_cells(out_path, "Worksheet", updates, backup=False)
     return out_path
 
@@ -1318,6 +1362,104 @@ def generate_contract_doc_windows_from_state(state: Dict[str, str], dogovir_temp
 def save_text_preview(path: Path, title: str, body: str) -> Path:
     path.write_text(f"{title}\n\n{body}\n", encoding="utf-8-sig")
     return path
+
+
+# ---------------------------------------------------------------------------
+# App config persistence
+# ---------------------------------------------------------------------------
+_CONFIG_FILENAME = "jm_config.json"
+
+
+def _config_path() -> Path:
+    return runtime_app_dir() / _CONFIG_FILENAME
+
+
+def load_app_config() -> dict:
+    """Load persisted settings from JSON, returning empty dict on any error."""
+    try:
+        p = _config_path()
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def save_app_config(cfg: dict) -> None:
+    """Persist settings dict to JSON file next to the app."""
+    try:
+        _config_path().write_text(
+            json.dumps(cfg, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Clipboard text parser
+# ---------------------------------------------------------------------------
+def _parse_clipboard_to_fields(text: str) -> Dict[str, str]:
+    """Extract form field values from free-form clipboard text (customer info)."""
+    result: Dict[str, str] = {}
+    clean = " ".join(text.split())  # normalise whitespace
+
+    # ПІБ: 2-4 uppercase Ukrainian/Cyrillic words
+    fio_m = re.search(
+        r'\b([\u0400-\u04FF\u02BC\u2019\'\-]{2,}(?:\s+[\u0400-\u04FF\u02BC\u2019\'\-]{2,}){1,3})\b',
+        clean,
+    )
+    if fio_m:
+        candidate = fio_m.group(1).strip()
+        # Must be all-uppercase and at least 2 words
+        if len(candidate.split()) >= 2 and candidate == candidate.upper():
+            result["C15"] = candidate
+
+    # ІПН / реєстраційний номер: exactly 10 digits
+    tax_m = re.search(r'(?<!\d)(\d{10})(?!\d)', clean)
+    if tax_m:
+        result["C18"] = tax_m.group(1)
+
+    # Паспорт: серія (2 кирилічні літери) + 6 цифр [+ дата + видавник]
+    ps_m = re.search(
+        r'(?:паспорт\s*)?([\u0410-\u042F\u0406\u0407\u0404\u0490]{2})\s*(\d{6})'
+        r'(?:\s*,?\s*від\s*(\d{1,2}[./]\d{1,2}[./]\d{2,4})\s*(?:р\.?)?)?'
+        r'(?:[,;]?\s*вида(?:ний|ним|но)\s+([^,;\n]+))?',
+        clean, re.IGNORECASE,
+    )
+    if ps_m:
+        series, num, date, issuer = ps_m.groups()
+        p = f"{series} {num}"
+        if date:
+            p += f" від {date.replace('/', '.')}"
+        if issuer:
+            p += f", виданий {issuer.strip().rstrip('.')}"
+        result["C17"] = p
+
+    # Дата народження: DD.MM.YYYY р.н. або просто YYYY р.н.
+    dob_m = re.search(
+        r'(\d{1,2}[./]\d{1,2}[./]\d{4})\s*(?:р\.?н\.?|рік?\s*народж|дата\s*народж)',
+        clean, re.IGNORECASE,
+    )
+    if dob_m:
+        result["C12"] = dob_m.group(1).replace("/", ".")
+    else:
+        yr_m = re.search(
+            r'\b(1[89]\d{2}|20[0-2]\d)\s*(?:р\.?н\.?|р\.?\s*народж|рік?\s*народж)',
+            clean, re.IGNORECASE,
+        )
+        if yr_m:
+            result["C12"] = yr_m.group(1)
+
+    # Адреса: після ключових слів
+    addr_m = re.search(
+        r'(?:адреса|адрес[иу]?|зареєстрований\s+за\s+адресою|місце\s+реєстрації)\s*:?\s*([^\n;]+)',
+        clean, re.IGNORECASE,
+    )
+    if addr_m:
+        result["C16"] = addr_m.group(1).strip().rstrip(".,;")
+
+    return result
 
 
 def open_file_with_preference(path: Path, editor_path: str = "") -> None:
@@ -1744,6 +1886,7 @@ class App:
         self.output_dir_var = tk.StringVar(value=str(self.out_dir))
         self.editor_path = tk.StringVar(value="")
         self.open_after_save = tk.BooleanVar(value=True)
+        self.use_word_com = tk.BooleanVar(value=True)
 
         self.state_vars: Dict[str, tk.StringVar] = {}
         self.widgets: Dict[str, tk.Entry] = {}
@@ -1757,6 +1900,29 @@ class App:
 
         ac_db_path = self.out_dir / "autocomplete.json"
         AutocompleteEntry.load_db(ac_db_path)
+
+        # Load persisted settings (overrides defaults set above)
+        _cfg = load_app_config()
+        if _cfg.get("source_path"):
+            self.source_path.set(_cfg["source_path"])
+        if _cfg.get("moto_path"):
+            self.moto_path.set(_cfg["moto_path"])
+        if _cfg.get("dogovir_path"):
+            self.dogovir_path.set(_cfg["dogovir_path"])
+        if _cfg.get("vidatkova_path"):
+            self.vidatkova_path.set(_cfg["vidatkova_path"])
+        if _cfg.get("output_dir"):
+            self.output_dir_var.set(_cfg["output_dir"])
+        if _cfg.get("editor_path"):
+            self.editor_path.set(_cfg["editor_path"])
+        if _cfg.get("theme_pref"):
+            self.theme_pref.set(_cfg["theme_pref"])
+            _pref = _cfg["theme_pref"]
+            if _pref in ("light", "dark"):
+                self.theme_mode = _pref
+                self.theme = build_theme_palette(_pref)
+        self.open_after_save.set(_cfg.get("open_after_save", True))
+        self.use_word_com.set(_cfg.get("use_word_com", True))
 
         self._load_state_from_source()
         self._build_ui()
@@ -1810,6 +1976,7 @@ class App:
         self._make_toolbar_button(toolbar, "↺ Відновити з файлу", self.reload_source, 3)
         self._make_toolbar_button(toolbar, "✖ Очистити", self.clear_form, 4)
         self._make_toolbar_button(toolbar, "⟲ Генерувати", self.generate_all, 5)
+        self._make_toolbar_button(toolbar, "↓ Вставити", self.paste_from_clipboard, 6)
 
         gear_btn = tk.Button(
             header, text="⚙", command=self.open_settings_dialog,
@@ -2098,7 +2265,15 @@ class App:
             bg=self.theme["card_bg"],
             fg=self.theme["label_fg"],
             selectcolor=self.theme["entry_bg"],
-        ).grid(row=theme_row + 1, column=0, columnspan=3, sticky="w", padx=16, pady=(10, 6))
+        ).grid(row=theme_row + 1, column=0, columnspan=3, sticky="w", padx=16, pady=(10, 4))
+        tk.Checkbutton(
+            dialog,
+            text="Інтеграція з Microsoft Office (Word COM)",
+            variable=self.use_word_com,
+            bg=self.theme["card_bg"],
+            fg=self.theme["label_fg"],
+            selectcolor=self.theme["entry_bg"],
+        ).grid(row=theme_row + 2, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 6))
         tk.Button(
             dialog,
             text="↺ Перезавантажити шаблон",
@@ -2107,25 +2282,26 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 2, column=0, sticky="w", padx=16, pady=8)
+        ).grid(row=theme_row + 3, column=0, sticky="w", padx=16, pady=8)
         tk.Button(
             dialog,
-            text="Зберегти новий шаблон",
-            command=lambda: [self.save_source_changes(), dialog.destroy()],
+            text="Зберегти налаштування",
+            command=lambda: [self._save_settings(), self.save_source_changes(), dialog.destroy()],
             bg=self.theme["btn_bg"],
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 2, column=1, sticky="w", pady=8)
+        ).grid(row=theme_row + 3, column=1, sticky="w", pady=8)
         tk.Button(
             dialog,
             text="Закрити",
-            command=dialog.destroy,
+            command=lambda: [self._save_settings(), dialog.destroy()],
             bg=self.theme["btn_bg"],
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 2, column=2, sticky="e", padx=12, pady=12)
+        ).grid(row=theme_row + 3, column=2, sticky="e", padx=12, pady=12)
+        dialog.protocol("WM_DELETE_WINDOW", lambda: [self._save_settings(), dialog.destroy()])
 
         # Auto-fit height after all widgets are created
         dialog.update_idletasks()
@@ -2251,6 +2427,45 @@ class App:
         self.write_log(f"Збережено 6055 у {source}")
         self.status_var.set(f"Збережено у {source.name}")
 
+    def _save_settings(self) -> None:
+        """Persist all settings (paths, theme, flags) to JSON config file."""
+        save_app_config({
+            "source_path": self.source_path.get(),
+            "moto_path": self.moto_path.get(),
+            "dogovir_path": self.dogovir_path.get(),
+            "vidatkova_path": self.vidatkova_path.get(),
+            "output_dir": self.output_dir_var.get(),
+            "editor_path": self.editor_path.get(),
+            "theme_pref": self.theme_pref.get(),
+            "open_after_save": self.open_after_save.get(),
+            "use_word_com": self.use_word_com.get(),
+        })
+
+    def paste_from_clipboard(self) -> None:
+        """Parse clipboard text and auto-fill matching form fields."""
+        try:
+            text = self.root.clipboard_get()
+        except Exception:
+            self.status_var.set("Буфер порожній або недоступний")
+            return
+        if not text or not text.strip():
+            self.status_var.set("Буфер порожній")
+            return
+        filled = _parse_clipboard_to_fields(text)
+        if not filled:
+            self.status_var.set("Не розпізнано жодного поля з буфера обміну")
+            return
+        self._syncing_form = True
+        for cell, value in filled.items():
+            if cell in self.state_vars and value:
+                self.state_vars[cell].set(value)
+        if "C15" in filled:
+            self.state_vars["E15"].set(short_name(filled["C15"]))
+        self._syncing_form = False
+        self.write_log(f"Вставлено з буфера: {', '.join(filled.keys())}")
+        self.status_var.set(f"Заповнено {len(filled)} поля(-ів) з буфера")
+        self.refresh_validation(silent=True)
+
     def current_payload(self) -> Dict[str, str]:
         payload, errors, warnings = validate_state(self.collect_state())
         return payload
@@ -2282,8 +2497,8 @@ class App:
             out_doc = out_dir / f"Договір{num_part}{ts}.doc"
             out_path = out_doc
             try:
-                if not IS_WINDOWS:
-                    raise RuntimeError("Word COM not available")
+                if not IS_WINDOWS or not self.use_word_com.get():
+                    raise RuntimeError("Word COM disabled or not available")
                 out_path = generate_contract_doc_windows_from_state(state, template_doc, out_doc)
             except Exception as exc:
                 self.write_log(f"Word COM недоступний: {exc}")
