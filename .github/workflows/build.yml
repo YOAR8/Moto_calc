@@ -1,0 +1,43 @@
+name: Build Japan Moto
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-windows.txt
+
+      - name: Build one-file exe
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --noupx --onefile --windowed --name JapanMoto `
+            --collect-submodules win32com --collect-data win32com `
+            --add-data "6055.xls;." `
+            --add-data "6055_MOTO_template.xls;." `
+            --add-data "DOGOVIR_6055_template.doc;." `
+            --add-data "vidatkova.xls;." `
+            app_6055.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: JapanMoto-windows
+          path: dist/JapanMoto.exe

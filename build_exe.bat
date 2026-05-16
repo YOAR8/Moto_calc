@@ -18,19 +18,18 @@ pyinstaller ^
   --noconfirm ^
   --clean ^
   --noupx ^
+  --onefile ^
   --windowed ^
-  --name MotoCalc ^
+  --name JapanMoto ^
   --collect-submodules win32com ^
   --collect-data win32com ^
+  --add-data "6055.xls;." ^
+  --add-data "6055_MOTO_template.xls;." ^
+  --add-data "DOGOVIR_6055_template.doc;." ^
+  --add-data "vidatkova.xls;." ^
   app_6055.py
 
-if not exist dist\MotoCalc mkdir dist\MotoCalc
-copy /Y 6055.xls dist\MotoCalc\6055.xls >nul
-copy /Y 6055_MOTO_template.xls dist\MotoCalc\6055_MOTO_template.xls >nul
-copy /Y DOGOVIR_6055_template.doc dist\MotoCalc\DOGOVIR_6055_template.doc >nul
-copy /Y vidatkova.xls dist\MotoCalc\vidatkova.xls >nul
-
 echo.
-echo Build complete. Run: dist\MotoCalc\MotoCalc.exe
-echo Output files will be created in %%USERPROFILE%%\Documents\MotoCalc\out
+echo Build complete. Run: dist\JapanMoto.exe
+echo Output files will be created in %%USERPROFILE%%\Documents\JapanMoto\out
 echo Full generation creates a separate buyer folder using the short FIO.

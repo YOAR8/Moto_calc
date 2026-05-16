@@ -26,16 +26,28 @@ except Exception:  # pragma: no cover
 IS_WINDOWS = platform.system().lower().startswith("win")
 
 
-def runtime_base_dir() -> Path:
+def runtime_app_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
 
 
+def runtime_resource_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            return Path(meipass).resolve()
+    return Path(__file__).resolve().parent
+
+
 def default_output_dir(base_dir: Path) -> Path:
     if IS_WINDOWS:
-        return Path.home() / "Documents" / "MotoCalc" / "out"
+        return Path.home() / "Documents" / "JapanMoto" / "out"
     return base_dir / "out"
+
+
+def safe_contract_output_path(out_path: Path) -> Path:
+    return out_path.with_suffix(".txt")
 
 
 def a1_to_rc(addr: str) -> Tuple[int, int]:
@@ -781,11 +793,11 @@ def generate_vidatkova_xls_from_state(state: Dict[str, str], template_path: Path
 
 def generate_contract_doc_windows_from_state(state: Dict[str, str], dogovir_template: Path, out_path: Path) -> Path:
     payload = parse_state(state)
-    import win32com.client as win32  # type: ignore
-
-    word = win32.Dispatch("Word.Application")
-    word.Visible = False
     try:
+        import win32com.client as win32  # type: ignore
+
+        word = win32.Dispatch("Word.Application")
+        word.Visible = False
         doc = word.Documents.Open(str(dogovir_template.resolve()))
         bookmark_map = {
             "Number": "Number",
@@ -812,12 +824,16 @@ def generate_contract_doc_windows_from_state(state: Dict[str, str], dogovir_temp
                 doc.Bookmarks(bookmark_name).Range.Text = str(payload.get(key, ""))
         doc.SaveAs(str(out_path.resolve()))
         doc.Close(SaveChanges=False)
+        return out_path
+    except Exception:
+        fallback = safe_contract_output_path(out_path)
+        save_text_preview(fallback, "ЧОРНОВИК ДОГОВОРУ", preview_text_for_contract(payload))
+        return fallback
     finally:
         try:
-            word.Quit()
+            word.Quit()  # type: ignore[name-defined]
         except Exception:
             pass
-    return out_path
 
 
 def save_text_preview(path: Path, title: str, body: str) -> Path:
@@ -859,17 +875,19 @@ def ensure_case_dir(base_out_dir: Path, state: Dict[str, str], unique: bool = Fa
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.base_dir = runtime_base_dir()
-        self.out_dir = default_output_dir(self.base_dir)
+        self.app_dir = runtime_app_dir()
+        self.resource_dir = runtime_resource_dir()
+        self.out_dir = default_output_dir(self.app_dir)
 
-        self.root.title("MotoCalc 6055")
-        self.root.geometry("1280x900")
-        self.root.minsize(1120, 760)
+        self.root.title("Japan moto")
+        self.root.geometry("1320x920")
+        self.root.minsize(1160, 780)
 
-        self.source_path = tk.StringVar(value=str(self.base_dir / "6055.xls"))
-        self.moto_path = tk.StringVar(value=str(self.base_dir / "6055_MOTO_template.xls"))
-        self.dogovir_path = tk.StringVar(value=str(self.base_dir / "DOGOVIR_6055_template.doc"))
-        self.vidatkova_path = tk.StringVar(value=str(self.base_dir / "vidatkova.xls"))
+        self.source_path = tk.StringVar(value=str(self.resource_dir / "6055.xls"))
+        self.moto_path = tk.StringVar(value=str(self.resource_dir / "6055_MOTO_template.xls"))
+        self.dogovir_path = tk.StringVar(value=str(self.resource_dir / "DOGOVIR_6055_template.doc"))
+        self.vidatkova_path = tk.StringVar(value=str(self.resource_dir / "vidatkova.xls"))
+        self.output_dir_var = tk.StringVar(value=str(self.out_dir))
         self.editor_path = tk.StringVar(value="")
         self.open_after_save = tk.BooleanVar(value=True)
 
@@ -896,62 +914,54 @@ class App:
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
+        self.root.rowconfigure(2, weight=0)
         self.root.configure(bg="#f4efe7")
 
-        header = tk.Frame(self.root, bg="#1f2937", padx=18, pady=14)
+        header = tk.Frame(self.root, bg="#111827", padx=10, pady=8)
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
+        header.columnconfigure(1, weight=0)
 
-        tk.Label(header, text="MotoCalc 6055", fg="white", bg="#1f2937", font=("Segoe UI", 20, "bold")).grid(row=0, column=0, sticky="w")
-        tk.Label(header, text="Одна форма для акта, договору та видаткової", fg="#d1d5db", bg="#1f2937", font=("Segoe UI", 10)).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        title_frame = tk.Frame(header, bg="#111827")
+        title_frame.grid(row=0, column=0, sticky="w")
+        tk.Label(title_frame, text="Japan moto", fg="white", bg="#111827", font=("Segoe UI", 18, "bold")).pack(anchor="w")
+        tk.Label(title_frame, text="Один екран для акта, договору та видаткової", fg="#cbd5e1", bg="#111827", font=("Segoe UI", 9)).pack(anchor="w")
+
+        toolbar = tk.Frame(header, bg="#111827")
+        toolbar.grid(row=0, column=1, sticky="e")
+
+        self._make_toolbar_button(toolbar, "⚙ Шаблон", self.open_settings_dialog, 0)
+        self._make_toolbar_button(toolbar, "↺ Файл 6055", self.reload_source, 1)
+        self._make_toolbar_button(toolbar, "✖ Очистити", self.clear_form, 2)
+        self._make_toolbar_button(toolbar, "Акт", lambda: self.open_draft("act"), 3)
+        self._make_toolbar_button(toolbar, "Договір", lambda: self.open_draft("contract"), 4)
+        self._make_toolbar_button(toolbar, "Видаткова", lambda: self.open_draft("vidatkova"), 5)
+        self._make_toolbar_button(toolbar, "⟲ Генерувати", self.generate_all, 6)
 
         main = ttk.Frame(self.root, padding=12)
         main.grid(row=1, column=0, sticky="nsew")
         main.columnconfigure(0, weight=1)
         main.rowconfigure(1, weight=1)
+        self._build_data_tab(main)
 
-        actions = ttk.Frame(main)
-        actions.grid(row=0, column=0, sticky="ew")
-        for i in range(8):
-            actions.columnconfigure(i, weight=1)
+        bottom = tk.Frame(self.root, bg="#111827", padx=12, pady=6)
+        bottom.grid(row=2, column=0, sticky="ew")
+        bottom.columnconfigure(0, weight=1)
+        bottom.columnconfigure(1, weight=1)
+        bottom.columnconfigure(2, weight=1)
 
-        ttk.Button(actions, text="Перевірити", command=self.refresh_validation).grid(row=0, column=0, sticky="ew", padx=4)
-        ttk.Button(actions, text="Заповнити з 6055", command=self.reload_source).grid(row=0, column=1, sticky="ew", padx=4)
-        ttk.Button(actions, text="Очистити форму", command=self.clear_form).grid(row=0, column=2, sticky="ew", padx=4)
-        ttk.Button(actions, text="Акт", command=lambda: self.open_draft("act")).grid(row=0, column=3, sticky="ew", padx=4)
-        ttk.Button(actions, text="Договір", command=lambda: self.open_draft("contract")).grid(row=0, column=4, sticky="ew", padx=4)
-        ttk.Button(actions, text="Видаткова", command=lambda: self.open_draft("vidatkova")).grid(row=0, column=5, sticky="ew", padx=4)
-        ttk.Button(actions, text="Зберегти 6055", command=self.save_source_changes).grid(row=0, column=6, sticky="ew", padx=4)
-        ttk.Button(actions, text="Генерувати", command=self.generate_all).grid(row=0, column=7, sticky="ew", padx=4)
-
-        summary = ttk.Frame(main)
-        summary.grid(row=1, column=0, sticky="ew", pady=(10, 8))
-        summary.columnconfigure(0, weight=1)
-        summary.columnconfigure(1, weight=1)
-
-        ttk.Label(summary, textvariable=self.summary_var, anchor="w", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, columnspan=2, sticky="ew")
-        ttk.Label(summary, textvariable=self.error_var, foreground="#9f1239", anchor="w", wraplength=1100).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        ttk.Label(summary, textvariable=self.warning_var, foreground="#a16207", anchor="w", wraplength=1100).grid(row=2, column=0, columnspan=2, sticky="ew")
-
-        self.notebook = ttk.Notebook(main)
-        self.notebook.grid(row=2, column=0, sticky="nsew")
-
-        data_tab = ttk.Frame(self.notebook)
-        settings_tab = ttk.Frame(self.notebook)
-        log_tab = ttk.Frame(self.notebook)
-        self.notebook.add(data_tab, text="Дані")
-        self.notebook.add(settings_tab, text="Налаштування")
-        self.notebook.add(log_tab, text="Лог")
-
-        self._build_data_tab(data_tab)
-        self._build_settings_tab(settings_tab)
-        self._build_log_tab(log_tab)
+        tk.Label(bottom, textvariable=self.status_var, bg="#111827", fg="#d1d5db", anchor="w").grid(row=0, column=0, sticky="ew")
+        tk.Label(bottom, textvariable=self.error_var, bg="#111827", fg="#fecaca", anchor="w", wraplength=640).grid(row=0, column=1, sticky="ew")
+        tk.Label(bottom, textvariable=self.warning_var, bg="#111827", fg="#fde68a", anchor="w", wraplength=640).grid(row=0, column=2, sticky="ew")
 
         self.write_log(f"Platform: {platform.system()}")
         self.write_log(f"Output folder: {self.out_dir}")
         if not IS_WINDOWS:
             self.write_log("Linux mode: Word COM write is unavailable; preview text will be generated.")
-        ttk.Label(main, textvariable=self.status_var, anchor="w").grid(row=3, column=0, sticky="ew", pady=(8, 0))
+
+    def _make_toolbar_button(self, parent, text: str, command, column: int) -> None:
+        button = tk.Button(parent, text=text, command=command, bg="#111827", fg="white", activebackground="#1f2937", activeforeground="white", bd=0, relief="flat", padx=10, pady=4, cursor="hand2")
+        button.grid(row=0, column=column, padx=(0, 6), sticky="e")
 
     def _build_data_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -1006,9 +1016,6 @@ class App:
             if cell != "E15":
                 var.trace_add("write", self._on_state_change)
 
-        if {f[0] for f in fields} >= {"C39", "C42", "C43"}:
-            ttk.Button(parent, text="Синхронізувати C39/C42/C43", command=self.sync_frame_fields).grid(row=len(fields) + 1, column=0, columnspan=2, sticky="w", pady=(10, 0))
-
     def _build_settings_tab(self, parent: ttk.Frame) -> None:
         parent.columnconfigure(1, weight=1)
 
@@ -1044,9 +1051,35 @@ class App:
         if var is self.output_dir_var:
             value = filedialog.askdirectory(initialdir=var.get() or str(self.out_dir)) if filedialog else ""
         else:
-            value = filedialog.askopenfilename(initialdir=str(self.base_dir)) if filedialog else ""
+            value = filedialog.askopenfilename(initialdir=str(self.app_dir)) if filedialog else ""
         if value:
             var.set(value)
+
+    def open_settings_dialog(self) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Шаблони і вихід")
+        dialog.geometry("760x320")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        dialog.columnconfigure(1, weight=1)
+        fields = [
+            ("6055.xls", self.source_path),
+            ("Шаблон акту", self.moto_path),
+            ("Шаблон договору", self.dogovir_path),
+            ("Шаблон видаткової", self.vidatkova_path),
+            ("Папка виходу", self.output_dir_var),
+            ("Редактор", self.editor_path),
+        ]
+
+        tk.Label(dialog, text="Параметри шаблонів", font=("Segoe UI", 14, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", padx=16, pady=(14, 8))
+        for row, (label, var) in enumerate(fields, start=1):
+            tk.Label(dialog, text=label).grid(row=row, column=0, sticky="w", padx=16, pady=6)
+            tk.Entry(dialog, textvariable=var).grid(row=row, column=1, sticky="ew", pady=6)
+            tk.Button(dialog, text="Огляд", command=lambda v=var: self.browse_path(v)).grid(row=row, column=2, padx=12)
+
+        tk.Checkbutton(dialog, text="Відкривати файл після генерації", variable=self.open_after_save).grid(row=7, column=0, columnspan=3, sticky="w", padx=16, pady=(10, 6))
+        tk.Button(dialog, text="Закрити", command=dialog.destroy).grid(row=8, column=2, sticky="e", padx=12, pady=12)
 
     def _on_state_change(self, *_):
         if self._syncing_form:
@@ -1209,7 +1242,6 @@ class App:
 
     def generate_all(self) -> None:
         try:
-            self.save_source_changes()
             state = self.collect_state()
             base_out_dir = self._ensure_output_dir()
             case_dir = ensure_case_dir(base_out_dir, state, unique=True)
@@ -1373,10 +1405,10 @@ else:
             raise RuntimeError("Tkinter is unavailable in this environment")
 
 
-def run_demo(base_dir: Path) -> None:
-    source = base_dir / "6055.xls"
-    moto = base_dir / "6055_MOTO_template.xls"
-    dog = base_dir / "DOGOVIR_6055_template.doc"
+def run_demo(app_dir: Path, resource_dir: Path) -> None:
+    source = app_dir / "6055.xls"
+    moto = resource_dir / "6055_MOTO_template.xls"
+    dog = resource_dir / "DOGOVIR_6055_template.doc"
 
     updates = {
         "A3": "№ 8424/26/009999 від 15 травня 2026 року",
@@ -1391,7 +1423,7 @@ def run_demo(base_dir: Path) -> None:
     }
     write_xls_cells(source, "Worksheet", updates, backup=True)
 
-    out_dir = base_dir / "out"
+    out_dir = app_dir / "out"
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -1415,10 +1447,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    base_dir = runtime_base_dir()
+    app_dir = runtime_app_dir()
+    resource_dir = runtime_resource_dir()
 
     if args.demo:
-        run_demo(base_dir)
+        run_demo(app_dir, resource_dir)
         return 0
 
     if tk is None:
