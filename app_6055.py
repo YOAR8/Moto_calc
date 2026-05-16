@@ -71,6 +71,11 @@ def build_theme_palette(mode: str) -> Dict[str, str]:
             "warn_fg": "#fde68a",
             "popup_select_bg": "#f59e0b",
             "popup_select_fg": "#0f172a",
+            "btn_bg": "#1e293b",
+            "btn_fg": "#cbd5e1",
+            "scrollbar_bg": "#334155",
+            "scrollbar_trough": "#1e293b",
+            "scrollbar_arrow": "#94a3b8",
         }
     return {
         "root_bg": "#f4efe7",
@@ -97,6 +102,11 @@ def build_theme_palette(mode: str) -> Dict[str, str]:
         "warn_fg": "#fde68a",
         "popup_select_bg": "#e07b39",
         "popup_select_fg": "#ffffff",
+        "btn_bg": "#4b5563",
+        "btn_fg": "#ffffff",
+        "scrollbar_bg": "#9ca3af",
+        "scrollbar_trough": "#e5e7eb",
+        "scrollbar_arrow": "#374151",
     }
 
 
@@ -145,10 +155,35 @@ def _office_convert(src_path: Path, out_dir: Path, to_ext: str) -> "Path | None"
         return None
 
 
+def _fill_docx_runs(para, values: Dict[str, str]) -> None:
+    """Replace placeholders in paragraph runs, preserving run-level formatting."""
+    for key, val in values.items():
+        for ph in (f"{{{{{key}}}}}", f"<<{key}>>", f"[{key}]", f"${{{key}}}"):
+            if ph not in para.text:
+                continue
+            # Strategy 1: single-run hit — preserves each run's own formatting
+            for run in para.runs:
+                if ph in run.text:
+                    run.text = run.text.replace(ph, val)
+            # Strategy 2: cross-run placeholder — merge all into first run (preserves its format)
+            if ph in para.text:
+                full = "".join(r.text for r in para.runs)
+                if ph in full:
+                    new_full = full.replace(ph, val)
+                    if para.runs:
+                        para.runs[0].text = new_full
+                        for r in para.runs[1:]:
+                            r.text = ""
+
+
 def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out_docx: Path) -> "Path | None":
+    """Copy template byte-for-byte then fill placeholders/bookmarks, preserving original formatting."""
     try:
         from docx import Document  # type: ignore
     except Exception:
+        return None
+
+    if not template_docx.exists():
         return None
 
     payload = parse_state(state)
@@ -173,30 +208,22 @@ def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out
         "FIO2": str(payload.get("FIO2", "")),
     }
 
-    doc = Document(str(template_docx))
+    # Copy template byte-for-byte (preserves all styles, images, layout)
+    shutil.copy2(template_docx, out_docx)
+    doc = Document(str(out_docx))
 
-    def repl(text: str) -> str:
-        out = text
-        for key, val in values.items():
-            for ph in (f"{{{{{key}}}}}", f"<<{key}>>", f"[{key}]", f"${{{key}}}"):
-                out = out.replace(ph, val)
-        return out
-
-    replaced = 0
+    # Fill paragraphs with run-level replacement (preserves formatting)
     for p in doc.paragraphs:
-        nt = repl(p.text)
-        if nt != p.text:
-            p.text = nt
-            replaced += 1
+        _fill_docx_runs(p, values)
 
+    # Fill table cells
     for tbl in doc.tables:
         for row in tbl.rows:
             for cell in row.cells:
-                nt = repl(cell.text)
-                if nt != cell.text:
-                    cell.text = nt
-                    replaced += 1
+                for p in cell.paragraphs:
+                    _fill_docx_runs(p, values)
 
+    # Fill Word bookmarks (for templates that use bookmark fields)
     for key, val in values.items():
         if not val:
             continue
@@ -209,12 +236,9 @@ def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out
                     text_nodes[0].text = val
                     for extra in text_nodes[1:]:
                         extra.text = ""
-                    replaced += 1
                     break
                 node = node.getnext()
 
-    if replaced == 0:
-        return None
     doc.save(str(out_docx))
     return out_docx if out_docx.exists() else None
 
@@ -254,6 +278,31 @@ def generate_contract_via_office_fallback(state: Dict[str, str], template_doc: P
         final_docx = out_path.with_suffix(".docx")
         shutil.copy2(filled, final_docx)
         return final_docx
+
+
+def generate_contract_non_com(state: Dict[str, str], template_path: Path, out_path: Path) -> "Path | None":
+    """Generate contract without Word COM.
+    .docx template — fills directly (run-level, preserves formatting 1:1).
+    .doc  template — converts via LibreOffice first.
+    """
+    suffix = template_path.suffix.lower()
+    if suffix == ".docx":
+        out_docx = out_path.with_suffix(".docx")
+        filled = _fill_docx_contract_template(state, template_path, out_docx)
+        if not filled:
+            return None
+        # Optionally convert to .doc if output extension requested
+        if out_path.suffix.lower() == ".doc":
+            doc_result = _office_convert(filled, out_path.parent, "doc")
+            if doc_result:
+                try:
+                    filled.unlink()
+                except Exception:
+                    pass
+                return doc_result
+        return filled  # keep .docx — looks identical to original template
+    # .doc template — use LibreOffice conversion workflow
+    return generate_contract_via_office_fallback(state, template_path, out_path)
 
 
 def runtime_app_dir() -> Path:
@@ -1337,6 +1386,7 @@ class SmartEntry(tk.Frame if tk is not None else object):
         self._lb: "tk.Listbox | None" = None
         self._popup_select_bg = popup_select_bg
         self._popup_select_fg = popup_select_fg
+        self._fg = fg
 
         self.columnconfigure(0, weight=1)
         self._text = tk.Text(
@@ -1362,6 +1412,11 @@ class SmartEntry(tk.Frame if tk is not None else object):
     def set_bg(self, color: str) -> None:
         self._text.configure(bg=color)
         self.configure(bg=color)
+        # Use dark text on light error/warning backgrounds for readability
+        if color in ("#fee2e2", "#fef3c7"):
+            self._text.configure(fg="#1f2937")
+        else:
+            self._text.configure(fg=self._fg)
 
     def _set_text_value(self, value: str) -> None:
         self._text.delete("1.0", "end")
@@ -1764,8 +1819,8 @@ class App:
         )
         gear_btn.grid(row=0, column=2, sticky="ne", padx=(0, 4), pady=2)
 
-        main = ttk.Frame(self.root, padding=12)
-        main.grid(row=1, column=0, sticky="nsew")
+        main = tk.Frame(self.root, bg=self.theme["surface_bg"])
+        main.grid(row=1, column=0, sticky="nsew", padx=12, pady=12)
         main.columnconfigure(0, weight=1)
         main.rowconfigure(0, weight=1)
         self._build_data_tab(main)
@@ -1838,7 +1893,7 @@ class App:
         target.bind("<Button-3>", _show_menu)
         target.bind("<Control-a>", _select_all)
 
-    def _build_data_tab(self, parent: ttk.Frame) -> None:
+    def _build_data_tab(self, parent: tk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(0, weight=1)
 
@@ -1848,7 +1903,20 @@ class App:
         outer.rowconfigure(0, weight=1)
 
         canvas = tk.Canvas(outer, bg=self.theme["surface_bg"], highlightthickness=0)
-        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        _sbar_style = "Themed.Vertical.TScrollbar"
+        _st = ttk.Style()
+        _st.configure(_sbar_style,
+            background=self.theme["scrollbar_bg"],
+            troughcolor=self.theme["scrollbar_trough"],
+            arrowcolor=self.theme["scrollbar_arrow"],
+            bordercolor=self.theme["scrollbar_trough"],
+            darkcolor=self.theme["scrollbar_bg"],
+            lightcolor=self.theme["scrollbar_bg"],
+            borderwidth=0,
+            arrowsize=10,
+        )
+        _st.map(_sbar_style, background=[("active", self.theme["scrollbar_bg"])])
+        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview, style=_sbar_style)
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")
@@ -1971,19 +2039,9 @@ class App:
     def open_settings_dialog(self) -> None:
         dialog = tk.Toplevel(self.root)
         dialog.title("Шаблони і вихід")
-        width = 760
-        height = int(320 * 1.05)
-        dialog.geometry(f"{width}x{height}")
         dialog.configure(bg=self.theme["card_bg"])
         dialog.transient(self.root)
         dialog.grab_set()
-
-        dialog.update_idletasks()
-        sx = dialog.winfo_screenwidth()
-        sy = dialog.winfo_screenheight()
-        px = max(0, (sx - width) // 2)
-        py = max(0, (sy - height) // 2)
-        dialog.geometry(f"{width}x{height}+{px}+{py}")
 
         dialog.columnconfigure(1, weight=1)
         fields = [
@@ -2009,8 +2067,8 @@ class App:
                 dialog,
                 text="Огляд",
                 command=lambda v=var: self.browse_path(v),
-                bg=self.theme["header_bg"],
-                fg=self.theme["toolbar_fg"],
+                bg=self.theme["btn_bg"],
+                fg=self.theme["btn_fg"],
                 activebackground=self.theme["header_active_bg"],
                 activeforeground=self.theme["header_fg"],
             ).grid(row=row, column=2, padx=12)
@@ -2045,8 +2103,8 @@ class App:
             dialog,
             text="↺ Перезавантажити шаблон",
             command=lambda: [self.reload_source(), dialog.destroy()],
-            bg=self.theme["header_bg"],
-            fg=self.theme["toolbar_fg"],
+            bg=self.theme["btn_bg"],
+            fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
         ).grid(row=theme_row + 2, column=0, sticky="w", padx=16, pady=8)
@@ -2054,8 +2112,8 @@ class App:
             dialog,
             text="Зберегти новий шаблон",
             command=lambda: [self.save_source_changes(), dialog.destroy()],
-            bg=self.theme["header_bg"],
-            fg=self.theme["toolbar_fg"],
+            bg=self.theme["btn_bg"],
+            fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
         ).grid(row=theme_row + 2, column=1, sticky="w", pady=8)
@@ -2063,11 +2121,21 @@ class App:
             dialog,
             text="Закрити",
             command=dialog.destroy,
-            bg=self.theme["header_bg"],
-            fg=self.theme["toolbar_fg"],
+            bg=self.theme["btn_bg"],
+            fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
         ).grid(row=theme_row + 2, column=2, sticky="e", padx=12, pady=12)
+
+        # Auto-fit height after all widgets are created
+        dialog.update_idletasks()
+        _dw = 800
+        _dh = max(dialog.winfo_reqheight() + 30, 480)
+        _sx = dialog.winfo_screenwidth()
+        _sy = dialog.winfo_screenheight()
+        _px = max(0, (_sx - _dw) // 2)
+        _py = max(0, (_sy - _dh) // 2)
+        dialog.geometry(f"{_dw}x{_dh}+{_px}+{_py}")
 
     def _on_state_change(self, *_):
         if self._syncing_form:
@@ -2117,6 +2185,10 @@ class App:
                 entry.set_bg(bg)
             else:
                 entry.configure(bg=bg)
+                if bg in ("#fee2e2", "#fef3c7"):
+                    entry.configure(fg="#1f2937")
+                else:
+                    entry.configure(fg=self.theme["entry_fg"])
 
         self.summary_var.set(f"Заповнено: {sum(1 for v in state.values() if v)} полів. Номер: {payload.get('Number', '')} | Дата: {payload.get('Data', '')}")
         self.error_var.set("Помилки: " + ("; ".join(errors) if errors else "немає"))
@@ -2216,24 +2288,19 @@ class App:
             except Exception as exc:
                 self.write_log(f"Word COM недоступний: {exc}")
 
-                # 1) Try to keep legacy .doc via LibreOffice/Office CLI conversions
-                office_doc = generate_contract_via_office_fallback(state, template_doc, out_doc)
-                if office_doc:
-                    out_path = office_doc
+                # Copy template + run-level fill (preserves original formatting)
+                non_com = generate_contract_non_com(state, template_doc, out_doc)
+                if non_com:
+                    out_path = non_com
                 else:
-                    # 2) Keep layout from template in .docx when .doc is unavailable
+                    # Last resort: full text docx generator (different appearance)
                     out_docx = out_doc.with_suffix(".docx")
-                    office_docx = generate_contract_via_office_fallback(state, template_doc, out_docx)
-                    if office_docx:
-                        out_path = office_docx
+                    result = generate_contract_docx_fallback(state, out_docx)
+                    if result:
+                        out_path = result
                     else:
-                        # 3) Last resort: full text docx generator
-                        result = generate_contract_docx_fallback(state, out_docx)
-                        if result:
-                            out_path = result
-                        else:
-                            out_path = out_doc.with_suffix(".txt")
-                            save_text_preview(out_path, "ЧОРНОВИК ДОГОВОРУ", preview_text_for_contract(payload))
+                        out_path = out_doc.with_suffix(".txt")
+                        save_text_preview(out_path, "ЧОРНОВИК ДОГОВОРУ", preview_text_for_contract(payload))
         elif kind == "vidatkova":
             out_path = out_dir / f"Видаткова{num_part}{ts}.xls"
             generate_vidatkova_xls_from_state(state, Path(self.vidatkova_path.get()), out_path)
