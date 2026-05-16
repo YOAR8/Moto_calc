@@ -7,6 +7,7 @@ import subprocess
 import re
 import shutil
 import sys
+import tempfile
 import traceback
 from pathlib import Path
 from typing import Dict, Tuple
@@ -97,6 +98,162 @@ def build_theme_palette(mode: str) -> Dict[str, str]:
         "popup_select_bg": "#e07b39",
         "popup_select_fg": "#ffffff",
     }
+
+
+def contract_sumtext_plain(text: str) -> str:
+    """Return amount-in-words without trailing currency phrase."""
+    cleaned = re.sub(r"\s+", " ", str(text or "").strip())
+    cleaned = re.sub(
+        r"\s*(грн\.?|грив(?:ня|ні|ень))\s*0{1,2}\s*коп(?:\.|ійок)?\s*$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    return cleaned.strip(" ,.")
+
+
+def _resolve_office_cli() -> str:
+    for name in ("soffice", "libreoffice", "triooffice", "openoffice"):
+        found = shutil.which(name)
+        if found:
+            return found
+    for p in (
+        r"C:\\Program Files\\LibreOffice\\program\\soffice.exe",
+        r"C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
+    ):
+        if Path(p).exists():
+            return p
+    return ""
+
+
+def _office_convert(src_path: Path, out_dir: Path, to_ext: str) -> "Path | None":
+    office_cli = _resolve_office_cli()
+    if not office_cli:
+        return None
+    ext = to_ext.lstrip(".").lower()
+    try:
+        result = subprocess.run(
+            [office_cli, "--headless", "--convert-to", ext, "--outdir", str(out_dir), str(src_path)],
+            capture_output=True,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            return None
+        out_path = out_dir / f"{src_path.stem}.{ext}"
+        return out_path if out_path.exists() else None
+    except Exception:
+        return None
+
+
+def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out_docx: Path) -> "Path | None":
+    try:
+        from docx import Document  # type: ignore
+    except Exception:
+        return None
+
+    payload = parse_state(state)
+    values = {
+        "Number": str(payload.get("Number", "")),
+        "Data": str(payload.get("Data", "")),
+        "FIO": str(payload.get("FIO", "")),
+        "pasport": str(payload.get("pasport", "")),
+        "TaxNumber": str(payload.get("TaxNumber", "")),
+        "BirthDay": str(payload.get("BirthDay", "")),
+        "adres": str(payload.get("adres", "")),
+        "decl": str(payload.get("decl", "")),
+        "model": str(payload.get("model", "")),
+        "year": str(payload.get("year", "")),
+        "color": str(payload.get("color", "")),
+        "numberdv": str(payload.get("numberdv", "")),
+        "cuzov": str(payload.get("cuzov", "")),
+        "cub": str(payload.get("cub", "")),
+        "znak": str(payload.get("znak", "")),
+        "price": str(payload.get("price", "")),
+        "sumtext": contract_sumtext_plain(payload.get("sumtext", "")),
+        "FIO2": str(payload.get("FIO2", "")),
+    }
+
+    doc = Document(str(template_docx))
+
+    def repl(text: str) -> str:
+        out = text
+        for key, val in values.items():
+            for ph in (f"{{{{{key}}}}}", f"<<{key}>>", f"[{key}]", f"${{{key}}}"):
+                out = out.replace(ph, val)
+        return out
+
+    replaced = 0
+    for p in doc.paragraphs:
+        nt = repl(p.text)
+        if nt != p.text:
+            p.text = nt
+            replaced += 1
+
+    for tbl in doc.tables:
+        for row in tbl.rows:
+            for cell in row.cells:
+                nt = repl(cell.text)
+                if nt != cell.text:
+                    cell.text = nt
+                    replaced += 1
+
+    for key, val in values.items():
+        if not val:
+            continue
+        bookmarks = doc.element.xpath(f".//w:bookmarkStart[@w:name='{key}']")
+        for bm in bookmarks:
+            node = bm.getnext()
+            while node is not None:
+                text_nodes = node.xpath(".//w:t")
+                if text_nodes:
+                    text_nodes[0].text = val
+                    for extra in text_nodes[1:]:
+                        extra.text = ""
+                    replaced += 1
+                    break
+                node = node.getnext()
+
+    if replaced == 0:
+        return None
+    doc.save(str(out_docx))
+    return out_docx if out_docx.exists() else None
+
+
+def generate_contract_via_office_fallback(state: Dict[str, str], template_doc: Path, out_path: Path) -> "Path | None":
+    """Fallback without Word COM: try LibreOffice conversions while preserving template layout."""
+    if not template_doc.exists():
+        return None
+
+    with tempfile.TemporaryDirectory(prefix="jm_contract_") as td:
+        tmp_dir = Path(td)
+        tmp_doc = tmp_dir / "template.doc"
+        shutil.copy2(template_doc, tmp_doc)
+        tpl_docx = _office_convert(tmp_doc, tmp_dir, "docx")
+        if not tpl_docx:
+            return None
+
+        filled_docx = tmp_dir / "filled.docx"
+        filled = _fill_docx_contract_template(state, tpl_docx, filled_docx)
+        if not filled:
+            return None
+
+        if out_path.suffix.lower() == ".doc":
+            converted_doc = _office_convert(filled, out_path.parent, "doc")
+            if not converted_doc:
+                return None
+            final_doc = out_path.with_suffix(".doc")
+            if converted_doc != final_doc:
+                try:
+                    if final_doc.exists():
+                        final_doc.unlink()
+                    converted_doc.rename(final_doc)
+                except Exception:
+                    return converted_doc
+            return final_doc
+
+        final_docx = out_path.with_suffix(".docx")
+        shutil.copy2(filled, final_docx)
+        return final_docx
 
 
 def runtime_app_dir() -> Path:
@@ -931,6 +1088,8 @@ def generate_contract_docx_fallback(state: Dict[str, str], out_path: Path) -> "P
         val = str(payload.get(key, "")).strip()
         return val if val else "___"
 
+    sumtext_plain = contract_sumtext_plain(payload.get("sumtext", "")) or v("sumtext")
+
     doc = Document()
     # Use Times New Roman 12pt throughout for legal document appearance
     doc.styles["Normal"].font.name = "Times New Roman"
@@ -1013,7 +1172,7 @@ def generate_contract_docx_fallback(state: Dict[str, str], out_path: Path) -> "P
     add_bold_para("2. ЦІНА ДОГОВОРУ")
     add_para(
         f"2.1. За домовленістю сторін ціна Транспортного засобу складає {v('price')} "
-        f"({v('sumtext')}).",
+        f"({sumtext_plain}) гривень 00 копійок.",
         indent=True,
     )
     add_para(
@@ -1086,8 +1245,11 @@ def generate_contract_doc_windows_from_state(state: Dict[str, str], dogovir_temp
             "FIO2": "FIO2",
         }
         for key, bookmark_name in bookmark_map.items():
+            value = payload.get(key, "")
+            if key == "sumtext":
+                value = contract_sumtext_plain(str(value))
             if doc.Bookmarks.Exists(bookmark_name):
-                doc.Bookmarks(bookmark_name).Range.Text = str(payload.get(key, ""))
+                doc.Bookmarks(bookmark_name).Range.Text = str(value)
         doc.SaveAs(str(out_path.resolve()))
         doc.Close(SaveChanges=False)
         return out_path
@@ -1516,6 +1678,7 @@ class App:
         self.root.title("Japan moto")
         self.root.geometry("1320x920")
         self.root.minsize(1160, 780)
+        self.theme_pref = tk.StringVar(value="auto")
         self.theme_mode = detect_theme_mode()
         self.theme = build_theme_palette(self.theme_mode)
 
@@ -1550,6 +1713,21 @@ class App:
         for _, cell, _, _ in iter_field_specs():
             self.state_vars[cell] = tk.StringVar(value=state.get(cell, ""))
         self.state_vars["E15"].set(short_name(self.state_vars["C15"].get()))
+
+    def _resolve_theme_mode(self) -> str:
+        pref = self.theme_pref.get().strip().lower()
+        if pref in ("light", "dark"):
+            return pref
+        return detect_theme_mode()
+
+    def apply_theme_preference(self, *_):
+        new_mode = self._resolve_theme_mode()
+        self.theme_mode = new_mode
+        self.theme = build_theme_palette(new_mode)
+        for child in self.root.winfo_children():
+            child.destroy()
+        self._build_ui()
+        self.refresh_validation(silent=True)
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -1793,10 +1971,19 @@ class App:
     def open_settings_dialog(self) -> None:
         dialog = tk.Toplevel(self.root)
         dialog.title("Шаблони і вихід")
-        dialog.geometry("760x320")
+        width = 760
+        height = int(320 * 1.05)
+        dialog.geometry(f"{width}x{height}")
         dialog.configure(bg=self.theme["card_bg"])
         dialog.transient(self.root)
         dialog.grab_set()
+
+        dialog.update_idletasks()
+        sx = dialog.winfo_screenwidth()
+        sy = dialog.winfo_screenheight()
+        px = max(0, (sx - width) // 2)
+        py = max(0, (sy - height) // 2)
+        dialog.geometry(f"{width}x{height}+{px}+{py}")
 
         dialog.columnconfigure(1, weight=1)
         fields = [
@@ -1828,6 +2015,24 @@ class App:
                 activeforeground=self.theme["header_fg"],
             ).grid(row=row, column=2, padx=12)
 
+        theme_row = len(fields) + 1
+        tk.Label(dialog, text="Тема", bg=self.theme["card_bg"], fg=self.theme["label_fg"]).grid(row=theme_row, column=0, sticky="w", padx=16, pady=6)
+        theme_box = tk.Frame(dialog, bg=self.theme["card_bg"])
+        theme_box.grid(row=theme_row, column=1, columnspan=2, sticky="w", pady=6)
+        for idx, (label, value) in enumerate((("Авто", "auto"), ("Світла", "light"), ("Темна", "dark"))):
+            tk.Radiobutton(
+                theme_box,
+                text=label,
+                value=value,
+                variable=self.theme_pref,
+                bg=self.theme["card_bg"],
+                fg=self.theme["label_fg"],
+                selectcolor=self.theme["entry_bg"],
+                activebackground=self.theme["card_bg"],
+                activeforeground=self.theme["label_fg"],
+                command=self.apply_theme_preference,
+            ).grid(row=0, column=idx, sticky="w", padx=(0, 12))
+
         tk.Checkbutton(
             dialog,
             text="Відкривати файл після генерації",
@@ -1835,7 +2040,7 @@ class App:
             bg=self.theme["card_bg"],
             fg=self.theme["label_fg"],
             selectcolor=self.theme["entry_bg"],
-        ).grid(row=7, column=0, columnspan=3, sticky="w", padx=16, pady=(10, 6))
+        ).grid(row=theme_row + 1, column=0, columnspan=3, sticky="w", padx=16, pady=(10, 6))
         tk.Button(
             dialog,
             text="↺ Перезавантажити шаблон",
@@ -1844,7 +2049,7 @@ class App:
             fg=self.theme["toolbar_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=8, column=0, sticky="w", padx=16, pady=8)
+        ).grid(row=theme_row + 2, column=0, sticky="w", padx=16, pady=8)
         tk.Button(
             dialog,
             text="Зберегти новий шаблон",
@@ -1853,7 +2058,7 @@ class App:
             fg=self.theme["toolbar_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=8, column=1, sticky="w", pady=8)
+        ).grid(row=theme_row + 2, column=1, sticky="w", pady=8)
         tk.Button(
             dialog,
             text="Закрити",
@@ -1862,7 +2067,7 @@ class App:
             fg=self.theme["toolbar_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=8, column=2, sticky="e", padx=12, pady=12)
+        ).grid(row=theme_row + 2, column=2, sticky="e", padx=12, pady=12)
 
     def _on_state_change(self, *_):
         if self._syncing_form:
@@ -2001,12 +2206,34 @@ class App:
             out_path = out_dir / f"Акт{num_part}{ts}.xls"
             generate_act_xls_from_state(state, Path(self.source_path.get()), out_path)
         elif kind == "contract":
-            if not IS_WINDOWS:
-                raise RuntimeError(
-                    "Договір підтримується тільки у Windows-оточенні через шаблон DOGOVIR_6055_template.doc (1:1)."
-                )
-            out_path = out_dir / f"Договір{num_part}{ts}.doc"
-            out_path = generate_contract_doc_windows_from_state(state, Path(self.dogovir_path.get()), out_path)
+            template_doc = Path(self.dogovir_path.get())
+            out_doc = out_dir / f"Договір{num_part}{ts}.doc"
+            out_path = out_doc
+            try:
+                if not IS_WINDOWS:
+                    raise RuntimeError("Word COM not available")
+                out_path = generate_contract_doc_windows_from_state(state, template_doc, out_doc)
+            except Exception as exc:
+                self.write_log(f"Word COM недоступний: {exc}")
+
+                # 1) Try to keep legacy .doc via LibreOffice/Office CLI conversions
+                office_doc = generate_contract_via_office_fallback(state, template_doc, out_doc)
+                if office_doc:
+                    out_path = office_doc
+                else:
+                    # 2) Keep layout from template in .docx when .doc is unavailable
+                    out_docx = out_doc.with_suffix(".docx")
+                    office_docx = generate_contract_via_office_fallback(state, template_doc, out_docx)
+                    if office_docx:
+                        out_path = office_docx
+                    else:
+                        # 3) Last resort: full text docx generator
+                        result = generate_contract_docx_fallback(state, out_docx)
+                        if result:
+                            out_path = result
+                        else:
+                            out_path = out_doc.with_suffix(".txt")
+                            save_text_preview(out_path, "ЧОРНОВИК ДОГОВОРУ", preview_text_for_contract(payload))
         elif kind == "vidatkova":
             out_path = out_dir / f"Видаткова{num_part}{ts}.xls"
             generate_vidatkova_xls_from_state(state, Path(self.vidatkova_path.get()), out_path)
