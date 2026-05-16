@@ -5,6 +5,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -53,14 +55,27 @@ jobs:
           path: dist/JapanMoto.zip
 
       - name: Publish latest public release asset
-        if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+        if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "latest-build"
-          $title = "JapanMoto latest build"
-          $notes = "Automated build from commit $env:GITHUB_SHA"
+          $isTag = "${{ startsWith(github.ref, 'refs/tags/v') }}" -eq "true"
+          if ($isTag) {
+            $tag = "${{ github.ref_name }}"
+            $title = "JapanMoto $tag"
+          }
+          else {
+            $tag = "latest-build"
+            $title = "JapanMoto latest build"
+          }
+
+          if (Test-Path "RELEASE_NOTES.md") {
+            $notes = Get-Content "RELEASE_NOTES.md" -Raw
+          }
+          else {
+            $notes = "Automated build from commit $env:GITHUB_SHA"
+          }
 
           gh release view $tag --repo $env:GITHUB_REPOSITORY 2>$null
           if ($LASTEXITCODE -ne 0) {

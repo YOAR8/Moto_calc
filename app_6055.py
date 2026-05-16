@@ -26,6 +26,79 @@ except Exception:  # pragma: no cover
 IS_WINDOWS = platform.system().lower().startswith("win")
 
 
+def detect_theme_mode() -> str:
+    """Return 'dark' or 'light' based on OS preference (Windows registry)."""
+    if IS_WINDOWS:
+        try:
+            import winreg  # type: ignore
+
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+            )
+            apps_use_light, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+            return "light" if int(apps_use_light) == 1 else "dark"
+        except Exception:
+            pass
+    return "light"
+
+
+def build_theme_palette(mode: str) -> Dict[str, str]:
+    if mode == "dark":
+        return {
+            "root_bg": "#0f172a",
+            "header_bg": "#020617",
+            "header_fg": "#e2e8f0",
+            "header_sub_fg": "#94a3b8",
+            "header_muted_fg": "#94a3b8",
+            "header_active_bg": "#1e293b",
+            "toolbar_fg": "#e2e8f0",
+            "surface_bg": "#111827",
+            "card_bg": "#1f2937",
+            "card_border": "#334155",
+            "section_fg": "#f59e0b",
+            "label_fg": "#d1d5db",
+            "entry_bg": "#0b1220",
+            "entry_fg": "#e5e7eb",
+            "entry_insert": "#f8fafc",
+            "readonly_bg": "#1e293b",
+            "readonly_fg": "#cbd5e1",
+            "input_border": "#475569",
+            "status_bg": "#020617",
+            "status_fg": "#cbd5e1",
+            "error_fg": "#fca5a5",
+            "warn_fg": "#fde68a",
+            "popup_select_bg": "#f59e0b",
+            "popup_select_fg": "#0f172a",
+        }
+    return {
+        "root_bg": "#f4efe7",
+        "header_bg": "#111827",
+        "header_fg": "#ffffff",
+        "header_sub_fg": "#cbd5e1",
+        "header_muted_fg": "#9ca3af",
+        "header_active_bg": "#1f2937",
+        "toolbar_fg": "#ffffff",
+        "surface_bg": "#f4efe7",
+        "card_bg": "#fffdf8",
+        "card_border": "#d6c7ad",
+        "section_fg": "#7c2d12",
+        "label_fg": "#374151",
+        "entry_bg": "#ffffff",
+        "entry_fg": "#374151",
+        "entry_insert": "#111827",
+        "readonly_bg": "#eef2ff",
+        "readonly_fg": "#374151",
+        "input_border": "#d1d5db",
+        "status_bg": "#111827",
+        "status_fg": "#d1d5db",
+        "error_fg": "#fecaca",
+        "warn_fg": "#fde68a",
+        "popup_select_bg": "#e07b39",
+        "popup_select_fg": "#ffffff",
+    }
+
+
 def runtime_app_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -1088,18 +1161,25 @@ class SmartEntry(tk.Frame if tk is not None else object):
         kwargs.pop("highlightthickness", None)
         kwargs.pop("bd", None)
         bg = kwargs.pop("bg", "white")
-        super().__init__(master, bg=bg, highlightbackground="#d1d5db",
+        fg = kwargs.pop("fg", "#374151")
+        insert_fg = kwargs.pop("insertbackground", "#111827")
+        border = kwargs.pop("highlightbackground", "#d1d5db")
+        popup_select_bg = kwargs.pop("popup_select_bg", "#e07b39")
+        popup_select_fg = kwargs.pop("popup_select_fg", "white")
+        super().__init__(master, bg=bg, highlightbackground=border,
                          highlightthickness=1, **kwargs)
         self._cell = cell
         self._var = textvariable
         self._syncing = False
         self._popup: "tk.Toplevel | None" = None
         self._lb: "tk.Listbox | None" = None
+        self._popup_select_bg = popup_select_bg
+        self._popup_select_fg = popup_select_fg
 
         self.columnconfigure(0, weight=1)
         self._text = tk.Text(
             self, height=1, wrap="word", relief="flat", bd=0,
-            bg=bg, fg="#374151", insertbackground="#111827",
+            bg=bg, fg=fg, insertbackground=insert_fg,
             font=("Segoe UI", 10), padx=4, pady=2, undo=True,
         )
         self._text.grid(row=0, column=0, sticky="ew")
@@ -1182,7 +1262,8 @@ class SmartEntry(tk.Frame if tk is not None else object):
             self._popup.wm_attributes("-topmost", True)
             self._lb = tk.Listbox(
                 self._popup, relief="solid", bd=1,
-                selectbackground="#e07b39", selectforeground="white",
+                selectbackground=self._popup_select_bg,
+                selectforeground=self._popup_select_fg,
                 font=("Segoe UI", 9), activestyle="none",
             )
             self._lb.pack(fill="both", expand=True)
@@ -1435,6 +1516,8 @@ class App:
         self.root.title("Japan moto")
         self.root.geometry("1320x920")
         self.root.minsize(1160, 780)
+        self.theme_mode = detect_theme_mode()
+        self.theme = build_theme_palette(self.theme_mode)
 
         self.source_path = tk.StringVar(value=str(self.resource_dir / "6055.xls"))
         self.moto_path = tk.StringVar(value=str(self.resource_dir / "6055_MOTO_template.xls"))
@@ -1472,20 +1555,20 @@ class App:
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
         self.root.rowconfigure(2, weight=0)
-        self.root.configure(bg="#f4efe7")
+        self.root.configure(bg=self.theme["root_bg"])
 
-        header = tk.Frame(self.root, bg="#111827", padx=10, pady=8)
+        header = tk.Frame(self.root, bg=self.theme["header_bg"], padx=10, pady=8)
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
         header.columnconfigure(1, weight=0)
         header.columnconfigure(2, weight=0)
 
-        title_frame = tk.Frame(header, bg="#111827")
+        title_frame = tk.Frame(header, bg=self.theme["header_bg"])
         title_frame.grid(row=0, column=0, sticky="w")
-        tk.Label(title_frame, text="Japan moto", fg="white", bg="#111827", font=("Segoe UI", 18, "bold")).pack(anchor="w")
-        tk.Label(title_frame, text="Один екран для акта, договору та видаткової", fg="#cbd5e1", bg="#111827", font=("Segoe UI", 9)).pack(anchor="w")
+        tk.Label(title_frame, text="Japan moto", fg=self.theme["header_fg"], bg=self.theme["header_bg"], font=("Segoe UI", 18, "bold")).pack(anchor="w")
+        tk.Label(title_frame, text="Один екран для акта, договору та видаткової", fg=self.theme["header_sub_fg"], bg=self.theme["header_bg"], font=("Segoe UI", 9)).pack(anchor="w")
 
-        toolbar = tk.Frame(header, bg="#111827")
+        toolbar = tk.Frame(header, bg=self.theme["header_bg"])
         toolbar.grid(row=0, column=1, sticky="e")
 
         self._make_toolbar_button(toolbar, "Акт", lambda: self.open_draft("act"), 0)
@@ -1497,8 +1580,8 @@ class App:
 
         gear_btn = tk.Button(
             header, text="⚙", command=self.open_settings_dialog,
-            bg="#111827", fg="#9ca3af", activebackground="#1f2937",
-            activeforeground="white", bd=0, relief="flat",
+            bg=self.theme["header_bg"], fg=self.theme["header_muted_fg"], activebackground=self.theme["header_active_bg"],
+            activeforeground=self.theme["header_fg"], bd=0, relief="flat",
             font=("Segoe UI", 14), padx=8, pady=4, cursor="hand2",
         )
         gear_btn.grid(row=0, column=2, sticky="ne", padx=(0, 4), pady=2)
@@ -1509,15 +1592,15 @@ class App:
         main.rowconfigure(0, weight=1)
         self._build_data_tab(main)
 
-        bottom = tk.Frame(self.root, bg="#111827", padx=12, pady=6)
+        bottom = tk.Frame(self.root, bg=self.theme["status_bg"], padx=12, pady=6)
         bottom.grid(row=2, column=0, sticky="ew")
         bottom.columnconfigure(0, weight=1)
         bottom.columnconfigure(1, weight=1)
         bottom.columnconfigure(2, weight=1)
 
-        tk.Label(bottom, textvariable=self.status_var, bg="#111827", fg="#d1d5db", anchor="w").grid(row=0, column=0, sticky="ew")
-        tk.Label(bottom, textvariable=self.error_var, bg="#111827", fg="#fecaca", anchor="w", wraplength=640).grid(row=0, column=1, sticky="ew")
-        tk.Label(bottom, textvariable=self.warning_var, bg="#111827", fg="#fde68a", anchor="w", wraplength=640).grid(row=0, column=2, sticky="ew")
+        tk.Label(bottom, textvariable=self.status_var, bg=self.theme["status_bg"], fg=self.theme["status_fg"], anchor="w").grid(row=0, column=0, sticky="ew")
+        tk.Label(bottom, textvariable=self.error_var, bg=self.theme["status_bg"], fg=self.theme["error_fg"], anchor="w", wraplength=640).grid(row=0, column=1, sticky="ew")
+        tk.Label(bottom, textvariable=self.warning_var, bg=self.theme["status_bg"], fg=self.theme["warn_fg"], anchor="w", wraplength=640).grid(row=0, column=2, sticky="ew")
 
         self.write_log(f"Platform: {platform.system()}")
         self.write_log(f"Output folder: {self.out_dir}")
@@ -1525,7 +1608,20 @@ class App:
             self.write_log("Демо-режим поза Windows: формування договору через Word-шаблон недоступне.")
 
     def _make_toolbar_button(self, parent, text: str, command, column: int) -> None:
-        button = tk.Button(parent, text=text, command=command, bg="#111827", fg="white", activebackground="#1f2937", activeforeground="white", bd=0, relief="flat", padx=10, pady=4, cursor="hand2")
+        button = tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg=self.theme["header_bg"],
+            fg=self.theme["toolbar_fg"],
+            activebackground=self.theme["header_active_bg"],
+            activeforeground=self.theme["header_fg"],
+            bd=0,
+            relief="flat",
+            padx=10,
+            pady=4,
+            cursor="hand2",
+        )
         button.grid(row=0, column=column, padx=(0, 6), sticky="e")
 
     def _add_copy_paste_menu(self, entry) -> None:
@@ -1568,18 +1664,18 @@ class App:
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(0, weight=1)
 
-        outer = tk.Frame(parent, bg="#f4efe7")
+        outer = tk.Frame(parent, bg=self.theme["surface_bg"])
         outer.grid(row=0, column=0, sticky="nsew")
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(0, weight=1)
 
-        canvas = tk.Canvas(outer, bg="#f4efe7", highlightthickness=0)
+        canvas = tk.Canvas(outer, bg=self.theme["surface_bg"], highlightthickness=0)
         scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")
 
-        content = tk.Frame(canvas, bg="#f4efe7")
+        content = tk.Frame(canvas, bg=self.theme["surface_bg"])
         content.columnconfigure(0, weight=1)
         content.columnconfigure(1, weight=1)
         content_win = canvas.create_window((0, 0), window=content, anchor="nw")
@@ -1603,7 +1699,14 @@ class App:
         for index, (group_name, fields) in enumerate(FIELD_SECTIONS):
             row = index // 2
             col = index % 2
-            card = tk.Frame(content, bg="#fffdf8", highlightbackground="#d6c7ad", highlightthickness=1, padx=14, pady=14)
+            card = tk.Frame(
+                content,
+                bg=self.theme["card_bg"],
+                highlightbackground=self.theme["card_border"],
+                highlightthickness=1,
+                padx=14,
+                pady=14,
+            )
             if index == last_idx and last_idx % 2 == 0:
                 card.grid(row=row, column=0, columnspan=2, sticky="nsew", padx=8, pady=8)
             else:
@@ -1615,22 +1718,32 @@ class App:
         parent.columnconfigure(1, weight=1)
         row_offset = 0
         if group_name:
-            tk.Label(parent, text=group_name, bg="#fffdf8", fg="#7c2d12",
+            tk.Label(parent, text=group_name, bg=self.theme["card_bg"], fg=self.theme["section_fg"],
                      font=("Segoe UI", 12, "bold")).grid(
                          row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
             row_offset = 1
         for row, (cell, label, required) in enumerate(fields):
             actual_row = row + row_offset
             display = f"{label}{' *' if required else ''}"
-            tk.Label(parent, text=display, bg="#fffdf8", fg="#374151", anchor="w").grid(row=actual_row, column=0, sticky="w", padx=(0, 10), pady=4)
+            tk.Label(parent, text=display, bg=self.theme["card_bg"], fg=self.theme["label_fg"], anchor="w").grid(row=actual_row, column=0, sticky="w", padx=(0, 10), pady=4)
 
             var = self.state_vars[cell]
             if cell == "E15":
                 entry = tk.Entry(parent, textvariable=var, relief="flat", highlightthickness=1, bd=0,
-                                 bg="#eef2ff", fg="#374151", insertbackground="#111827",
-                                 state="readonly", readonlybackground="#eef2ff")
+                                 bg=self.theme["readonly_bg"], fg=self.theme["readonly_fg"], insertbackground=self.theme["entry_insert"],
+                                 state="readonly", readonlybackground=self.theme["readonly_bg"])
             else:
-                entry = SmartEntry(parent, cell=cell, textvariable=var)
+                entry = SmartEntry(
+                    parent,
+                    cell=cell,
+                    textvariable=var,
+                    bg=self.theme["entry_bg"],
+                    fg=self.theme["entry_fg"],
+                    insertbackground=self.theme["entry_insert"],
+                    highlightbackground=self.theme["input_border"],
+                    popup_select_bg=self.theme["popup_select_bg"],
+                    popup_select_fg=self.theme["popup_select_fg"],
+                )
             entry.grid(row=actual_row, column=1, sticky="ew", pady=4)
             self.widgets[cell] = entry
 
@@ -1681,6 +1794,7 @@ class App:
         dialog = tk.Toplevel(self.root)
         dialog.title("Шаблони і вихід")
         dialog.geometry("760x320")
+        dialog.configure(bg=self.theme["card_bg"])
         dialog.transient(self.root)
         dialog.grab_set()
 
@@ -1694,16 +1808,61 @@ class App:
             ("Редактор", self.editor_path),
         ]
 
-        tk.Label(dialog, text="Параметри шаблонів", font=("Segoe UI", 14, "bold")).grid(row=0, column=0, columnspan=3, sticky="w", padx=16, pady=(14, 8))
+        tk.Label(
+            dialog,
+            text="Параметри шаблонів",
+            font=("Segoe UI", 14, "bold"),
+            bg=self.theme["card_bg"],
+            fg=self.theme["label_fg"],
+        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=16, pady=(14, 8))
         for row, (label, var) in enumerate(fields, start=1):
-            tk.Label(dialog, text=label).grid(row=row, column=0, sticky="w", padx=16, pady=6)
-            tk.Entry(dialog, textvariable=var).grid(row=row, column=1, sticky="ew", pady=6)
-            tk.Button(dialog, text="Огляд", command=lambda v=var: self.browse_path(v)).grid(row=row, column=2, padx=12)
+            tk.Label(dialog, text=label, bg=self.theme["card_bg"], fg=self.theme["label_fg"]).grid(row=row, column=0, sticky="w", padx=16, pady=6)
+            tk.Entry(dialog, textvariable=var, bg=self.theme["entry_bg"], fg=self.theme["entry_fg"], insertbackground=self.theme["entry_insert"]).grid(row=row, column=1, sticky="ew", pady=6)
+            tk.Button(
+                dialog,
+                text="Огляд",
+                command=lambda v=var: self.browse_path(v),
+                bg=self.theme["header_bg"],
+                fg=self.theme["toolbar_fg"],
+                activebackground=self.theme["header_active_bg"],
+                activeforeground=self.theme["header_fg"],
+            ).grid(row=row, column=2, padx=12)
 
-        tk.Checkbutton(dialog, text="Відкривати файл після генерації", variable=self.open_after_save).grid(row=7, column=0, columnspan=3, sticky="w", padx=16, pady=(10, 6))
-        tk.Button(dialog, text="↺ Перезавантажити шаблон", command=lambda: [self.reload_source(), dialog.destroy()]).grid(row=8, column=0, sticky="w", padx=16, pady=8)
-        tk.Button(dialog, text="Зберегти новий шаблон", command=lambda: [self.save_source_changes(), dialog.destroy()]).grid(row=8, column=1, sticky="w", pady=8)
-        tk.Button(dialog, text="Закрити", command=dialog.destroy).grid(row=8, column=2, sticky="e", padx=12, pady=12)
+        tk.Checkbutton(
+            dialog,
+            text="Відкривати файл після генерації",
+            variable=self.open_after_save,
+            bg=self.theme["card_bg"],
+            fg=self.theme["label_fg"],
+            selectcolor=self.theme["entry_bg"],
+        ).grid(row=7, column=0, columnspan=3, sticky="w", padx=16, pady=(10, 6))
+        tk.Button(
+            dialog,
+            text="↺ Перезавантажити шаблон",
+            command=lambda: [self.reload_source(), dialog.destroy()],
+            bg=self.theme["header_bg"],
+            fg=self.theme["toolbar_fg"],
+            activebackground=self.theme["header_active_bg"],
+            activeforeground=self.theme["header_fg"],
+        ).grid(row=8, column=0, sticky="w", padx=16, pady=8)
+        tk.Button(
+            dialog,
+            text="Зберегти новий шаблон",
+            command=lambda: [self.save_source_changes(), dialog.destroy()],
+            bg=self.theme["header_bg"],
+            fg=self.theme["toolbar_fg"],
+            activebackground=self.theme["header_active_bg"],
+            activeforeground=self.theme["header_fg"],
+        ).grid(row=8, column=1, sticky="w", pady=8)
+        tk.Button(
+            dialog,
+            text="Закрити",
+            command=dialog.destroy,
+            bg=self.theme["header_bg"],
+            fg=self.theme["toolbar_fg"],
+            activebackground=self.theme["header_active_bg"],
+            activeforeground=self.theme["header_fg"],
+        ).grid(row=8, column=2, sticky="e", padx=12, pady=12)
 
     def _on_state_change(self, *_):
         if self._syncing_form:
@@ -1748,7 +1907,7 @@ class App:
             elif cell in warning_cells:
                 bg = "#fef3c7"
             else:
-                bg = "#ffffff"
+                bg = self.theme["entry_bg"]
             if isinstance(entry, SmartEntry):
                 entry.set_bg(bg)
             else:
