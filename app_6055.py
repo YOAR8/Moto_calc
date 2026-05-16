@@ -301,30 +301,34 @@ def windows_transfer_all(source_6055: Path, moto_template: Path, dogovir_templat
 
 FIELD_SECTIONS = [
     (
+        "Суб'єкт господарювання",
+        [
+            ("C5", "Найменування", False),
+            ("C6", "Код ЄДРПОУ", False),
+            ("C7", "Місцезнаходження", False),
+            ("C8", "Реєстр. номер МВС", False),
+            ("A56", "Продавець (підпис)", False),
+        ],
+    ),
+    (
         "Документ",
         [
             ("A3", "Номер і дата", True),
-            ("C51", "Дата набуття права", False),
             ("C47", "Митна декларація", False),
+            ("C51", "Дата набуття права", False),
+            ("C48", "Акт приймання-передачі", False),
+            ("C49", "Свідоцтво про реєстрацію", False),
+            ("C53", "Висновок", False),
         ],
     ),
     (
-        "Покупець",
-        [
-            ("C15", "ПІБ покупця", True),
-            ("E15", "ПІБ скорочено", False),
-            ("C12", "Дата народження", False),
-            ("C16", "Адреса", True),
-            ("C17", "Паспорт", True),
-            ("C18", "ІПН / код", True),
-        ],
-    ),
-    (
-        "Транспорт 1",
+        "Транспорт",
         [
             ("C20", "Марка, модель", True),
             ("C21", "Тип ТЗ", False),
             ("C22", "Призначення", False),
+            ("C23", "Сертифікат відповідності", False),
+            ("C24", "Номер сертифіката типу", False),
             ("C25", "Категорія", False),
             ("C26", "Тип кузова", False),
             ("C27", "Паливо", False),
@@ -332,40 +336,49 @@ FIELD_SECTIONS = [
             ("C29", "Рік випуску", True),
             ("C30", "Повна маса", False),
             ("C31", "Маса без навантаження", False),
+            ("C32", "Кількість дверей", False),
             ("C33", "Кількість місць", False),
+            ("C34", "Кількість стоячих місць", False),
         ],
     ),
     (
-        "Транспорт 2",
+        "Ідентифікатори",
         [
             ("C35", "Кількість циліндрів", False),
             ("C36", "Об'єм двигуна", True),
             ("C37", "Потужність кВт", False),
+            ("C38", "Потужність к.с.", False),
             ("C39", "VIN / номер рами", True),
+            ("C40", "Номер кузова", False),
             ("C41", "Номер двигуна", True),
             ("C42", "Номер шасі", True),
             ("C43", "Номер рами", True),
-            ("C44", "Ціна без ПДВ", True),
-            ("C45", "ПДВ", True),
-            ("C46", "Ціна з ПДВ", True),
             ("C50", "Номерні знаки", False),
         ],
     ),
     (
-        "Додатково",
+        "Вартість",
         [
-            ("C23", "Сертифікат відповідності", False),
-            ("C24", "Номер сертифіката типу", False),
-            ("C32", "Кількість дверей", False),
-            ("C34", "Кількість стоячих місць", False),
-            ("C38", "Потужність к.с.", False),
-            ("C40", "Номер кузова", False),
-            ("C48", "Акт приймання-передачі", False),
-            ("C49", "Свідоцтво про реєстрацію", False),
-            ("C51", "Дата набуття права", False),
-            ("C53", "Висновок", False),
-            ("A56", "Продавець", False),
-            ("D56", "Покупець (підпис)", False),
+            ("C44", "Ціна без ПДВ", True),
+            ("C45", "ПДВ", True),
+            ("C46", "Ціна з ПДВ", True),
+            ("DISC", "Знижка", False),
+        ],
+    ),
+    (
+        "Реквізити покупця",
+        [
+            ("C12", "Дата народження", False),
+        ],
+    ),
+    (
+        "Покупець",
+        [
+            ("C15", "ПІБ покупця", True),
+            ("E15", "ПІБ скорочено", False),
+            ("C16", "Адреса", True),
+            ("C17", "Паспорт", True),
+            ("C18", "ІПН / код", True),
         ],
     ),
 ]
@@ -772,13 +785,17 @@ def preview_text_for_vidatkova(payload: Dict[str, str]) -> str:
     ])
 
 
+_XLS_CELL_RE = re.compile(r"^[A-Z]+\d+$")
+
+
 def generate_act_xls_from_state(state: Dict[str, str], source_6055: Path, out_path: Path) -> Path:
     shutil.copy2(source_6055, out_path)
-    updates = {cell: state.get(cell, "") for cell in FORM_CELLS}
+    updates = {cell: state.get(cell, "") for cell in FORM_CELLS if _XLS_CELL_RE.match(cell)}
     full_fio = str(state.get("C15", "")).strip()
     short_fio = str(state.get("E15", "")).strip()
     if full_fio and short_fio:
         updates["C15"] = f"{full_fio} / {short_fio}"
+    updates["D56"] = short_fio or short_name(full_fio)
     write_xls_cells(out_path, "Worksheet", updates, backup=False)
     return out_path
 
@@ -786,7 +803,24 @@ def generate_act_xls_from_state(state: Dict[str, str], source_6055: Path, out_pa
 def generate_vidatkova_xls_from_state(state: Dict[str, str], template_path: Path, out_path: Path) -> Path:
     payload = parse_state(state)
     shutil.copy2(template_path, out_path)
-    updates = {
+
+    discount = parse_decimal(state.get("DISC", "")) or 0.0
+    price_no_vat = parse_decimal(payload.get("C44", "")) or 0.0
+    vat_amt = parse_decimal(payload.get("C45", "")) or 0.0
+    price_total = parse_decimal(payload.get("C46", "")) or 0.0
+
+    if discount > 0:
+        price_no_vat_d = max(0.0, price_no_vat - discount)
+        vat_d = vat_amt
+        price_total_d = max(0.0, price_total - discount)
+        sumtext = amount_to_words_uah(price_total_d)
+    else:
+        price_no_vat_d = price_no_vat
+        vat_d = vat_amt
+        price_total_d = price_total
+        sumtext = payload.get("sumtext", "")
+
+    updates: Dict[str, object] = {
         "C6": payload["FIO"],
         "C7": "той самий",
         "G9": payload["A3"],
@@ -796,79 +830,149 @@ def generate_vidatkova_xls_from_state(state: Dict[str, str], template_path: Path
         "D13": payload["cuzov"],
         "E13": "шт",
         "F13": 1,
-        "G13": payload.get("C44", ""),
-        "H13": payload.get("C44", ""),
-        "H15": payload.get("C44", ""),
-        "H16": payload.get("C45", ""),
-        "H17": payload.get("C46", ""),
-        "A19": payload.get("sumtext", ""),
-        "B20": payload.get("C45", ""),
+        "G13": price_no_vat if price_no_vat else payload.get("C44", ""),
+        "H13": price_no_vat if price_no_vat else payload.get("C44", ""),
+        "H15": price_no_vat_d if price_no_vat_d else payload.get("C44", ""),
+        "H16": vat_d if vat_d else payload.get("C45", ""),
+        "H17": price_total_d if price_total_d else payload.get("C46", ""),
+        "A19": sumtext,
+        "B20": vat_d if vat_d else payload.get("C45", ""),
         "F23": payload["FIO"],
     }
+    if discount > 0:
+        updates["H14"] = discount
     write_xls_cells(out_path, "Лист1", updates, backup=False)
     return out_path
 
 
 def generate_contract_docx_fallback(state: Dict[str, str], out_path: Path) -> "Path | None":
-    """Generate contract .docx without Word COM (python-docx fallback). Returns None if python-docx unavailable."""
+    """Generate full-text contract .docx without Word COM. Returns None if python-docx unavailable."""
     try:
         from docx import Document  # type: ignore
-        from docx.shared import Cm  # type: ignore
+        from docx.shared import Pt, Cm  # type: ignore
         from docx.enum.text import WD_ALIGN_PARAGRAPH  # type: ignore
     except ImportError:
         return None
 
     payload = parse_state(state)
+
+    def v(key: str) -> str:
+        val = str(payload.get(key, "")).strip()
+        return val if val else "___"
+
     doc = Document()
-    for section in doc.sections:
-        section.top_margin = Cm(2)
-        section.bottom_margin = Cm(2)
-        section.left_margin = Cm(2.5)
-        section.right_margin = Cm(2.5)
+    for sec in doc.sections:
+        sec.top_margin = Cm(2)
+        sec.bottom_margin = Cm(2)
+        sec.left_margin = Cm(3)
+        sec.right_margin = Cm(1.5)
 
-    t = doc.add_heading("ДОГОВІР КУПІВЛІ-ПРОДАЖУ ТРАНСПОРТНОГО ЗАСОБУ", level=1)
-    t.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    def add_centered_bold(text: str, size: int = 12) -> None:
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        r = p.add_run(text)
+        r.bold = True
+        r.font.size = Pt(size)
 
-    p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = p.add_run(f"\u2116 {payload.get('Number', '')}  \u0432\u0456\u0434  {payload.get('Data', '')}")
-    run.bold = True
+    def add_para(text: str, indent: bool = False) -> None:
+        p = doc.add_paragraph(text)
+        if indent:
+            p.paragraph_format.first_line_indent = Pt(36)
 
-    def _add_field(label: str, value: str) -> None:
-        para = doc.add_paragraph()
-        rl = para.add_run(f"{label}: ")
-        rl.bold = True
-        para.add_run(value if value else "___")
+    def add_bold_para(text: str) -> None:
+        p = doc.add_paragraph()
+        p.add_run(text).bold = True
 
-    doc.add_heading("\u0421\u0442\u043e\u0440\u043e\u043d\u0438 \u0434\u043e\u0433\u043e\u0432\u043e\u0440\u0443", level=2)
-    _add_field("\u041f\u043e\u043a\u0443\u043f\u0435\u0446\u044c (\u041f\u0406\u0411)", payload.get("FIO", ""))
-    _add_field("\u0414\u0430\u0442\u0430 \u043d\u0430\u0440\u043e\u0434\u0436\u0435\u043d\u043d\u044f", payload.get("BirthDay", ""))
-    _add_field("\u041f\u0430\u0441\u043f\u043e\u0440\u0442", payload.get("pasport", ""))
-    _add_field("\u0406\u041f\u041d / \u0420\u041d\u041e\u041a\u041f\u041f", payload.get("TaxNumber", ""))
-    _add_field("\u0410\u0434\u0440\u0435\u0441\u0430", payload.get("adres", ""))
-    _add_field("\u041c\u0438\u0442\u043d\u0430 \u0434\u0435\u043a\u043b\u0430\u0440\u0430\u0446\u0456\u044f", payload.get("decl", ""))
-
-    doc.add_heading("\u0422\u0440\u0430\u043d\u0441\u043f\u043e\u0440\u0442\u043d\u0438\u0439 \u0437\u0430\u0441\u0456\u0431", level=2)
-    _add_field("\u041c\u0430\u0440\u043a\u0430, \u043c\u043e\u0434\u0435\u043b\u044c", payload.get("model", ""))
-    _add_field("\u0420\u0456\u043a \u0432\u0438\u043f\u0443\u0441\u043a\u0443", payload.get("year", ""))
-    _add_field("\u041a\u043e\u043b\u0456\u0440", payload.get("color", ""))
-    _add_field("\u041d\u043e\u043c\u0435\u0440 \u0434\u0432\u0438\u0433\u0443\u043d\u0430", payload.get("numberdv", ""))
-    _add_field("VIN / \u041d\u043e\u043c\u0435\u0440 \u0440\u0430\u043c\u0438", payload.get("cuzov", ""))
-    _add_field("\u041e\u0431'\u0454\u043c \u0434\u0432\u0438\u0433\u0443\u043d\u0430", payload.get("cub", ""))
-    _add_field("\u041d\u043e\u043c\u0435\u0440\u043d\u0456 \u0437\u043d\u0430\u043a\u0438", payload.get("znak", ""))
-
-    doc.add_heading("\u0412\u0430\u0440\u0442\u0456\u0441\u0442\u044c", level=2)
-    _add_field("\u0426\u0456\u043d\u0430 (\u0437 \u041f\u0414\u0412)", payload.get("price", ""))
-    _add_field("\u0421\u0443\u043c\u0430 \u043f\u0440\u043e\u043f\u0438\u0441\u043e\u043c", payload.get("sumtext", ""))
-
+    # Title
+    add_centered_bold("ДОГОВІР КУПІВЛІ-ПРОДАЖУ ТРАНСПОРТНОГО ЗАСОБУ", size=14)
+    add_centered_bold(
+        f"№ {v('Number')}    місто Вінниця, Україна,    {v('Data')}"
+    )
     doc.add_paragraph()
+
+    # Parties
+    add_para(
+        "Ми, які підписалися нижче:\n"
+        "Приватне Підприємство ВКФ МОСТ, код ЄДРПОУ 20112221, м. Вінниця, вул. Івана Богуна, 1/13 "
+        "(надалі «Продавець»), в особі директора Колійчука Ігора Миколайовича, який діє на підставі "
+        f"Статуту підприємства з однієї сторони та {v('FIO')}, {v('BirthDay')} року народження, "
+        f"паспорт серія {v('pasport')}, реєстраційний номер облікової картки платника податків "
+        f"{v('TaxNumber')}, який зареєстрований за адресою: {v('adres')}, (надалі «Покупець»), "
+        "який діє на підставі власного волевиявлення, з другої сторони уклали цей Договір про таке:"
+    )
+
+    # Section 1
+    add_bold_para("1. ПРЕДМЕТ ДОГОВОРУ")
+    add_para(
+        f"1.1. За цим Договором Продавець продає Покупцю, та зобов'язується передати у власність "
+        f"Покупця, а Покупець зобов'язується прийняти у власність транспортний засіб, ввезений на "
+        f"територію України на підставі митної декларації {v('decl')}, б/використані мотоцикл, "
+        f"який має такі характеристики: марка {v('model')}, {v('year')} року випуску, "
+        f"колір {v('color')}, номер кузова (шасі, рама) {v('cuzov')}, номер двигуна {v('numberdv')}, "
+        f"об'єм двигуна {v('cub')} см\u00b3, транзитний номерний знак виданий торг. орг. {v('znak')}.",
+        indent=True,
+    )
+    add_para(
+        "1.2. Транспортний засіб оглянутий Покупцем. Покупець стверджує, що володіє достатньою "
+        "інформацією про Транспортний засіб, що набувається, задоволений його технічним станом та "
+        "погоджується прийняти його таким, як він є. Під час огляду Транспортного засобу будь-яких "
+        "дефектів, недоліків, які перешкоджають використанню Транспортного засобу за цільовим "
+        "призначенням, про які не було повідомлено Продавцем не виявлено. Претензій до Продавця "
+        "щодо якісних характеристик відчужуваного Транспортного засобу Покупець не має.",
+        indent=True,
+    )
+    add_para(
+        "1.3. Продавець підтверджує, що вказаний мотоцикл нікому не проданий, не подарований, "
+        "не закладений, не знаходиться під арештом, судова справа по ньому не ведеться та оформлений "
+        "в митному відношенні, гарантує достовірність документів на вказаний мотоцикл, законність "
+        "права володіння ним, достовірність номерів, вузлів та агрегатів, в подальшому всі претензії "
+        "від покупця по вище перерахованих питаннях продавець приймає на себе.",
+        indent=True,
+    )
+    add_para(
+        "1.4. Право власності на Транспортний засіб виникає у Покупця з моменту укладання даного "
+        "Договору.",
+        indent=True,
+    )
+
+    # Section 2
+    add_bold_para("2. ЦІНА ДОГОВОРУ")
+    add_para(
+        f"2.1. За домовленістю сторін ціна Транспортного засобу складає {v('price')} "
+        f"({v('sumtext')}) гривень 00 копійок.",
+        indent=True,
+    )
+    add_para(
+        "2.2. Оплата Транспортного засобу здійснюється шляхом оплати на безготівковий та/або "
+        "готівковий рахунок підприємства з відстрочкою платежу 30 днів та підтверджується "
+        "видатковою накладною.",
+        indent=True,
+    )
+
+    # Section 3
+    add_bold_para("3. ІНШІ УМОВИ")
+    add_para("3.1. Сторони мають права і обов'язки встановлені законодавством.", indent=True)
+    add_para("3.2. Договір є укладеним з моменту його підписання Сторонами.", indent=True)
+    add_para(
+        "3.3. У разі невиконання або неналежного виконання своїх зобов'язань за цим Договором "
+        "сторони несуть відповідальність, передбачену чинним законодавством.",
+        indent=True,
+    )
+    add_para(
+        "3.4. Договір укладено у двох примірниках, один для Покупця, другий для Продавця.",
+        indent=True,
+    )
+
+    # Signatures
+    doc.add_paragraph()
+    add_centered_bold("ПІДПИСИ:")
     tbl = doc.add_table(rows=3, cols=2)
-    tbl.cell(0, 0).text = "\u041f\u0440\u043e\u0434\u0430\u0432\u0435\u0446\u044c"
-    tbl.cell(0, 1).text = "\u041f\u043e\u043a\u0443\u043f\u0435\u0446\u044c"
-    tbl.cell(1, 0).text = "________________________"
-    tbl.cell(1, 1).text = "________________________"
-    tbl.cell(2, 0).text = ""
-    tbl.cell(2, 1).text = payload.get("FIO2", "")
+    tbl.cell(0, 0).text = "ПОКУПЕЦЬ:"
+    tbl.cell(0, 1).text = "ПРОДАВЕЦЬ:"
+    tbl.cell(1, 0).text = f"{v('FIO2')}"
+    tbl.cell(1, 1).text = "Директор КОЛІЙЧУК ІГОР МИКОЛАЙОВИЧ"
+    tbl.cell(2, 0).text = "(підпис) ________________________"
+    tbl.cell(2, 1).text = "ПП ВКФ МОСТ:  (підпис) ________________________"
 
     out_docx = out_path.with_suffix(".docx")
     doc.save(str(out_docx))
@@ -959,6 +1063,186 @@ def ensure_case_dir(base_out_dir: Path, state: Dict[str, str], unique: bool = Fa
     return case_dir
 
 
+# ---------------------------------------------------------------------------
+# Autocomplete widget
+# ---------------------------------------------------------------------------
+
+_BUILTIN_SUGGESTIONS: Dict[str, list] = {
+    "C21": ["МОТОЦИКЛ", "МОПЕД", "СКУТЕР", "ТРИЦИКЛ"],
+    "C22": ["ЗАГАЛЬНИЙ", "СПОРТИВНИЙ"],
+    "C25": ["A1", "A2", "A3", "L1e", "L2e", "L3", "L3e"],
+    "C26": ["МОТОЦИКЛ", "МОПЕД", "СКУТЕР"],
+    "C27": ["БЕНЗИН", "ДИЗЕЛЬ", "ЕЛЕКТРО"],
+}
+
+
+class AutocompleteEntry(tk.Entry if tk is not None else object):
+    """tk.Entry with a dropdown autocomplete popup powered by a JSON history file."""
+
+    _suggestions: Dict[str, list] = {}
+    _db_path: "Path | None" = None
+
+    @classmethod
+    def load_db(cls, path: Path) -> None:
+        cls._db_path = path
+        merged: Dict[str, list] = {k: list(v) for k, v in _BUILTIN_SUGGESTIONS.items()}
+        if path.exists():
+            try:
+                import json as _json
+                data = _json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    for cell, vals in data.items():
+                        if isinstance(vals, list):
+                            existing = set(merged.get(cell, []))
+                            merged.setdefault(cell, [])
+                            for val in vals:
+                                if val not in existing:
+                                    merged[cell].append(val)
+                                    existing.add(val)
+            except Exception:
+                pass
+        cls._suggestions = merged
+
+    @classmethod
+    def save_db(cls) -> None:
+        if cls._db_path is None:
+            return
+        try:
+            import json as _json
+            cls._db_path.write_text(
+                _json.dumps(cls._suggestions, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    @classmethod
+    def record(cls, cell: str, value: str) -> None:
+        value = str(value).strip()
+        if not value:
+            return
+        lst = cls._suggestions.setdefault(cell, [])
+        if value in lst:
+            lst.remove(value)
+        lst.insert(0, value)
+        if len(lst) > 50:
+            del lst[50:]
+
+    def __init__(self, master, cell: str, textvariable: tk.StringVar, **kwargs):
+        super().__init__(master, textvariable=textvariable, **kwargs)
+        self._cell = cell
+        self._var = textvariable
+        self._popup: "tk.Toplevel | None" = None
+        self._lb: "tk.Listbox | None" = None
+        self._selecting = False
+
+        self.bind("<KeyRelease>", self._on_key)
+        self.bind("<FocusOut>", self._close)
+        self.bind("<Escape>", self._close)
+        self.bind("<Down>", self._move_down)
+        self.bind("<Up>", self._move_up)
+        self.bind("<Tab>", self._on_tab)
+        self.bind("<Return>", self._on_enter)
+
+    def _candidates(self) -> list:
+        typed = self._var.get().strip().upper()
+        all_ = self._suggestions.get(self._cell, [])
+        if not typed:
+            return all_[:8]
+        return [v for v in all_ if v.upper().startswith(typed)][:8]
+
+    def _open(self, candidates: list) -> None:
+        if not candidates:
+            self._close()
+            return
+        if self._popup is None or not self._popup.winfo_exists():
+            self._popup = tk.Toplevel(self)
+            self._popup.wm_overrideredirect(True)
+            self._popup.wm_attributes("-topmost", True)
+            self._lb = tk.Listbox(
+                self._popup,
+                relief="solid",
+                bd=1,
+                selectbackground="#e07b39",
+                selectforeground="white",
+                font=("Segoe UI", 9),
+                activestyle="none",
+            )
+            self._lb.pack(fill="both", expand=True)
+            self._lb.bind("<ButtonRelease-1>", lambda e: self._pick(self._lb.curselection()))
+        self._lb.delete(0, "end")
+        for c in candidates:
+            self._lb.insert("end", c)
+        self.update_idletasks()
+        x = self.winfo_rootx()
+        y = self.winfo_rooty() + self.winfo_height()
+        w = max(self.winfo_width(), 200)
+        h = min(len(candidates) * 22 + 4, 180)
+        self._popup.geometry(f"{w}x{h}+{x}+{y}")
+        self._popup.deiconify()
+
+    def _close(self, *_) -> None:
+        if self._popup and self._popup.winfo_exists():
+            self._popup.withdraw()
+
+    def _on_key(self, event) -> None:
+        if event.keysym in ("Down", "Up", "Return", "Escape", "Tab"):
+            return
+        if self._selecting:
+            return
+        self._open(self._candidates())
+
+    def _move_down(self, event) -> str:
+        if self._popup and self._popup.winfo_viewable() and self._lb:
+            cur = self._lb.curselection()
+            nxt = (cur[0] + 1) if cur else 0
+            if nxt < self._lb.size():
+                self._lb.selection_clear(0, "end")
+                self._lb.selection_set(nxt)
+                self._lb.see(nxt)
+        return "break"
+
+    def _move_up(self, event) -> str:
+        if self._popup and self._popup.winfo_viewable() and self._lb:
+            cur = self._lb.curselection()
+            if cur and cur[0] > 0:
+                self._lb.selection_clear(0, "end")
+                self._lb.selection_set(cur[0] - 1)
+                self._lb.see(cur[0] - 1)
+        return "break"
+
+    def _on_tab(self, event) -> "str | None":
+        if self._popup and self._popup.winfo_viewable() and self._lb:
+            cur = self._lb.curselection()
+            if not cur and self._lb.size() > 0:
+                self._lb.selection_set(0)
+                cur = (0,)
+            if cur:
+                self._pick(cur)
+                return "break"
+        return None
+
+    def _on_enter(self, event) -> "str | None":
+        if self._popup and self._popup.winfo_viewable() and self._lb:
+            cur = self._lb.curselection()
+            if cur:
+                self._pick(cur)
+                return "break"
+        self._close()
+        return None
+
+    def _pick(self, sel) -> None:
+        if not sel or self._lb is None:
+            return
+        value = self._lb.get(sel[0])
+        self._selecting = True
+        self._var.set(value)
+        self._selecting = False
+        self._close()
+        self.icursor("end")
+        self.focus_set()
+
+
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -987,6 +1271,9 @@ class App:
         self.log_lines: list[str] = []
         self._syncing_form = False
         self._generation_suggested = False
+
+        ac_db_path = self.out_dir / "autocomplete.json"
+        AutocompleteEntry.load_db(ac_db_path)
 
         self._load_state_from_source()
         self._build_ui()
@@ -1113,14 +1400,9 @@ class App:
         canvas.bind_all("<Button-4>", _scroll_up)
         canvas.bind_all("<Button-5>", _scroll_dn)
 
-        title = tk.Frame(content, bg="#f4efe7", padx=10, pady=10)
-        title.grid(row=0, column=0, columnspan=2, sticky="ew")
-        tk.Label(title, text="АКТ / ГОЛОВНА ФОРМА 6055", font=("Segoe UI", 18, "bold"), bg="#f4efe7", fg="#111827").pack(anchor="w")
-        tk.Label(title, text="Заповніть поля один раз, далі формуйте чорновик акту, договору або видаткової.", font=("Segoe UI", 10), bg="#f4efe7", fg="#4b5563").pack(anchor="w", pady=(4, 0))
-
         last_idx = len(FIELD_SECTIONS) - 1
         for index, (group_name, fields) in enumerate(FIELD_SECTIONS):
-            row = index // 2 + 1
+            row = index // 2
             col = index % 2
             card = tk.Frame(content, bg="#fffdf8", highlightbackground="#d6c7ad", highlightthickness=1, padx=14, pady=14)
             if index == last_idx and last_idx % 2 == 0:
@@ -1139,9 +1421,13 @@ class App:
             tk.Label(parent, text=display, bg="#fffdf8", fg="#374151", anchor="w").grid(row=row, column=0, sticky="w", padx=(0, 10), pady=4)
 
             var = self.state_vars[cell]
-            entry = tk.Entry(parent, textvariable=var, relief="flat", highlightthickness=1, bd=0, bg="white", insertbackground="#111827")
             if cell == "E15":
-                entry.configure(state="readonly", readonlybackground="#eef2ff", fg="#374151")
+                entry = tk.Entry(parent, textvariable=var, relief="flat", highlightthickness=1, bd=0,
+                                 bg="#eef2ff", fg="#374151", insertbackground="#111827",
+                                 state="readonly", readonlybackground="#eef2ff")
+            else:
+                entry = AutocompleteEntry(parent, cell=cell, textvariable=var, relief="flat",
+                                         highlightthickness=1, bd=0, bg="white", insertbackground="#111827")
             entry.grid(row=row, column=1, sticky="ew", pady=4)
             self.widgets[cell] = entry
 
@@ -1171,8 +1457,8 @@ class App:
                 ttk.Button(parent, text="Огляд", command=lambda v=var: self.browse_path(v)).grid(row=row, column=2, padx=(8, 0))
 
         ttk.Checkbutton(parent, text="Відкривати файл після генерації", variable=self.open_after_save).grid(row=6, column=0, columnspan=2, sticky="w", pady=(12, 0))
-        ttk.Button(parent, text="Перезавантажити 6055", command=self.reload_source).grid(row=7, column=0, sticky="w", pady=(12, 0))
-        ttk.Button(parent, text="Зберегти 6055 зараз", command=self.save_source_changes).grid(row=7, column=1, sticky="w", pady=(12, 0))
+        ttk.Button(parent, text="Перезавантажити шаблон", command=self.reload_source).grid(row=7, column=0, sticky="w", pady=(12, 0))
+        ttk.Button(parent, text="Зберегти новий шаблон", command=self.save_source_changes).grid(row=7, column=1, sticky="w", pady=(12, 0))
 
     def _build_log_tab(self, parent: ttk.Frame) -> None:
         parent.rowconfigure(0, weight=1)
@@ -1212,8 +1498,8 @@ class App:
             tk.Button(dialog, text="Огляд", command=lambda v=var: self.browse_path(v)).grid(row=row, column=2, padx=12)
 
         tk.Checkbutton(dialog, text="Відкривати файл після генерації", variable=self.open_after_save).grid(row=7, column=0, columnspan=3, sticky="w", padx=16, pady=(10, 6))
-        tk.Button(dialog, text="↺ Перезавантажити 6055", command=lambda: [self.reload_source(), dialog.destroy()]).grid(row=8, column=0, sticky="w", padx=16, pady=8)
-        tk.Button(dialog, text="Зберегти 6055", command=lambda: [self.save_source_changes(), dialog.destroy()]).grid(row=8, column=1, sticky="w", pady=8)
+        tk.Button(dialog, text="↺ Перезавантажити шаблон", command=lambda: [self.reload_source(), dialog.destroy()]).grid(row=8, column=0, sticky="w", padx=16, pady=8)
+        tk.Button(dialog, text="Зберегти новий шаблон", command=lambda: [self.save_source_changes(), dialog.destroy()]).grid(row=8, column=1, sticky="w", pady=8)
         tk.Button(dialog, text="Закрити", command=dialog.destroy).grid(row=8, column=2, sticky="e", padx=12, pady=12)
 
     def _on_state_change(self, *_):
@@ -1222,7 +1508,6 @@ class App:
         self._syncing_form = True
         c15_val = self.state_vars["C15"].get()
         self.state_vars["E15"].set(short_name(c15_val))
-        self.state_vars["D56"].set(c15_val)
         _payload, errors, _warnings = self.refresh_validation(silent=True)
         self._syncing_form = False
         if not errors and not self._generation_suggested:
@@ -1307,7 +1592,7 @@ class App:
     def save_source_changes(self) -> None:
         source = Path(self.source_path.get())
         state = self.collect_state()
-        updates = {cell: state.get(cell, "") for cell in FORM_CELLS if cell != "E15"}
+        updates = {cell: state.get(cell, "") for cell in FORM_CELLS if cell != "E15" and _XLS_CELL_RE.match(cell)}
         updates["E15"] = short_name(state.get("C15", ""))
         updates["C39"] = state.get("C39", "")
         updates["C42"] = state.get("C42", "")
@@ -1355,13 +1640,16 @@ class App:
                     out_path = out_path.with_suffix(".txt")
                     save_text_preview(out_path, "ЧОРНОВИК ДОГОВОРУ", preview_text_for_contract(payload))
         elif kind == "vidatkova":
-            out_path = out_dir / f"видаткова{num_part}{ts}.xls"
+            out_path = out_dir / f"Видаткова{num_part}{ts}.xls"
             generate_vidatkova_xls_from_state(state, Path(self.vidatkova_path.get()), out_path)
         else:
             raise ValueError(f"Невідомий тип чорновика: {kind}")
 
         self.write_log(f"Згенеровано: {out_path}")
         self.status_var.set(f"Створено {out_path.name}")
+        for cell, value in state.items():
+            AutocompleteEntry.record(cell, value)
+        AutocompleteEntry.save_db()
         if open_after and self.open_after_save.get():
             try:
                 open_file_with_preference(out_path, self.editor_path.get().strip())
@@ -1479,7 +1767,7 @@ if tk is not None:
             payload_s = parse_state(state)
             doc_num_s = re.sub(r'[\\/:*?"<>|]', "-", payload_s.get("Number", "")).strip("-")
             num_part_s = f" №{doc_num_s}" if doc_num_s else ""
-            _stem_map = {"act": "Акт", "contract": "Договір", "vidatkova": "видаткова"}
+            _stem_map = {"act": "Акт", "contract": "Договір", "vidatkova": "Видаткова"}
             dest_name = _stem_map.get(self.kind, self._temp_path.stem) + num_part_s + self._temp_path.suffix
             dest = case_dir / dest_name
             if dest.exists():
