@@ -29,7 +29,7 @@ IS_WINDOWS = platform.system().lower().startswith("win")
 
 
 def detect_theme_mode() -> str:
-    """Return 'dark' or 'light' based on OS preference."""
+    """Return 'dark' or 'light' based on Windows registry preference."""
     if IS_WINDOWS:
         try:
             import winreg  # type: ignore
@@ -42,21 +42,6 @@ def detect_theme_mode() -> str:
             return "light" if int(apps_use_light) == 1 else "dark"
         except Exception:
             pass
-    else:
-        # Linux/macOS: try gsettings (GNOME/GTK)
-        for _gsettings_cmd in (
-            ["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"],
-            ["gsettings", "get", "org.gnome.desktop.interface", "gtk-theme"],
-        ):
-            try:
-                _r = subprocess.run(_gsettings_cmd, capture_output=True, text=True, timeout=2)
-                if "dark" in _r.stdout.lower():
-                    return "dark"
-            except Exception:
-                continue
-        # Time-based fallback: dark between 20:00 and 07:00
-        if dt.datetime.now().hour < 7 or dt.datetime.now().hour >= 20:
-            return "dark"
     return "light"
 
 
@@ -219,9 +204,10 @@ def _remove_form_field_shading(doc) -> None:
 
 
 def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out_docx: Path) -> "Path | None":
-    """Copy template byte-for-byte then fill placeholders/bookmarks, preserving original formatting."""
+    """Copy template byte-for-byte then fill ALL placeholders/bookmarks/content-controls."""
     try:
         from docx import Document  # type: ignore
+        from docx.oxml.ns import qn as _qn  # type: ignore
     except Exception:
         return None
 
@@ -249,23 +235,72 @@ def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out
         "sumtext": contract_sumtext_plain(payload.get("sumtext", "")),
         "FIO2": str(payload.get("FIO2", "")),
     }
+    _XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
 
     # Copy template byte-for-byte (preserves all styles, images, layout)
     shutil.copy2(template_docx, out_docx)
     doc = Document(str(out_docx))
 
-    # Fill paragraphs with run-level replacement (preserves formatting)
-    for p in doc.paragraphs:
-        _fill_docx_runs(p, values)
+    # --- Strategy A: fill SDT content controls by tag / alias name ----------
+    # Modern Word templates often use structured document tags (gray form fields).
+    # Match by w:tag or w:alias attribute so the correct field gets its value.
+    for sdt in list(doc.element.body.iter(_qn("w:sdt"))):
+        sdt_pr = sdt.find(_qn("w:sdtPr"))
+        if sdt_pr is None:
+            continue
+        tag_el = sdt_pr.find(_qn("w:tag"))
+        alias_el = sdt_pr.find(_qn("w:alias"))
+        field_name = (
+            (tag_el.get(_qn("w:val")) if tag_el is not None else None)
+            or (alias_el.get(_qn("w:val")) if alias_el is not None else None)
+        )
+        if field_name and field_name in values:
+            sdt_content = sdt.find(_qn("w:sdtContent"))
+            if sdt_content is not None:
+                all_t = list(sdt_content.iter(_qn("w:t")))
+                if all_t:
+                    all_t[0].text = values[field_name]
+                    all_t[0].set(_XML_SPACE, "preserve")
+                    for t in all_t[1:]:
+                        t.text = ""
 
-    # Fill table cells
-    for tbl in doc.tables:
-        for row in tbl.rows:
-            for cell in row.cells:
-                for p in cell.paragraphs:
-                    _fill_docx_runs(p, values)
+    # --- Strategy B: run-level fill on EVERY paragraph in the document -------
+    # Covers both top-level paragraphs AND paragraphs nested inside content
+    # controls (w:sdt) and table cells that doc.paragraphs / doc.tables miss.
+    def _fill_para_elem(para_elem) -> None:
+        runs = list(para_elem.iter(_qn("w:r")))
+        if not runs:
+            return
+        for key, val in values.items():
+            for ph in (f"{{{{{key}}}}}", f"<<{key}>>", f"[{key}]", f"${{{key}}}"):
+                para_text = "".join((r.findtext(_qn("w:t")) or "") for r in runs)
+                if ph not in para_text:
+                    continue
+                # Pass 1: single-run replacement (preserves run formatting)
+                for run in runs:
+                    t = run.find(_qn("w:t"))
+                    if t is not None and t.text and ph in t.text:
+                        t.text = t.text.replace(ph, val)
+                        if t.text and (t.text[0] == " " or t.text[-1] == " "):
+                            t.set(_XML_SPACE, "preserve")
+                # Pass 2: cross-run merge into first run
+                para_text_now = "".join((r.findtext(_qn("w:t")) or "") for r in runs)
+                if ph in para_text_now:
+                    new_text = para_text_now.replace(ph, val)
+                    first_t = runs[0].find(_qn("w:t"))
+                    if first_t is not None:
+                        first_t.text = new_text
+                        if new_text and (new_text[0] == " " or new_text[-1] == " "):
+                            first_t.set(_XML_SPACE, "preserve")
+                    for run in runs[1:]:
+                        t = run.find(_qn("w:t"))
+                        if t is not None:
+                            t.text = ""
 
-    # Fill Word bookmarks (for templates that use bookmark fields)
+    for para_elem in doc.element.body.iter(_qn("w:p")):
+        _fill_para_elem(para_elem)
+
+    # --- Strategy C: fill Word bookmarks ------------------------------------
     for key, val in values.items():
         if not val:
             continue
@@ -678,11 +713,10 @@ FIELD_SECTIONS = [
             ("C36", "Об'єм двигуна", True),
             ("C37", "Потужність кВт", False),
             ("C38", "Потужність к.с.", False),
-            ("C39", "VIN / номер рами", True),
+            ("C39", "VIN (номер рами)", True),
             ("C40", "Номер кузова", False),
             ("C41", "Номер двигуна", True),
             ("C42", "Номер шасі", True),
-            ("C43", "Номер рами", True),
             ("C50", "Номерні знаки", False),
             ("C44", "Ціна без ПДВ", True),
             ("C45", "ПДВ", True),
@@ -977,10 +1011,10 @@ def validate_state(state: Dict[str, str]) -> Tuple[Dict[str, str], list[str], li
         warnings.append("Дата народження — підозрілий формат")
         warning_cells.add("C12")
 
-    frame_values = [str(state.get(c, "")).strip() for c in ("C39", "C42", "C43") if str(state.get(c, "")).strip()]
+    frame_values = [str(state.get(c, "")).strip() for c in ("C39", "C42") if str(state.get(c, "")).strip()]
     if len(set(frame_values)) > 1:
-        warnings.append("VIN / рама / шасі не збігаються")
-        warning_cells.update({"C39", "C42", "C43"})
+        warnings.append("VIN / шасі не збігаються")
+        warning_cells.update({"C39", "C42"})
 
     if payload.get("cuzov"):
         vin_token = normalize_token(payload["cuzov"])
@@ -1117,6 +1151,7 @@ def generate_act_xls_from_state(state: Dict[str, str], source_6055: Path, out_pa
         updates["C15"] = f"{full_fio} / {short_fio}"
     updates["D56"] = short_fio or short_name(full_fio)
     updates.pop("E15", None)  # E15 is app-internal; short name used only in D56
+    updates["C43"] = updates.get("C39", "")  # C43 (Номер рами) деривується з VIN
     write_xls_cells(out_path, "Worksheet", updates, backup=False)
     return out_path
 
@@ -1343,6 +1378,52 @@ def generate_contract_doc_windows_from_state(state: Dict[str, str], dogovir_temp
                 value = contract_sumtext_plain(str(value))
             if doc.Bookmarks.Exists(bookmark_name):
                 doc.Bookmarks(bookmark_name).Range.Text = str(value)
+
+        # Also fill via Content Controls (tag or title match)
+        try:
+            for i in range(1, doc.ContentControls.Count + 1):
+                cc = doc.ContentControls(i)
+                cc_name = str(cc.Tag or cc.Title or "")
+                if cc_name and cc_name in payload:
+                    try:
+                        cc.Range.Text = str(payload[cc_name])
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Also fill legacy FormFields (Name match)
+        try:
+            for i in range(1, doc.FormFields.Count + 1):
+                ff = doc.FormFields(i)
+                ff_name = str(ff.Name or "")
+                if ff_name and ff_name in payload:
+                    try:
+                        ff.Result = str(payload[ff_name])
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Also fill via Find & Replace for {{placeholder}} style text
+        try:
+            find = doc.Content.Find
+            find.ClearFormatting()
+            for key, value in payload.items():
+                val_str = str(value)
+                if key == "sumtext":
+                    val_str = contract_sumtext_plain(val_str)
+                for ph in (f"{{{{{key}}}}}", f"<<{key}>>", f"[{key}]"):
+                    find.Execute(
+                        FindText=ph, MatchCase=False, MatchWholeWord=False,
+                        MatchWildcards=False, MatchSoundsLike=False,
+                        MatchAllWordForms=False, Forward=True,
+                        Wrap=1, Format=False,
+                        ReplaceWith=val_str, Replace=2,
+                    )
+        except Exception:
+            pass
+
         doc.SaveAs(str(out_path.resolve()))
         doc.Close(SaveChanges=False)
         return out_path
@@ -1404,15 +1485,25 @@ def _parse_clipboard_to_fields(text: str) -> Dict[str, str]:
     result: Dict[str, str] = {}
     clean = " ".join(text.split())  # normalise whitespace
 
-    # ПІБ: 2-4 uppercase Ukrainian/Cyrillic words
+    # ПІБ: Ukrainian person name = exactly 3 uppercase Cyrillic words where
+    # the LAST word (patronymic) ends with a known Ukrainian/Russian suffix.
+    # Prevents matching institution names like "ДЕРЖАВНА МИТНА СЛУЖБА".
+    _PATRONYMIC = re.compile(
+        r'(?:ОВИЧ|ЕВИЧ|ЄВИЧ|ОВНА|ЄВНА|ЕВНА|ІВНА|ЇВНА|ІЙНА|ЧЕНКО|НЕНКО|ІЄНКО|ЄНКО)$',
+        re.IGNORECASE,
+    )
     fio_m = re.search(
-        r'\b([\u0400-\u04FF\u02BC\u2019\'\-]{2,}(?:\s+[\u0400-\u04FF\u02BC\u2019\'\-]{2,}){1,3})\b',
+        r'\b([А-ЯІЇЄҐ\u02BC\'-]{2,}(?:\s+[А-ЯІЇЄҐ\u02BC\'-]{2,}){2})\b',
         clean,
     )
     if fio_m:
         candidate = fio_m.group(1).strip()
-        # Must be all-uppercase and at least 2 words
-        if len(candidate.split()) >= 2 and candidate == candidate.upper():
+        words = candidate.split()
+        if (
+            len(words) == 3
+            and all(re.fullmatch(r'[А-ЯІЇЄҐ\u02BC\'-]{2,}', w, re.IGNORECASE) for w in words)
+            and _PATRONYMIC.search(words[-1])
+        ):
             result["C15"] = candidate
 
     # ІПН / реєстраційний номер: exactly 10 digits
@@ -1422,7 +1513,7 @@ def _parse_clipboard_to_fields(text: str) -> Dict[str, str]:
 
     # Паспорт: серія (2 кирилічні літери) + 6 цифр [+ дата + видавник]
     ps_m = re.search(
-        r'(?:паспорт\s*)?([\u0410-\u042F\u0406\u0407\u0404\u0490]{2})\s*(\d{6})'
+        r'(?:паспорт\s*)?([А-ЯІЇЄҐ]{2})\s*(\d{6})'
         r'(?:\s*,?\s*від\s*(\d{1,2}[./]\d{1,2}[./]\d{2,4})\s*(?:р\.?)?)?'
         r'(?:[,;]?\s*вида(?:ний|ним|но)\s+([^,;\n]+))?',
         clean, re.IGNORECASE,
@@ -1458,6 +1549,19 @@ def _parse_clipboard_to_fields(text: str) -> Dict[str, str]:
     )
     if addr_m:
         result["C16"] = addr_m.group(1).strip().rstrip(".,;")
+
+    # VIN: стандартний 17-значний код (без літер I, O, Q)
+    vin_m = re.search(r'\b([A-HJ-NPR-Z0-9]{17})\b', clean)
+    if vin_m:
+        result["C39"] = vin_m.group(1)
+
+    # Номер двигуна: після ключового слова
+    eng_m = re.search(
+        r'(?:двигун[аиу]?|engine)\s*(?:№|#|номер)?\s*:?\s*([A-Za-zА-ЯІЇЄҐа-яіїєґ0-9\-]{4,20})',
+        clean, re.IGNORECASE,
+    )
+    if eng_m:
+        result["C41"] = eng_m.group(1).strip()
 
     return result
 
@@ -2378,13 +2482,13 @@ class App:
 
     def sync_frame_fields(self) -> None:
         state = self.collect_state()
-        frame_value = state.get("C39") or state.get("C42") or state.get("C43")
+        frame_value = state.get("C39") or state.get("C42")
         if frame_value:
             self._syncing_form = True
-            for cell in ("C39", "C42", "C43"):
+            for cell in ("C39", "C42"):
                 self.state_vars[cell].set(frame_value)
             self._syncing_form = False
-            self.write_log(f"Синхронізовано рамні поля: {frame_value}")
+            self.write_log(f"Синхронізовано VIN/шасі: {frame_value}")
             self.refresh_validation(silent=True)
 
     def clear_form(self) -> None:
@@ -2422,7 +2526,7 @@ class App:
         updates["E15"] = short_name(state.get("C15", ""))
         updates["C39"] = state.get("C39", "")
         updates["C42"] = state.get("C42", "")
-        updates["C43"] = state.get("C43", "")
+        updates["C43"] = state.get("C39", "")  # C43 (Номер рами) auto-derived from VIN
         write_xls_cells(source, "Worksheet", updates, backup=True)
         self.write_log(f"Збережено 6055 у {source}")
         self.status_var.set(f"Збережено у {source.name}")
