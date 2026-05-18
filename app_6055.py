@@ -192,12 +192,30 @@ def _fill_docx_runs(para, values: Dict[str, str]) -> None:
 
 
 def _remove_form_field_shading(doc, fill_white: bool = True) -> None:
-    """Remove gray form-field backgrounds from a filled .docx."""
+    """Remove gray form-field backgrounds from a filled .docx.
+
+    Strategy: instead of just deleting w:shd nodes (which lets the parent style
+    re-apply the gray), we *replace* every shading element with an explicit
+    white / clear declaration.  This overrides inherited character/paragraph
+    styles that carry gray form-field backgrounds in templates.
+    """
     try:
         from docx.oxml.ns import qn  # type: ignore
+        from lxml import etree as _et  # type: ignore
     except ImportError:
         return
-    # Unwrap SDT content controls (structured document tags render as gray form boxes)
+
+    _W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+    def _make_white_shd():
+        """Return a w:shd element that explicitly sets fill to white/none."""
+        el = _et.Element(f"{{{_W}}}shd")
+        el.set(f"{{{_W}}}val", "clear")
+        el.set(f"{{{_W}}}color", "auto")
+        el.set(f"{{{_W}}}fill", "FFFFFF")
+        return el
+
+    # ── 1. Unwrap SDT content controls ──────────────────────────────────────
     for sdt in list(doc.element.body.iter(qn("w:sdt"))):
         sdt_content = sdt.find(qn("w:sdtContent"))
         if sdt_content is not None:
@@ -209,31 +227,37 @@ def _remove_form_field_shading(doc, fill_white: bool = True) -> None:
                 parent.insert(idx, child)
                 idx += 1
             parent.remove(sdt)
-    # Remove run-level shading elements (w:shd causes gray highlight)
-    for run_elem in list(doc.element.body.iter(qn("w:r"))):
-        rpr = run_elem.find(qn("w:rPr"))
-        if rpr is not None:
-            for shd in list(rpr.findall(qn("w:shd"))):
+
+    # ── 2. Run-level: replace w:shd with white, strip w:highlight ────────────
+    for rpr in list(doc.element.body.iter(qn("w:rPr"))):
+        for shd in list(rpr.findall(qn("w:shd"))):
+            if fill_white:
+                rpr.replace(shd, _make_white_shd())
+            else:
                 rpr.remove(shd)
-            for hl in list(rpr.findall(qn("w:highlight"))):
-                rpr.remove(hl)
-    # Remove paragraph-level shading (w:p/w:pPr/w:shd) — LibreOffice form fields
-    for para_elem in list(doc.element.body.iter(qn("w:p"))):
-        ppr = para_elem.find(qn("w:pPr"))
-        if ppr is not None:
-            for shd in list(ppr.findall(qn("w:shd"))):
+        for hl in list(rpr.findall(qn("w:highlight"))):
+            rpr.remove(hl)
+        # Also remove character style references that carry gray form-field look
+        for rst in list(rpr.findall(qn("w:rStyle"))):
+            val = rst.get(qn("w:val"), "")
+            if val.lower() in ("placeholdertext", "defaultplaceholdertext"):
+                rpr.remove(rst)
+
+    # ── 3. Paragraph-level: replace w:shd with white ────────────────────────
+    for ppr in list(doc.element.body.iter(qn("w:pPr"))):
+        for shd in list(ppr.findall(qn("w:shd"))):
+            if fill_white:
+                ppr.replace(shd, _make_white_shd())
+            else:
                 ppr.remove(shd)
-    # Remove table-cell shading (w:tc/w:tcPr/w:shd)
-    for tc_elem in list(doc.element.body.iter(qn("w:tc"))):
-        tcpr = tc_elem.find(qn("w:tcPr"))
-        if tcpr is not None:
-            for shd in list(tcpr.findall(qn("w:shd"))):
+
+    # ── 4. Table-cell level: replace w:shd with white ───────────────────────
+    for tcpr in list(doc.element.body.iter(qn("w:tcPr"))):
+        for shd in list(tcpr.findall(qn("w:shd"))):
+            if fill_white:
+                tcpr.replace(shd, _make_white_shd())
+            else:
                 tcpr.remove(shd)
-    if fill_white:
-        # Ensure no inherited background remains on text runs/cells in editors like LibreOffice.
-        for target in list(doc.element.body.iter(qn("w:rPr"))) + list(doc.element.body.iter(qn("w:tcPr"))) + list(doc.element.body.iter(qn("w:pPr"))):
-            for shd in list(target.findall(qn("w:shd"))):
-                target.remove(shd)
 
 
 def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out_docx: Path, log_fn=None, white_fill: bool = True) -> "Path | None":
@@ -2423,8 +2447,7 @@ class App:
         self._make_toolbar_button(toolbar, "📋 Всі данні", self.open_all_data_dialog, 4)
         self._make_toolbar_button(toolbar, "✖ Очистити", self.clear_form, 5)
         self._make_toolbar_button(toolbar, "⟲ Генерувати", self.generate_all, 6)
-        self._make_toolbar_button(toolbar, "⚠ Генерувати як є", self.generate_all_relaxed, 7)
-        self._make_toolbar_button(toolbar, "↓ Вставити", self.paste_from_clipboard, 8)
+        self._make_toolbar_button(toolbar, "↓ Вставити", self.paste_from_clipboard, 7)
 
         gear_btn = tk.Button(
             header, text="⚙", command=self.open_settings_dialog,
@@ -3289,13 +3312,107 @@ class App:
                 self.write_log(f"Не вдалося відкрити файл: {exc}")
         return out_path
 
+    def _ask_generate_with_errors(self, errors: list) -> bool:
+        """Show a custom dialog listing missing fields with 'Генерувати як є' option.
+        Returns True if the user chose to proceed despite errors."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Незаповнені поля")
+        dlg.configure(bg=self.theme["card_bg"])
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        tk.Label(
+            dlg,
+            text="⚠  Документ містить незаповнені або помилкові поля:",
+            bg=self.theme["card_bg"],
+            fg=self.theme["warn_fg"],
+            font=("Segoe UI", 10, "bold"),
+            anchor="w",
+        ).pack(fill="x", padx=16, pady=(14, 4))
+
+        txt = tk.Text(
+            dlg,
+            height=min(len(errors), 8),
+            wrap="word",
+            bg=self.theme["entry_bg"],
+            fg=self.theme["entry_fg"],
+            relief="flat",
+            font=("Segoe UI", 9),
+            padx=8,
+            pady=6,
+        )
+        txt.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+        for e in errors:
+            txt.insert("end", f"• {e}\n")
+        txt.configure(state="disabled")
+
+        tk.Label(
+            dlg,
+            text="Можна згенерувати документи зараз і заповнити поля вручну пізніше.",
+            bg=self.theme["card_bg"],
+            fg=self.theme["label_fg"],
+            font=("Segoe UI", 9),
+            anchor="w",
+            wraplength=460,
+        ).pack(fill="x", padx=16, pady=(0, 10))
+
+        result = [False]
+
+        btn_row = tk.Frame(dlg, bg=self.theme["card_bg"])
+        btn_row.pack(fill="x", padx=16, pady=(0, 14))
+
+        def _proceed():
+            result[0] = True
+            dlg.destroy()
+
+        def _cancel():
+            dlg.destroy()
+
+        tk.Button(
+            btn_row,
+            text="Генерувати як є",
+            command=_proceed,
+            bg="#b45309",
+            fg="#ffffff",
+            activebackground="#92400e",
+            activeforeground="#ffffff",
+            font=("Segoe UI", 9, "bold"),
+            padx=12,
+            pady=4,
+            relief="flat",
+            cursor="hand2",
+        ).pack(side="left")
+        tk.Button(
+            btn_row,
+            text="Скасувати",
+            command=_cancel,
+            bg=self.theme["btn_bg"],
+            fg=self.theme["btn_fg"],
+            padx=12,
+            pady=4,
+            relief="flat",
+            cursor="hand2",
+        ).pack(side="right")
+
+        dlg.update_idletasks()
+        _w = 500
+        _h = dlg.winfo_reqheight()
+        _px = max(0, self.root.winfo_rootx() + (self.root.winfo_width() - _w) // 2)
+        _py = max(0, self.root.winfo_rooty() + (self.root.winfo_height() - _h) // 2)
+        dlg.geometry(f"{_w}x{_h}+{_px}+{_py}")
+        dlg.wait_window()
+        return result[0]
+
     def generate_all(self, allow_incomplete: bool = False) -> None:
         try:
             state = self.collect_state()
             payload, errors, _ = validate_state(state)
             if errors and not allow_incomplete:
-                messagebox.showerror("Помилки валідації", "\n".join(errors))
-                return
+                proceed = self._ask_generate_with_errors(errors)
+                if not proceed:
+                    return
+                allow_incomplete = True
             if errors and allow_incomplete:
                 self.write_log("Увага: пакетна генерація з незаповненими/помилковими полями")
                 self.write_log("; ".join(errors))
@@ -3325,7 +3442,7 @@ class App:
                 messagebox.showerror("Помилка", str(exc))
 
     def generate_all_relaxed(self) -> None:
-        """Generate documents even when required fields are missing."""
+        """Generate documents skipping the confirmation dialog."""
         self.generate_all(allow_incomplete=True)
 
 
