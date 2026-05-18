@@ -201,9 +201,21 @@ def _remove_form_field_shading(doc) -> None:
         if rpr is not None:
             for shd in list(rpr.findall(qn("w:shd"))):
                 rpr.remove(shd)
+    # Remove paragraph-level shading (w:p/w:pPr/w:shd) — LibreOffice form fields
+    for para_elem in list(doc.element.body.iter(qn("w:p"))):
+        ppr = para_elem.find(qn("w:pPr"))
+        if ppr is not None:
+            for shd in list(ppr.findall(qn("w:shd"))):
+                ppr.remove(shd)
+    # Remove table-cell shading (w:tc/w:tcPr/w:shd)
+    for tc_elem in list(doc.element.body.iter(qn("w:tc"))):
+        tcpr = tc_elem.find(qn("w:tcPr"))
+        if tcpr is not None:
+            for shd in list(tcpr.findall(qn("w:shd"))):
+                tcpr.remove(shd)
 
 
-def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out_docx: Path) -> "Path | None":
+def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out_docx: Path, log_fn=None) -> "Path | None":
     """Copy template byte-for-byte then fill ALL placeholders/bookmarks/content-controls."""
     try:
         from docx import Document  # type: ignore
@@ -311,6 +323,7 @@ def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out
         _fill_para_elem(para_elem)
 
     # --- Strategy C: fill Word bookmarks ------------------------------------
+    _strat_c_filled = 0
     for key, val in values.items():
         if not val:
             continue
@@ -323,33 +336,111 @@ def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out
                     text_nodes[0].text = val
                     for extra in text_nodes[1:]:
                         extra.text = ""
+                    _strat_c_filled += 1
                     break
                 node = node.getnext()
+
+    # --- Strategy D: fill legacy FORMTEXT fields (w:fldChar-based) ----------
+    # LibreOffice converts .doc FORMTEXT controls to fldChar sequences.
+    # The field name is stored in w:ffData/w:name inside the begin fldChar.
+    _fld_names_found: list = []
+    _fld_names_unfilled: list = []
+    _strat_d_filled = 0
+    for para in list(doc.element.body.iter(_qn("w:p"))):
+        all_runs = [child for child in para if child.tag == _qn("w:r")]
+        i = 0
+        while i < len(all_runs):
+            r = all_runs[i]
+            fld_begin = r.find(_qn("w:fldChar"))
+            if fld_begin is not None and fld_begin.get(_qn("w:fldCharType")) == "begin":
+                field_name = None
+                ffd = fld_begin.find(_qn("w:ffData"))
+                if ffd is not None:
+                    name_el = ffd.find(_qn("w:name"))
+                    if name_el is not None:
+                        field_name = name_el.get(_qn("w:val"))
+                separate_idx: "int | None" = None
+                end_idx: "int | None" = None
+                for j in range(i + 1, len(all_runs)):
+                    fc = all_runs[j].find(_qn("w:fldChar"))
+                    if fc is not None:
+                        fct = fc.get(_qn("w:fldCharType"))
+                        if fct == "separate" and separate_idx is None:
+                            separate_idx = j
+                        elif fct == "end":
+                            end_idx = j
+                            break
+                if field_name is not None:
+                    _fld_names_found.append(field_name)
+                    if separate_idx is not None and end_idx is not None:
+                        match_key = next((k for k in values if k.lower() == field_name.lower()), None)
+                        if match_key and values[match_key]:
+                            fill_val = values[match_key]
+                            first_content = True
+                            for j in range(separate_idx + 1, end_idx):
+                                t = all_runs[j].find(_qn("w:t"))
+                                if t is not None:
+                                    if first_content:
+                                        t.text = fill_val
+                                        if fill_val and (fill_val[0] == " " or fill_val[-1] == " "):
+                                            t.set(_XML_SPACE, "preserve")
+                                        first_content = False
+                                    else:
+                                        t.text = ""
+                            if not first_content:
+                                _strat_d_filled += 1
+                        else:
+                            _fld_names_unfilled.append(field_name)
+                i = (end_idx + 1) if end_idx is not None else i + 1
+            else:
+                i += 1
+
+    if log_fn:
+        log_fn(f"Заповнення договору: Стратегія D (FORMTEXT поля) знайдено: {_fld_names_found or '(не знайдено)'}, заповнено: {_strat_d_filled}")
+        if _fld_names_unfilled:
+            log_fn(f"  Незаповнені FORMTEXT поля (немає відповідності): {_fld_names_unfilled}")
+            log_fn(f"  Очікувані ключі: {list(values.keys())}")
+        if not _fld_names_found:
+            log_fn("  Підказка: шаблон не містить FORMTEXT полів (fldChar). Перевірте SDT/закладки або використайте {{ключ}} у тексті.")
 
     _remove_form_field_shading(doc)
     doc.save(str(out_docx))
     return out_docx if out_docx.exists() else None
 
 
-def generate_contract_via_office_fallback(state: Dict[str, str], template_doc: Path, out_path: Path) -> "Path | None":
+def generate_contract_via_office_fallback(state: Dict[str, str], template_doc: Path, out_path: Path, log_fn=None) -> "Path | None":
     """Fallback without Word COM: try LibreOffice conversions while preserving template layout."""
+    def _log(msg: str) -> None:
+        if log_fn:
+            try:
+                log_fn(msg)
+            except Exception:
+                pass
+
     if not template_doc.exists():
+        _log(f"Шаблон не знайдено: {template_doc}")
         return None
 
     with tempfile.TemporaryDirectory(prefix="jm_contract_") as td:
         tmp_dir = Path(td)
         tmp_doc = tmp_dir / "template.doc"
         shutil.copy2(template_doc, tmp_doc)
+        _log(f"Конвертую .doc → .docx через LibreOffice: {template_doc.name}")
         tpl_docx = _office_convert(tmp_doc, tmp_dir, "docx")
         if not tpl_docx:
+            _log("Конвертація LibreOffice не вдалась (встановлений LibreOffice/soffice?)")
             return None
+        _log(f"Конверсію виконано: {tpl_docx.name}, заповнюю...")
 
         filled_docx = tmp_dir / "filled.docx"
-        filled = _fill_docx_contract_template(state, tpl_docx, filled_docx)
+        filled = _fill_docx_contract_template(state, tpl_docx, filled_docx, log_fn=log_fn)
         if not filled:
+            _log("Заповнення шаблону не вдалось")
             return None
+        _log("Шаблон заповнено")
 
         if out_path.suffix.lower() == ".doc":
+            _log("Конвертую .docx → .doc через LibreOffice")
             converted_doc = _office_convert(filled, out_path.parent, "doc")
             if not converted_doc:
                 return None
@@ -368,7 +459,7 @@ def generate_contract_via_office_fallback(state: Dict[str, str], template_doc: P
         return final_docx
 
 
-def generate_contract_non_com(state: Dict[str, str], template_path: Path, out_path: Path) -> "Path | None":
+def generate_contract_non_com(state: Dict[str, str], template_path: Path, out_path: Path, log_fn=None) -> "Path | None":
     """Generate contract without Word COM.
     .docx template — fills directly (run-level, preserves formatting 1:1).
     .doc  template — converts via LibreOffice first.
@@ -376,7 +467,7 @@ def generate_contract_non_com(state: Dict[str, str], template_path: Path, out_pa
     suffix = template_path.suffix.lower()
     if suffix == ".docx":
         out_docx = out_path.with_suffix(".docx")
-        filled = _fill_docx_contract_template(state, template_path, out_docx)
+        filled = _fill_docx_contract_template(state, template_path, out_docx, log_fn=log_fn)
         if not filled:
             return None
         # Optionally convert to .doc if output extension requested
@@ -390,7 +481,7 @@ def generate_contract_non_com(state: Dict[str, str], template_path: Path, out_pa
                 return doc_result
         return filled  # keep .docx — looks identical to original template
     # .doc template — use LibreOffice conversion workflow
-    return generate_contract_via_office_fallback(state, template_path, out_path)
+    return generate_contract_via_office_fallback(state, template_path, out_path, log_fn=log_fn)
 
 
 def runtime_app_dir() -> Path:
@@ -1360,20 +1451,36 @@ def diagnose_word_template(template_path: Path) -> str:
 
     suffix = template_path.suffix.lower()
 
-    # ── python-docx path (works for .docx) ──────────────────────────────────
-    if suffix == ".docx":
+    # ── python-docx path ─────────────────────────────────────────────────────
+    # For .doc files on non-Windows: try converting via LibreOffice first,
+    # then analyse the *converted* .docx — this shows exactly what the fill
+    # function will see.
+    _analyse_path = template_path
+    _converted_tmp = None
+    if suffix == ".doc":
+        import tempfile as _tf
+        _td = _tf.mkdtemp(prefix="jm_diag_")
+        _conv = _office_convert(template_path, Path(_td), "docx")
+        if _conv:
+            _analyse_path = _conv
+            _converted_tmp = _td
+            lines.append(f"(конвертовано .doc → .docx для аналізу python-docx: {_conv.name})")
+        else:
+            lines.append("(конвертація .doc → .docx не вдалась — аналіз python-docx пропущено)")
+
+    if _analyse_path.suffix.lower() == ".docx":
         try:
             from docx import Document as _DDoc  # type: ignore
             from docx.oxml.ns import qn as _dqn  # type: ignore
             _ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
             _W = "{" + _ns + "}"
-            _d = _DDoc(str(template_path))
+            _d = _DDoc(str(_analyse_path))
             # protection
             prot_el = _d.settings.element.find(_dqn("w:documentProtection"))
             if prot_el is not None:
-                lines.append(f"\u26a0 ЗАХИСТ (XML): {dict(prot_el.attrib)}")
+                lines.append(f"⚠ ЗАХИСТ (XML): {dict(prot_el.attrib)}")
             else:
-                lines.append("\u2713 Захисту в XML немає")
+                lines.append("✓ Захисту в XML немає")
             # SDT content controls
             sdts = list(_d.element.body.iter(_dqn("w:sdt")))
             lines.append(f"SDT content controls: {len(sdts)}")
@@ -1389,7 +1496,20 @@ def diagnose_word_template(template_path: Path) -> str:
             # bookmarks
             bms = _d.element.xpath(".//w:bookmarkStart", namespaces={"w": _ns})
             bm_names = [b.get(_W + "name", "?") for b in bms if not (b.get(_W + "name", "") or "").startswith("_")]
-            lines.append(f"Закладки (XML): {len(bm_names)} → {bm_names[:15]}")
+            lines.append(f"Закладки (XML): {len(bm_names)} → {bm_names[:20]}")
+            # FORMTEXT legacy fields (w:fldChar / w:ffData)
+            _fld_names = []
+            for _fld_begin in _d.element.body.iter(_dqn("w:fldChar")):
+                if _fld_begin.get(_W + "fldCharType") == "begin":
+                    _ffd = _fld_begin.find(_dqn("w:ffData"))
+                    if _ffd is not None:
+                        _fn_el = _ffd.find(_dqn("w:name"))
+                        if _fn_el is not None:
+                            _fld_names.append(_fn_el.get(_W + "val", "?"))
+            if _fld_names:
+                lines.append(f"FORMTEXT поля (fldChar): {len(_fld_names)} → {_fld_names[:20]}")
+            else:
+                lines.append("FORMTEXT поля (fldChar): не знайдено")
             # text preview + placeholders
             body_txt = " ".join(p.text for p in _d.paragraphs if p.text)
             phs = _re.findall(r"\{\{[^}]+\}\}|<<[^>]+>>|\[[^\]]+\]", body_txt)
@@ -1398,8 +1518,19 @@ def diagnose_word_template(template_path: Path) -> str:
             else:
                 lines.append("Плейсхолдери {{..}}/<<..>>/[..] не знайдено в тексті")
             lines.append(f"Перші 300 символів тексту: {body_txt[:300]!r}")
+            # show expected keys
+            _expected_keys = ["Number", "Data", "FIO", "pasport", "TaxNumber", "BirthDay",
+                              "adres", "decl", "model", "year", "color", "numberdv",
+                              "cuzov", "cub", "znak", "price", "sumtext", "FIO2"]
+            lines.append(f"Очікувані ключі програми: {_expected_keys}")
         except Exception as _e:
             lines.append(f"python-docx помилка: {_e}")
+    if _converted_tmp:
+        import shutil as _sh
+        try:
+            _sh.rmtree(_converted_tmp, ignore_errors=True)
+        except Exception:
+            pass
 
     # ── COM path (Windows only, works for .doc and .docx) ───────────────────
     if IS_WINDOWS:
@@ -2552,7 +2683,16 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 3, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 8))
+        ).grid(row=theme_row + 3, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 8))
+        tk.Button(
+            dialog,
+            text="📋 Журнал генерації",
+            command=lambda: self._show_generation_log(dialog),
+            bg=self.theme["btn_bg"],
+            fg=self.theme["btn_fg"],
+            activebackground=self.theme["header_active_bg"],
+            activeforeground=self.theme["header_fg"],
+        ).grid(row=theme_row + 3, column=2, sticky="e", padx=16, pady=(0, 8))
         tk.Button(
             dialog,
             text="↺ Перезавантажити шаблон",
@@ -2619,6 +2759,32 @@ class App:
         txt.configure(state="disabled")
         tk.Button(win, text="Закрити", command=win.destroy,
                   bg=self.theme["btn_bg"], fg=self.theme["btn_fg"]).pack(pady=8)
+
+    def _show_generation_log(self, parent_dialog=None) -> None:
+        """Show a scrollable window with the full generation log."""
+        win = tk.Toplevel(parent_dialog or self.root)
+        win.title("Журнал генерації")
+        win.configure(bg=self.theme["card_bg"])
+        win.geometry("820x560")
+        win.transient(parent_dialog or self.root)
+        txt = tk.Text(win, wrap="word", bg=self.theme["entry_bg"], fg=self.theme["entry_fg"],
+                      font=("Consolas", 10), relief="flat", padx=8, pady=8)
+        sb = tk.Scrollbar(win, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        txt.pack(fill="both", expand=True, padx=8, pady=(8, 0))
+        log_content = "\n".join(self.log_lines[-500:]) if self.log_lines else "(журнал порожній)"
+        txt.insert("1.0", log_content)
+        txt.see("end")
+        txt.configure(state="disabled")
+        btn_frame = tk.Frame(win, bg=self.theme["card_bg"])
+        btn_frame.pack(fill="x", pady=6)
+        tk.Button(btn_frame, text="Очистити журнал", command=lambda: [self.log_lines.clear(),
+                  txt.configure(state="normal"), txt.delete("1.0", "end"),
+                  txt.configure(state="disabled")],
+                  bg=self.theme["btn_bg"], fg=self.theme["btn_fg"]).pack(side="left", padx=12)
+        tk.Button(btn_frame, text="Закрити", command=win.destroy,
+                  bg=self.theme["btn_bg"], fg=self.theme["btn_fg"]).pack(side="right", padx=12)
 
     def _on_state_change(self, *_):
         if self._syncing_form:
@@ -2803,19 +2969,23 @@ class App:
             template_doc = Path(self.dogovir_path.get())
             out_doc = out_dir / f"Договір{num_part}{ts}.doc"
             out_path = out_doc
-            try:
-                if not IS_WINDOWS or not self.use_word_com.get():
-                    raise RuntimeError("Word COM disabled or not available")
-                out_path = generate_contract_doc_windows_from_state(state, template_doc, out_doc, log_fn=self.write_log)
-            except Exception as exc:
-                self.write_log(f"Word COM недоступний: {exc}")
-
-                # Copy template + run-level fill (preserves original formatting)
-                non_com = generate_contract_non_com(state, template_doc, out_doc)
+            _com_enabled = IS_WINDOWS and self.use_word_com.get()
+            if _com_enabled:
+                try:
+                    self.write_log("Генерація договору через Word COM...")
+                    out_path = generate_contract_doc_windows_from_state(state, template_doc, out_doc, log_fn=self.write_log)
+                except Exception as exc:
+                    self.write_log(f"Word COM помилка: {exc} → перемикаюсь на режим без COM")
+                    _com_enabled = False
+            if not _com_enabled:
+                reason = "вимкнено в налаштуваннях" if not self.use_word_com.get() else "не Windows"
+                self.write_log(f"Режим без Word COM ({reason}): {template_doc.name}")
+                non_com = generate_contract_non_com(state, template_doc, out_doc, log_fn=self.write_log)
                 if non_com:
                     out_path = non_com
                 else:
                     # Last resort: full text docx generator (different appearance)
+                    self.write_log("Шаблонне заповнення не вдалось → генерую резервний текстовий договір")
                     out_docx = out_doc.with_suffix(".docx")
                     result = generate_contract_docx_fallback(state, out_docx)
                     if result:
