@@ -241,6 +241,16 @@ def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out
     shutil.copy2(template_docx, out_docx)
     doc = Document(str(out_docx))
 
+    # Remove document protection so all fill strategies can write freely.
+    # Templates protected for form-filling (AllowOnlyFormFields) block text
+    # replacements via python-docx — unprotecting here fixes that.
+    try:
+        doc_prot = doc.settings.element.find(_qn("w:documentProtection"))
+        if doc_prot is not None:
+            doc.settings.element.remove(doc_prot)
+    except Exception:
+        pass
+
     # --- Strategy A: fill SDT content controls by tag / alias name ----------
     # Modern Word templates often use structured document tags (gray form fields).
     # Match by w:tag or w:alias attribute so the correct field gets its value.
@@ -1340,7 +1350,127 @@ def generate_contract_docx_fallback(state: Dict[str, str], out_path: Path) -> "P
     return out_docx
 
 
-def generate_contract_doc_windows_from_state(state: Dict[str, str], dogovir_template: Path, out_path: Path) -> Path:
+def diagnose_word_template(template_path: Path) -> str:
+    """Inspect a Word template and return a diagnostic report (bookmarks, CCs, form fields, protection, macros)."""
+    import re as _re
+    lines: list = [f"Шаблон: {template_path.name}  ({template_path.suffix})"]
+
+    if not template_path.exists():
+        return f"Файл не знайдено: {template_path}"
+
+    suffix = template_path.suffix.lower()
+
+    # ── python-docx path (works for .docx) ──────────────────────────────────
+    if suffix == ".docx":
+        try:
+            from docx import Document as _DDoc  # type: ignore
+            from docx.oxml.ns import qn as _dqn  # type: ignore
+            _ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            _W = "{" + _ns + "}"
+            _d = _DDoc(str(template_path))
+            # protection
+            prot_el = _d.settings.element.find(_dqn("w:documentProtection"))
+            if prot_el is not None:
+                lines.append(f"\u26a0 ЗАХИСТ (XML): {dict(prot_el.attrib)}")
+            else:
+                lines.append("\u2713 Захисту в XML немає")
+            # SDT content controls
+            sdts = list(_d.element.body.iter(_dqn("w:sdt")))
+            lines.append(f"SDT content controls: {len(sdts)}")
+            for s in sdts[:15]:
+                pr = s.find(_dqn("w:sdtPr"))
+                if pr is None:
+                    continue
+                tg = pr.find(_dqn("w:tag"))
+                al = pr.find(_dqn("w:alias"))
+                tv = tg.get(_W + "val", "") if tg is not None else ""
+                av = al.get(_W + "val", "") if al is not None else ""
+                lines.append(f"  SDT tag={tv!r} alias={av!r}")
+            # bookmarks
+            bms = _d.element.xpath(".//w:bookmarkStart", namespaces={"w": _ns})
+            bm_names = [b.get(_W + "name", "?") for b in bms if not (b.get(_W + "name", "") or "").startswith("_")]
+            lines.append(f"Закладки (XML): {len(bm_names)} → {bm_names[:15]}")
+            # text preview + placeholders
+            body_txt = " ".join(p.text for p in _d.paragraphs if p.text)
+            phs = _re.findall(r"\{\{[^}]+\}\}|<<[^>]+>>|\[[^\]]+\]", body_txt)
+            if phs:
+                lines.append(f"Плейсхолдери в тексті: {phs[:10]}")
+            else:
+                lines.append("Плейсхолдери {{..}}/<<..>>/[..] не знайдено в тексті")
+            lines.append(f"Перші 300 символів тексту: {body_txt[:300]!r}")
+        except Exception as _e:
+            lines.append(f"python-docx помилка: {_e}")
+
+    # ── COM path (Windows only, works for .doc and .docx) ───────────────────
+    if IS_WINDOWS:
+        _com_word = None
+        try:
+            import win32com.client as _win32  # type: ignore
+            _com_word = _win32.Dispatch("Word.Application")
+            _com_word.Visible = False
+            _com_word.Application.AutomationSecurity = 3  # ForceDisable macros
+            _cdoc = _com_word.Documents.Open(str(template_path.resolve()))
+
+            _prot_map = {-1: "Без захисту", 0: "Форми (тільки поля)", 1: "Версії", 2: "Коментарі", 3: "Тільки читання"}
+            _pt = _cdoc.ProtectionType
+            lines.append(f"Захист (COM ProtectionType={_pt}): {_prot_map.get(_pt, str(_pt))}")
+
+            _bmc = _cdoc.Bookmarks.Count
+            lines.append(f"Закладки (COM): {_bmc}")
+            if _bmc:
+                lines.append("  " + ", ".join(_cdoc.Bookmarks(i + 1).Name for i in range(min(_bmc, 20))))
+
+            try:
+                _ccc = _cdoc.ContentControls.Count
+                lines.append(f"Content Controls (COM): {_ccc}")
+                if _ccc:
+                    lines.append("  " + "; ".join(
+                        f"tag={_cdoc.ContentControls(i+1).Tag!r} title={_cdoc.ContentControls(i+1).Title!r}"
+                        for i in range(min(_ccc, 15))))
+            except Exception as _e:
+                lines.append(f"ContentControls COM: {_e}")
+
+            try:
+                _ffc = _cdoc.FormFields.Count
+                lines.append(f"FormFields (COM): {_ffc}")
+                if _ffc:
+                    lines.append("  " + ", ".join(_cdoc.FormFields(i + 1).Name for i in range(min(_ffc, 20))))
+            except Exception as _e:
+                lines.append(f"FormFields COM: {_e}")
+
+            try:
+                _vbc = _cdoc.VBProject.VBComponents.Count
+                if _vbc:
+                    _vbn = [_cdoc.VBProject.VBComponents(i + 1).Name for i in range(min(_vbc, 10))]
+                    lines.append(f"\u26a0 VBA макроси ({_vbc}): {_vbn}")
+                else:
+                    lines.append("\u2713 VBA макроси відсутні")
+            except Exception as _e:
+                lines.append(f"VBA: {_e}")
+
+            _cdoc.Close(SaveChanges=False)
+            _com_word.Application.AutomationSecurity = 1
+            _com_word.Quit()
+        except Exception as _e:
+            lines.append(f"COM помилка: {_e}")
+        finally:
+            if _com_word is not None:
+                try:
+                    _com_word.Quit()
+                except Exception:
+                    pass
+
+    return "\n".join(lines)
+
+
+def generate_contract_doc_windows_from_state(state: Dict[str, str], dogovir_template: Path, out_path: Path, log_fn=None) -> Path:
+    def _log(msg: str) -> None:
+        if log_fn:
+            try:
+                log_fn(msg)
+            except Exception:
+                pass
+
     payload = parse_state(state)
     if not dogovir_template.exists():
         raise FileNotFoundError(f"Шаблон договору не знайдено: {dogovir_template}")
@@ -1351,7 +1481,26 @@ def generate_contract_doc_windows_from_state(state: Dict[str, str], dogovir_temp
 
         word = win32.Dispatch("Word.Application")
         word.Visible = False
+        # Disable macros BEFORE opening: prevents AutoOpen/AutoNew from running
+        # and potentially overriding our fill or hanging on UI prompts.
+        word.Application.AutomationSecurity = 3  # msoAutomationSecurityForceDisable
         doc = word.Documents.Open(str(dogovir_template.resolve()))
+
+        # Remove document protection (protected-for-forms blocks text replacements).
+        try:
+            prot_type = doc.ProtectionType
+            if prot_type != -1:  # -1 = wdNoProtection
+                _log(f"Документ захищено (ProtectionType={prot_type}), знімаю захист...")
+                try:
+                    doc.Unprotect()
+                    _log("Захист знято успішно")
+                except Exception as _pe:
+                    _log(f"Не вдалося зняти захист: {_pe}")
+            else:
+                _log("Документ не захищений")
+        except Exception:
+            pass
+
         bookmark_map = {
             "Number": "Number",
             "Data": "Data",
@@ -1372,40 +1521,52 @@ def generate_contract_doc_windows_from_state(state: Dict[str, str], dogovir_temp
             "sumtext": "sumtext",
             "FIO2": "FIO2",
         }
+        bm_filled = 0
         for key, bookmark_name in bookmark_map.items():
             value = payload.get(key, "")
             if key == "sumtext":
                 value = contract_sumtext_plain(str(value))
             if doc.Bookmarks.Exists(bookmark_name):
                 doc.Bookmarks(bookmark_name).Range.Text = str(value)
+                bm_filled += 1
+        _log(f"Закладки: знайдено {doc.Bookmarks.Count}, заповнено за картою {bm_filled}/{len(bookmark_map)}")
 
         # Also fill via Content Controls (tag or title match)
+        cc_filled = 0
         try:
-            for i in range(1, doc.ContentControls.Count + 1):
+            _ccc = doc.ContentControls.Count
+            for i in range(1, _ccc + 1):
                 cc = doc.ContentControls(i)
                 cc_name = str(cc.Tag or cc.Title or "")
                 if cc_name and cc_name in payload:
                     try:
                         cc.Range.Text = str(payload[cc_name])
+                        cc_filled += 1
                     except Exception:
                         pass
-        except Exception:
-            pass
+            _log(f"Content Controls: {_ccc} знайдено, {cc_filled} заповнено")
+        except Exception as _e:
+            _log(f"Content Controls: помилка — {_e}")
 
         # Also fill legacy FormFields (Name match)
+        ff_filled = 0
         try:
-            for i in range(1, doc.FormFields.Count + 1):
+            _ffc = doc.FormFields.Count
+            for i in range(1, _ffc + 1):
                 ff = doc.FormFields(i)
                 ff_name = str(ff.Name or "")
                 if ff_name and ff_name in payload:
                     try:
                         ff.Result = str(payload[ff_name])
+                        ff_filled += 1
                     except Exception:
                         pass
-        except Exception:
-            pass
+            _log(f"FormFields: {_ffc} знайдено, {ff_filled} заповнено")
+        except Exception as _e:
+            _log(f"FormFields: помилка — {_e}")
 
-        # Also fill via Find & Replace for {{placeholder}} style text
+        # Also fill via Find & Replace for {{placeholder}} / <<placeholder>> / [placeholder]
+        fr_filled = 0
         try:
             find = doc.Content.Find
             find.ClearFormatting()
@@ -1414,18 +1575,23 @@ def generate_contract_doc_windows_from_state(state: Dict[str, str], dogovir_temp
                 if key == "sumtext":
                     val_str = contract_sumtext_plain(val_str)
                 for ph in (f"{{{{{key}}}}}", f"<<{key}>>", f"[{key}]"):
-                    find.Execute(
+                    ok = find.Execute(
                         FindText=ph, MatchCase=False, MatchWholeWord=False,
                         MatchWildcards=False, MatchSoundsLike=False,
                         MatchAllWordForms=False, Forward=True,
                         Wrap=1, Format=False,
                         ReplaceWith=val_str, Replace=2,
                     )
-        except Exception:
-            pass
+                    if ok:
+                        fr_filled += 1
+            _log(f"Find & Replace: {fr_filled} замін")
+        except Exception as _e:
+            _log(f"Find & Replace: помилка — {_e}")
 
+        _log(f"Всього заповнено: закладки={bm_filled}, CC={cc_filled}, FormFields={ff_filled}, F&R={fr_filled}")
         doc.SaveAs(str(out_path.resolve()))
         doc.Close(SaveChanges=False)
+        word.Application.AutomationSecurity = 1  # restore
         return out_path
     except Exception as exc:
         raise RuntimeError(
@@ -2380,13 +2546,22 @@ class App:
         ).grid(row=theme_row + 2, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 6))
         tk.Button(
             dialog,
+            text="🔍 Аналізувати шаблон договору",
+            command=lambda: self._run_template_diagnosis(dialog),
+            bg=self.theme["btn_bg"],
+            fg=self.theme["btn_fg"],
+            activebackground=self.theme["header_active_bg"],
+            activeforeground=self.theme["header_fg"],
+        ).grid(row=theme_row + 3, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 8))
+        tk.Button(
+            dialog,
             text="↺ Перезавантажити шаблон",
             command=lambda: [self.reload_source(), dialog.destroy()],
             bg=self.theme["btn_bg"],
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 3, column=0, sticky="w", padx=16, pady=8)
+        ).grid(row=theme_row + 4, column=0, sticky="w", padx=16, pady=8)
         tk.Button(
             dialog,
             text="Зберегти налаштування",
@@ -2395,7 +2570,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 3, column=1, sticky="w", pady=8)
+        ).grid(row=theme_row + 4, column=1, sticky="w", pady=8)
         tk.Button(
             dialog,
             text="Закрити",
@@ -2404,7 +2579,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 3, column=2, sticky="e", padx=12, pady=12)
+        ).grid(row=theme_row + 4, column=2, sticky="e", padx=12, pady=12)
         dialog.protocol("WM_DELETE_WINDOW", lambda: [self._save_settings(), dialog.destroy()])
 
         # Auto-fit height after all widgets are created
@@ -2416,6 +2591,34 @@ class App:
         _px = max(0, (_sx - _dw) // 2)
         _py = max(0, (_sy - _dh) // 2)
         dialog.geometry(f"{_dw}x{_dh}+{_px}+{_py}")
+
+    def _run_template_diagnosis(self, parent_dialog=None) -> None:
+        """Open the contract template, inspect its structure and show a report."""
+        tpl = Path(self.dogovir_path.get())
+        self.write_log("Аналізую шаблон договору...")
+        try:
+            report = diagnose_word_template(tpl)
+        except Exception as exc:
+            report = f"Помилка аналізу: {exc}"
+        self.write_log("=== ДІАГНОСТИКА ШАБЛОНУ ===")
+        for line in report.splitlines():
+            self.write_log(line)
+        self.write_log("=== КІНЕЦЬ ДІАГНОСТИКИ ===")
+        # Also show in a scrollable popup
+        win = tk.Toplevel(parent_dialog or self.root)
+        win.title("Аналіз шаблону договору")
+        win.configure(bg=self.theme["card_bg"])
+        win.geometry("720x520")
+        txt = tk.Text(win, wrap="word", bg=self.theme["entry_bg"], fg=self.theme["entry_fg"],
+                      font=("Consolas", 10), relief="flat", padx=8, pady=8)
+        sb = tk.Scrollbar(win, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        txt.pack(fill="both", expand=True, padx=8, pady=8)
+        txt.insert("1.0", report)
+        txt.configure(state="disabled")
+        tk.Button(win, text="Закрити", command=win.destroy,
+                  bg=self.theme["btn_bg"], fg=self.theme["btn_fg"]).pack(pady=8)
 
     def _on_state_change(self, *_):
         if self._syncing_form:
@@ -2603,7 +2806,7 @@ class App:
             try:
                 if not IS_WINDOWS or not self.use_word_com.get():
                     raise RuntimeError("Word COM disabled or not available")
-                out_path = generate_contract_doc_windows_from_state(state, template_doc, out_doc)
+                out_path = generate_contract_doc_windows_from_state(state, template_doc, out_doc, log_fn=self.write_log)
             except Exception as exc:
                 self.write_log(f"Word COM недоступний: {exc}")
 
