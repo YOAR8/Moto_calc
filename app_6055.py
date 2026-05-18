@@ -191,8 +191,8 @@ def _fill_docx_runs(para, values: Dict[str, str]) -> None:
                             r.text = ""
 
 
-def _remove_form_field_shading(doc) -> None:
-    """Remove gray form-field backgrounds from a filled .docx (w:sdt controls + w:shd shading)."""
+def _remove_form_field_shading(doc, fill_white: bool = True) -> None:
+    """Remove gray form-field backgrounds from a filled .docx."""
     try:
         from docx.oxml.ns import qn  # type: ignore
     except ImportError:
@@ -215,6 +215,8 @@ def _remove_form_field_shading(doc) -> None:
         if rpr is not None:
             for shd in list(rpr.findall(qn("w:shd"))):
                 rpr.remove(shd)
+            for hl in list(rpr.findall(qn("w:highlight"))):
+                rpr.remove(hl)
     # Remove paragraph-level shading (w:p/w:pPr/w:shd) — LibreOffice form fields
     for para_elem in list(doc.element.body.iter(qn("w:p"))):
         ppr = para_elem.find(qn("w:pPr"))
@@ -227,9 +229,14 @@ def _remove_form_field_shading(doc) -> None:
         if tcpr is not None:
             for shd in list(tcpr.findall(qn("w:shd"))):
                 tcpr.remove(shd)
+    if fill_white:
+        # Ensure no inherited background remains on text runs/cells in editors like LibreOffice.
+        for target in list(doc.element.body.iter(qn("w:rPr"))) + list(doc.element.body.iter(qn("w:tcPr"))) + list(doc.element.body.iter(qn("w:pPr"))):
+            for shd in list(target.findall(qn("w:shd"))):
+                target.remove(shd)
 
 
-def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out_docx: Path, log_fn=None) -> "Path | None":
+def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out_docx: Path, log_fn=None, white_fill: bool = True) -> "Path | None":
     """Copy template byte-for-byte then fill ALL placeholders/bookmarks/content-controls."""
     try:
         from docx import Document  # type: ignore
@@ -417,12 +424,12 @@ def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out
         if not _fld_names_found:
             log_fn("  Підказка: шаблон не містить FORMTEXT полів (fldChar). Перевірте SDT/закладки або використайте {{ключ}} у тексті.")
 
-    _remove_form_field_shading(doc)
+    _remove_form_field_shading(doc, fill_white=white_fill)
     doc.save(str(out_docx))
     return out_docx if out_docx.exists() else None
 
 
-def generate_contract_via_office_fallback(state: Dict[str, str], template_doc: Path, out_path: Path, log_fn=None) -> "Path | None":
+def generate_contract_via_office_fallback(state: Dict[str, str], template_doc: Path, out_path: Path, log_fn=None, white_fill: bool = True) -> "Path | None":
     """Fallback without Word COM: try LibreOffice conversions while preserving template layout."""
     def _log(msg: str) -> None:
         if log_fn:
@@ -447,7 +454,7 @@ def generate_contract_via_office_fallback(state: Dict[str, str], template_doc: P
         _log(f"Конверсію виконано: {tpl_docx.name}, заповнюю...")
 
         filled_docx = tmp_dir / "filled.docx"
-        filled = _fill_docx_contract_template(state, tpl_docx, filled_docx, log_fn=log_fn)
+        filled = _fill_docx_contract_template(state, tpl_docx, filled_docx, log_fn=log_fn, white_fill=white_fill)
         if not filled:
             _log("Заповнення шаблону не вдалось")
             return None
@@ -473,7 +480,7 @@ def generate_contract_via_office_fallback(state: Dict[str, str], template_doc: P
         return final_docx
 
 
-def generate_contract_non_com(state: Dict[str, str], template_path: Path, out_path: Path, log_fn=None) -> "Path | None":
+def generate_contract_non_com(state: Dict[str, str], template_path: Path, out_path: Path, log_fn=None, white_fill: bool = True) -> "Path | None":
     """Generate contract without Word COM.
     .docx template — fills directly (run-level, preserves formatting 1:1).
     .doc  template — converts via LibreOffice first.
@@ -481,7 +488,7 @@ def generate_contract_non_com(state: Dict[str, str], template_path: Path, out_pa
     suffix = template_path.suffix.lower()
     if suffix == ".docx":
         out_docx = out_path.with_suffix(".docx")
-        filled = _fill_docx_contract_template(state, template_path, out_docx, log_fn=log_fn)
+        filled = _fill_docx_contract_template(state, template_path, out_docx, log_fn=log_fn, white_fill=white_fill)
         if not filled:
             return None
         # Optionally convert to .doc if output extension requested
@@ -495,7 +502,7 @@ def generate_contract_non_com(state: Dict[str, str], template_path: Path, out_pa
                 return doc_result
         return filled  # keep .docx — looks identical to original template
     # .doc template — use LibreOffice conversion workflow
-    return generate_contract_via_office_fallback(state, template_path, out_path, log_fn=log_fn)
+    return generate_contract_via_office_fallback(state, template_path, out_path, log_fn=log_fn, white_fill=white_fill)
 
 
 def runtime_app_dir() -> Path:
@@ -549,7 +556,7 @@ def read_xls_cell(path: Path, sheet_name: str, addr: str):
     return sh.cell_value(r, c)
 
 
-def write_xls_cells(path: Path, sheet_name: str, updates: Dict[str, object], backup: bool = True, force_a3_tnr12: bool = False) -> None:
+def write_xls_cells(path: Path, sheet_name: str, updates: Dict[str, object], backup: bool = True, force_a3_tnr10: bool = False) -> None:
     if backup:
         ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_path = path.with_name(f"{path.stem}_backup_{ts}{path.suffix}")
@@ -568,12 +575,12 @@ def write_xls_cells(path: Path, sheet_name: str, updates: Dict[str, object], bac
 
     ws = wb.get_sheet(sheet_idx)
     rs = rb.sheet_by_index(sheet_idx)
-    a3_style = xlwt.easyxf("font: name Times New Roman, height 240;") if force_a3_tnr12 else None
+    a3_style = xlwt.easyxf("font: name Times New Roman, height 200;") if force_a3_tnr10 else None
     for addr, value in updates.items():
         r, c = a1_to_rc(addr)
         orig_xf = rs.cell_xf_index(r, c)
-        if force_a3_tnr12 and addr.upper() == "A3" and a3_style is not None:
-            # Explicitly enforce Times New Roman 12 for Act number/date in A3.
+        if force_a3_tnr10 and addr.upper() == "A3" and a3_style is not None:
+            # Explicitly enforce Times New Roman 10 for Act number/date in A3.
             ws.write(r, c, value, a3_style)
             continue
         ws.write(r, c, value)
@@ -1272,7 +1279,7 @@ def generate_act_xls_from_state(state: Dict[str, str], source_6055: Path, out_pa
     updates["D56"] = short_fio or short_name(full_fio)
     updates.pop("E15", None)  # E15 is app-internal; short name used only in D56
     updates["C43"] = updates.get("C39", "")  # C43 (Номер рами) деривується з VIN
-    write_xls_cells(out_path, "Worksheet", updates, backup=False, force_a3_tnr12=True)
+    write_xls_cells(out_path, "Worksheet", updates, backup=False, force_a3_tnr10=True)
     return out_path
 
 
@@ -2309,6 +2316,7 @@ class App:
         self.editor_path = tk.StringVar(value="")
         self.open_after_save = tk.BooleanVar(value=True)
         self.use_word_com = tk.BooleanVar(value=True)
+        self.fill_white_bg = tk.BooleanVar(value=True)
         self.contract_out_format = tk.StringVar(value="doc")
         self.act_out_format = tk.StringVar(value="xls")
         self.vidatkova_out_format = tk.StringVar(value="xls")
@@ -2348,6 +2356,7 @@ class App:
                 self.theme = build_theme_palette(_pref)
         self.open_after_save.set(_cfg.get("open_after_save", True))
         self.use_word_com.set(_cfg.get("use_word_com", True))
+        self.fill_white_bg.set(_cfg.get("fill_white_bg", True))
         if _cfg.get("contract_out_format") in ("doc", "docx"):
             self.contract_out_format.set(_cfg["contract_out_format"])
         if _cfg.get("act_out_format") in ("xls", "xlsx"):
@@ -2414,7 +2423,8 @@ class App:
         self._make_toolbar_button(toolbar, "📋 Всі данні", self.open_all_data_dialog, 4)
         self._make_toolbar_button(toolbar, "✖ Очистити", self.clear_form, 5)
         self._make_toolbar_button(toolbar, "⟲ Генерувати", self.generate_all, 6)
-        self._make_toolbar_button(toolbar, "↓ Вставити", self.paste_from_clipboard, 7)
+        self._make_toolbar_button(toolbar, "⚠ Генерувати як є", self.generate_all_relaxed, 7)
+        self._make_toolbar_button(toolbar, "↓ Вставити", self.paste_from_clipboard, 8)
 
         gear_btn = tk.Button(
             header, text="⚙", command=self.open_settings_dialog,
@@ -2442,6 +2452,18 @@ class App:
 
         self.write_log(f"Platform: {platform.system()}")
         self.write_log(f"Output folder: {self.out_dir}")
+        office_cli = _resolve_office_cli()
+        if office_cli:
+            self.write_log(f"LibreOffice CLI: {office_cli}")
+        else:
+            self.write_log("LibreOffice CLI не знайдено (для конвертацій xls/xlsx/doc/docx)")
+        if IS_WINDOWS:
+            try:
+                import win32com.client as _w32  # type: ignore
+                _w32.Dispatch("Word.Application").Quit()
+                self.write_log("Microsoft Word COM: доступний")
+            except Exception:
+                self.write_log("Microsoft Word COM: недоступний")
         if not IS_WINDOWS:
             self.write_log("Демо-режим поза Windows: формування договору через Word-шаблон недоступне.")
 
@@ -2712,45 +2734,53 @@ class App:
             fg=self.theme["label_fg"],
             selectcolor=self.theme["entry_bg"],
         ).grid(row=theme_row + 2, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 6))
+        tk.Checkbutton(
+            dialog,
+            text="Залити білим (прибрати сірий фон полів)",
+            variable=self.fill_white_bg,
+            bg=self.theme["card_bg"],
+            fg=self.theme["label_fg"],
+            selectcolor=self.theme["entry_bg"],
+        ).grid(row=theme_row + 3, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 6))
         tk.Label(
             dialog,
             text="Формат договору",
             bg=self.theme["card_bg"],
             fg=self.theme["label_fg"],
-        ).grid(row=theme_row + 3, column=0, sticky="w", padx=16, pady=(0, 6))
+        ).grid(row=theme_row + 4, column=0, sticky="w", padx=16, pady=(0, 6))
         fmt_menu = tk.OptionMenu(dialog, self.contract_out_format, "doc", "docx")
         fmt_menu.configure(bg=self.theme["btn_bg"], fg=self.theme["btn_fg"],
                            activebackground=self.theme["header_active_bg"],
                            activeforeground=self.theme["header_fg"],
                            highlightthickness=0)
         fmt_menu["menu"].configure(bg=self.theme["entry_bg"], fg=self.theme["entry_fg"])
-        fmt_menu.grid(row=theme_row + 3, column=1, sticky="w", pady=(0, 6))
+        fmt_menu.grid(row=theme_row + 4, column=1, sticky="w", pady=(0, 6))
         tk.Label(
             dialog,
             text="Формат акта",
             bg=self.theme["card_bg"],
             fg=self.theme["label_fg"],
-        ).grid(row=theme_row + 4, column=0, sticky="w", padx=16, pady=(0, 6))
+        ).grid(row=theme_row + 5, column=0, sticky="w", padx=16, pady=(0, 6))
         act_fmt_menu = tk.OptionMenu(dialog, self.act_out_format, "xls", "xlsx")
         act_fmt_menu.configure(bg=self.theme["btn_bg"], fg=self.theme["btn_fg"],
                                activebackground=self.theme["header_active_bg"],
                                activeforeground=self.theme["header_fg"],
                                highlightthickness=0)
         act_fmt_menu["menu"].configure(bg=self.theme["entry_bg"], fg=self.theme["entry_fg"])
-        act_fmt_menu.grid(row=theme_row + 4, column=1, sticky="w", pady=(0, 6))
+        act_fmt_menu.grid(row=theme_row + 5, column=1, sticky="w", pady=(0, 6))
         tk.Label(
             dialog,
             text="Формат видаткової",
             bg=self.theme["card_bg"],
             fg=self.theme["label_fg"],
-        ).grid(row=theme_row + 5, column=0, sticky="w", padx=16, pady=(0, 6))
+        ).grid(row=theme_row + 6, column=0, sticky="w", padx=16, pady=(0, 6))
         vid_fmt_menu = tk.OptionMenu(dialog, self.vidatkova_out_format, "xls", "xlsx")
         vid_fmt_menu.configure(bg=self.theme["btn_bg"], fg=self.theme["btn_fg"],
                                activebackground=self.theme["header_active_bg"],
                                activeforeground=self.theme["header_fg"],
                                highlightthickness=0)
         vid_fmt_menu["menu"].configure(bg=self.theme["entry_bg"], fg=self.theme["entry_fg"])
-        vid_fmt_menu.grid(row=theme_row + 5, column=1, sticky="w", pady=(0, 6))
+        vid_fmt_menu.grid(row=theme_row + 6, column=1, sticky="w", pady=(0, 6))
         tk.Button(
             dialog,
             text="🔍 Аналізувати шаблон договору",
@@ -2759,7 +2789,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 6, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 8))
+        ).grid(row=theme_row + 7, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 8))
         tk.Button(
             dialog,
             text="📋 Журнал генерації",
@@ -2768,7 +2798,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 6, column=2, sticky="e", padx=16, pady=(0, 8))
+        ).grid(row=theme_row + 7, column=2, sticky="e", padx=16, pady=(0, 8))
         tk.Button(
             dialog,
             text="↺ Перезавантажити шаблон",
@@ -2777,7 +2807,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 7, column=0, sticky="w", padx=16, pady=8)
+        ).grid(row=theme_row + 8, column=0, sticky="w", padx=16, pady=8)
         tk.Button(
             dialog,
             text="Зберегти налаштування",
@@ -2786,7 +2816,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 7, column=1, sticky="w", pady=8)
+        ).grid(row=theme_row + 8, column=1, sticky="w", pady=8)
         tk.Button(
             dialog,
             text="Закрити",
@@ -2795,7 +2825,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 7, column=2, sticky="e", padx=12, pady=12)
+        ).grid(row=theme_row + 8, column=2, sticky="e", padx=12, pady=12)
         dialog.protocol("WM_DELETE_WINDOW", lambda: [self._save_settings(), dialog.destroy()])
 
         # Auto-fit height after all widgets are created
@@ -2970,6 +3000,7 @@ class App:
         if self._syncing_form:
             return
         self._syncing_form = True
+        self._auto_recalculate_totals()
         c15_val = self.state_vars["C15"].get()
         self.state_vars["E15"].set(short_name(c15_val))
         _payload, errors, _warnings = self.refresh_validation(silent=True)
@@ -2985,9 +3016,21 @@ class App:
                 self._generation_suggested = True
                 if messagebox and messagebox.askyesno(
                     "Готово до генерації",
-                    "Всі обов'язкові поля заповнено!\n\nСгенерувати всі документи зараз?",
+                    "Всі обов'язкові поля заповнено!\n\nЗгенерувати всі документи зараз?",
                 ):
                     self.generate_all()
+
+    def _auto_recalculate_totals(self) -> None:
+        """Auto-calculate C46 = C44 + C45 - DISC when numeric inputs are present."""
+        c44 = parse_decimal(self.state_vars.get("C44", tk.StringVar()).get())
+        c45 = parse_decimal(self.state_vars.get("C45", tk.StringVar()).get())
+        disc = parse_decimal(self.state_vars.get("DISC", tk.StringVar()).get()) or 0.0
+        if c44 is None and c45 is None:
+            return
+        total = max(0.0, (c44 or 0.0) + (c45 or 0.0) - disc)
+        total_s = f"{total:.2f}".rstrip("0").rstrip(".")
+        if self.state_vars.get("C46") and self.state_vars["C46"].get().strip() != total_s:
+            self.state_vars["C46"].set(total_s)
 
     def collect_state(self) -> Dict[str, str]:
         state = {cell: var.get().strip() for cell, var in self.state_vars.items()}
@@ -3098,6 +3141,7 @@ class App:
             "theme_pref": self.theme_pref.get(),
             "open_after_save": self.open_after_save.get(),
             "use_word_com": self.use_word_com.get(),
+            "fill_white_bg": self.fill_white_bg.get(),
             "contract_out_format": self.contract_out_format.get(),
             "act_out_format": self.act_out_format.get(),
             "vidatkova_out_format": self.vidatkova_out_format.get(),
@@ -3140,11 +3184,13 @@ class App:
         out_dir.mkdir(parents=True, exist_ok=True)
         return out_dir
 
-    def save_draft(self, kind: str, open_after: bool = True, output_dir: Path | None = None, use_timestamp: bool = True) -> Path:
+    def save_draft(self, kind: str, open_after: bool = True, output_dir: Path | None = None, use_timestamp: bool = True, allow_incomplete: bool = False) -> Path:
         state = self.collect_state()
         payload, errors, warnings = validate_state(state)
-        if errors:
+        if errors and not allow_incomplete:
             raise ValueError("Потрібно виправити помилки перед збереженням: " + "; ".join(errors))
+        if errors and allow_incomplete:
+            self.write_log("Увага: генерація з незаповненими/помилковими полями: " + "; ".join(errors))
 
         out_dir = output_dir or self._ensure_output_dir()
         ts = f"_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}" if use_timestamp else ""
@@ -3189,7 +3235,13 @@ class App:
             if not _com_enabled:
                 reason = "вимкнено в налаштуваннях" if not self.use_word_com.get() else "не Windows"
                 self.write_log(f"Режим без Word COM ({reason}): {template_doc.name}")
-                non_com = generate_contract_non_com(state, template_doc, out_doc, log_fn=self.write_log)
+                non_com = generate_contract_non_com(
+                    state,
+                    template_doc,
+                    out_doc,
+                    log_fn=self.write_log,
+                    white_fill=self.fill_white_bg.get(),
+                )
                 if non_com:
                     out_path = non_com
                 else:
@@ -3237,13 +3289,16 @@ class App:
                 self.write_log(f"Не вдалося відкрити файл: {exc}")
         return out_path
 
-    def generate_all(self) -> None:
+    def generate_all(self, allow_incomplete: bool = False) -> None:
         try:
             state = self.collect_state()
             payload, errors, _ = validate_state(state)
-            if errors:
+            if errors and not allow_incomplete:
                 messagebox.showerror("Помилки валідації", "\n".join(errors))
                 return
+            if errors and allow_incomplete:
+                self.write_log("Увага: пакетна генерація з незаповненими/помилковими полями")
+                self.write_log("; ".join(errors))
             base_out_dir = self._ensure_output_dir()
             case_dir = base_out_dir / build_case_folder_name(state)
             if case_dir.exists():
@@ -3253,9 +3308,9 @@ class App:
                 ):
                     return
             case_dir.mkdir(parents=True, exist_ok=True)
-            self.save_draft("act", open_after=False, output_dir=case_dir, use_timestamp=False)
-            self.save_draft("contract", open_after=False, output_dir=case_dir, use_timestamp=False)
-            self.save_draft("vidatkova", open_after=False, output_dir=case_dir, use_timestamp=False)
+            self.save_draft("act", open_after=False, output_dir=case_dir, use_timestamp=False, allow_incomplete=allow_incomplete)
+            self.save_draft("contract", open_after=False, output_dir=case_dir, use_timestamp=False, allow_incomplete=allow_incomplete)
+            self.save_draft("vidatkova", open_after=False, output_dir=case_dir, use_timestamp=False, allow_incomplete=allow_incomplete)
             self.status_var.set(f"Усі документи збережено у {case_dir.name}")
             self.write_log(f"Усі документи збережено у {case_dir}")
             if self.open_after_save.get():
@@ -3268,6 +3323,10 @@ class App:
             self.write_log(traceback.format_exc())
             if messagebox:
                 messagebox.showerror("Помилка", str(exc))
+
+    def generate_all_relaxed(self) -> None:
+        """Generate documents even when required fields are missing."""
+        self.generate_all(allow_incomplete=True)
 
 
 if tk is not None:
