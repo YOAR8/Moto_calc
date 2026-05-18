@@ -2310,6 +2310,8 @@ class App:
         self.open_after_save = tk.BooleanVar(value=True)
         self.use_word_com = tk.BooleanVar(value=True)
         self.contract_out_format = tk.StringVar(value="doc")
+        self.act_out_format = tk.StringVar(value="xls")
+        self.vidatkova_out_format = tk.StringVar(value="xls")
 
         self.state_vars: Dict[str, tk.StringVar] = {}
         self.widgets: Dict[str, tk.Entry] = {}
@@ -2348,6 +2350,10 @@ class App:
         self.use_word_com.set(_cfg.get("use_word_com", True))
         if _cfg.get("contract_out_format") in ("doc", "docx"):
             self.contract_out_format.set(_cfg["contract_out_format"])
+        if _cfg.get("act_out_format") in ("xls", "xlsx"):
+            self.act_out_format.set(_cfg["act_out_format"])
+        if _cfg.get("vidatkova_out_format") in ("xls", "xlsx"):
+            self.vidatkova_out_format.set(_cfg["vidatkova_out_format"])
 
         try:
             self.app_log_path = configure_app_logging(Path(self.output_dir_var.get().strip() or str(self.out_dir)))
@@ -2405,9 +2411,10 @@ class App:
         self._make_toolbar_button(toolbar, "Договір", lambda: self.open_draft("contract"), 1)
         self._make_toolbar_button(toolbar, "Видаткова", lambda: self.open_draft("vidatkova"), 2)
         self._make_toolbar_button(toolbar, "↺ Відновити з файлу", self.reload_source, 3)
-        self._make_toolbar_button(toolbar, "✖ Очистити", self.clear_form, 4)
-        self._make_toolbar_button(toolbar, "⟲ Генерувати", self.generate_all, 5)
-        self._make_toolbar_button(toolbar, "↓ Вставити", self.paste_from_clipboard, 6)
+        self._make_toolbar_button(toolbar, "📋 Всі данні", self.open_all_data_dialog, 4)
+        self._make_toolbar_button(toolbar, "✖ Очистити", self.clear_form, 5)
+        self._make_toolbar_button(toolbar, "⟲ Генерувати", self.generate_all, 6)
+        self._make_toolbar_button(toolbar, "↓ Вставити", self.paste_from_clipboard, 7)
 
         gear_btn = tk.Button(
             header, text="⚙", command=self.open_settings_dialog,
@@ -2718,6 +2725,32 @@ class App:
                            highlightthickness=0)
         fmt_menu["menu"].configure(bg=self.theme["entry_bg"], fg=self.theme["entry_fg"])
         fmt_menu.grid(row=theme_row + 3, column=1, sticky="w", pady=(0, 6))
+        tk.Label(
+            dialog,
+            text="Формат акта",
+            bg=self.theme["card_bg"],
+            fg=self.theme["label_fg"],
+        ).grid(row=theme_row + 4, column=0, sticky="w", padx=16, pady=(0, 6))
+        act_fmt_menu = tk.OptionMenu(dialog, self.act_out_format, "xls", "xlsx")
+        act_fmt_menu.configure(bg=self.theme["btn_bg"], fg=self.theme["btn_fg"],
+                               activebackground=self.theme["header_active_bg"],
+                               activeforeground=self.theme["header_fg"],
+                               highlightthickness=0)
+        act_fmt_menu["menu"].configure(bg=self.theme["entry_bg"], fg=self.theme["entry_fg"])
+        act_fmt_menu.grid(row=theme_row + 4, column=1, sticky="w", pady=(0, 6))
+        tk.Label(
+            dialog,
+            text="Формат видаткової",
+            bg=self.theme["card_bg"],
+            fg=self.theme["label_fg"],
+        ).grid(row=theme_row + 5, column=0, sticky="w", padx=16, pady=(0, 6))
+        vid_fmt_menu = tk.OptionMenu(dialog, self.vidatkova_out_format, "xls", "xlsx")
+        vid_fmt_menu.configure(bg=self.theme["btn_bg"], fg=self.theme["btn_fg"],
+                               activebackground=self.theme["header_active_bg"],
+                               activeforeground=self.theme["header_fg"],
+                               highlightthickness=0)
+        vid_fmt_menu["menu"].configure(bg=self.theme["entry_bg"], fg=self.theme["entry_fg"])
+        vid_fmt_menu.grid(row=theme_row + 5, column=1, sticky="w", pady=(0, 6))
         tk.Button(
             dialog,
             text="🔍 Аналізувати шаблон договору",
@@ -2726,7 +2759,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 4, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 8))
+        ).grid(row=theme_row + 6, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 8))
         tk.Button(
             dialog,
             text="📋 Журнал генерації",
@@ -2735,7 +2768,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 4, column=2, sticky="e", padx=16, pady=(0, 8))
+        ).grid(row=theme_row + 6, column=2, sticky="e", padx=16, pady=(0, 8))
         tk.Button(
             dialog,
             text="↺ Перезавантажити шаблон",
@@ -2744,7 +2777,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 5, column=0, sticky="w", padx=16, pady=8)
+        ).grid(row=theme_row + 7, column=0, sticky="w", padx=16, pady=8)
         tk.Button(
             dialog,
             text="Зберегти налаштування",
@@ -2753,7 +2786,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 5, column=1, sticky="w", pady=8)
+        ).grid(row=theme_row + 7, column=1, sticky="w", pady=8)
         tk.Button(
             dialog,
             text="Закрити",
@@ -2762,7 +2795,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 5, column=2, sticky="e", padx=12, pady=12)
+        ).grid(row=theme_row + 7, column=2, sticky="e", padx=12, pady=12)
         dialog.protocol("WM_DELETE_WINDOW", lambda: [self._save_settings(), dialog.destroy()])
 
         # Auto-fit height after all widgets are created
@@ -2830,6 +2863,108 @@ class App:
                   bg=self.theme["btn_bg"], fg=self.theme["btn_fg"]).pack(side="left", padx=12)
         tk.Button(btn_frame, text="Закрити", command=win.destroy,
                   bg=self.theme["btn_bg"], fg=self.theme["btn_fg"]).pack(side="right", padx=12)
+
+    def open_all_data_dialog(self) -> None:
+        """Open a full list of all ACT-linked fields bound to the same app state."""
+        win = tk.Toplevel(self.root)
+        win.title("Всі данні (поля Акта)")
+        win.configure(bg=self.theme["card_bg"])
+        win.geometry("980x760")
+        win.transient(self.root)
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(1, weight=1)
+
+        tk.Label(
+            win,
+            text="Всі данні",
+            font=("Segoe UI", 14, "bold"),
+            bg=self.theme["card_bg"],
+            fg=self.theme["label_fg"],
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 2))
+        tk.Label(
+            win,
+            text="Поля синхронізовані з формою та використовуються для Акта, Договору і Видаткової.",
+            bg=self.theme["card_bg"],
+            fg=self.theme["label_fg"],
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=12, pady=(36, 6))
+
+        outer = tk.Frame(win, bg=self.theme["card_bg"])
+        outer.grid(row=1, column=0, sticky="nsew", padx=12, pady=8)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
+
+        canvas = tk.Canvas(outer, bg=self.theme["card_bg"], highlightthickness=0)
+        sb = tk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+
+        form = tk.Frame(canvas, bg=self.theme["card_bg"])
+        form.columnconfigure(0, weight=0)
+        form.columnconfigure(1, weight=1)
+        form_win = canvas.create_window((0, 0), window=form, anchor="nw")
+        form.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(form_win, width=e.width))
+
+        all_cells = sorted([c for c in FORM_CELLS if _XLS_CELL_RE.match(c)], key=lambda a: a1_to_rc(a))
+        for i, cell in enumerate(all_cells):
+            label = CELL_LABELS.get(cell, cell)
+            req_mark = " *" if any(cell == spec_cell and req for _, spec_cell, _, req in iter_field_specs()) else ""
+            tk.Label(
+                form,
+                text=f"{cell} — {label}{req_mark}",
+                bg=self.theme["card_bg"],
+                fg=self.theme["label_fg"],
+                anchor="w",
+            ).grid(row=i, column=0, sticky="w", padx=(0, 10), pady=3)
+            var = self.state_vars[cell]
+            if cell == "E15":
+                entry = tk.Entry(
+                    form,
+                    textvariable=var,
+                    relief="flat",
+                    highlightthickness=1,
+                    bd=0,
+                    bg=self.theme["readonly_bg"],
+                    fg=self.theme["readonly_fg"],
+                    insertbackground=self.theme["entry_insert"],
+                    state="readonly",
+                    readonlybackground=self.theme["readonly_bg"],
+                )
+            else:
+                entry = tk.Entry(
+                    form,
+                    textvariable=var,
+                    bg=self.theme["entry_bg"],
+                    fg=self.theme["entry_fg"],
+                    insertbackground=self.theme["entry_insert"],
+                    relief="flat",
+                    highlightthickness=1,
+                    bd=0,
+                )
+            entry.grid(row=i, column=1, sticky="ew", pady=3)
+            self._add_copy_paste_menu(entry)
+
+        btns = tk.Frame(win, bg=self.theme["card_bg"])
+        btns.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 10))
+        tk.Button(
+            btns,
+            text="Синхронізувати VIN/шасі",
+            command=self.sync_frame_fields,
+            bg=self.theme["btn_bg"],
+            fg=self.theme["btn_fg"],
+        ).pack(side="left")
+        tk.Button(
+            btns,
+            text="Закрити",
+            command=win.destroy,
+            bg=self.theme["btn_bg"],
+            fg=self.theme["btn_fg"],
+        ).pack(side="right")
+
+        self.write_log("Відкрито вікно 'Всі данні'")
 
     def _on_state_change(self, *_):
         if self._syncing_form:
@@ -2964,6 +3099,8 @@ class App:
             "open_after_save": self.open_after_save.get(),
             "use_word_com": self.use_word_com.get(),
             "contract_out_format": self.contract_out_format.get(),
+            "act_out_format": self.act_out_format.get(),
+            "vidatkova_out_format": self.vidatkova_out_format.get(),
         })
 
     def paste_from_clipboard(self) -> None:
@@ -3015,8 +3152,25 @@ class App:
         num_part = f" \u2116{doc_num}" if doc_num else ""
 
         if kind == "act":
-            out_path = out_dir / f"Акт{num_part}{ts}.xls"
-            generate_act_xls_from_state(state, Path(self.source_path.get()), out_path)
+            act_ext = self.act_out_format.get().strip().lower()
+            if act_ext not in ("xls", "xlsx"):
+                act_ext = "xls"
+            out_xls = out_dir / f"Акт{num_part}{ts}.xls"
+            generate_act_xls_from_state(state, Path(self.source_path.get()), out_xls)
+            if act_ext == "xls":
+                out_path = out_xls
+            else:
+                self.write_log("Конвертую Акт у формат .xlsx...")
+                converted = _office_convert(out_xls, out_dir, "xlsx")
+                if converted and converted.exists():
+                    out_path = converted
+                    try:
+                        out_xls.unlink()
+                    except Exception:
+                        pass
+                else:
+                    self.write_log("Не вдалося конвертувати Акт у .xlsx, залишаю .xls")
+                    out_path = out_xls
         elif kind == "contract":
             template_doc = Path(self.dogovir_path.get())
             ext = self.contract_out_format.get().strip().lower()
@@ -3049,8 +3203,25 @@ class App:
                         out_path = out_doc.with_suffix(".txt")
                         save_text_preview(out_path, "ЧОРНОВИК ДОГОВОРУ", preview_text_for_contract(payload))
         elif kind == "vidatkova":
-            out_path = out_dir / f"Видаткова{num_part}{ts}.xls"
-            generate_vidatkova_xls_from_state(state, Path(self.vidatkova_path.get()), out_path)
+            vid_ext = self.vidatkova_out_format.get().strip().lower()
+            if vid_ext not in ("xls", "xlsx"):
+                vid_ext = "xls"
+            out_xls = out_dir / f"Видаткова{num_part}{ts}.xls"
+            generate_vidatkova_xls_from_state(state, Path(self.vidatkova_path.get()), out_xls)
+            if vid_ext == "xls":
+                out_path = out_xls
+            else:
+                self.write_log("Конвертую Видаткову у формат .xlsx...")
+                converted = _office_convert(out_xls, out_dir, "xlsx")
+                if converted and converted.exists():
+                    out_path = converted
+                    try:
+                        out_xls.unlink()
+                    except Exception:
+                        pass
+                else:
+                    self.write_log("Не вдалося конвертувати Видаткову у .xlsx, залишаю .xls")
+                    out_path = out_xls
         else:
             raise ValueError(f"Невідомий тип чорновика: {kind}")
 
