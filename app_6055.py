@@ -191,13 +191,12 @@ def _fill_docx_runs(para, values: Dict[str, str]) -> None:
                             r.text = ""
 
 
-def _remove_form_field_shading(doc, fill_white: bool = True) -> None:
-    """Remove gray form-field backgrounds from a filled .docx.
+def _apply_contract_field_shading(doc, remove_shading: bool = True) -> None:
+    """Apply contract field shading mode for a filled .docx.
 
-    Strategy: instead of just deleting w:shd nodes (which lets the parent style
-    re-apply the gray), we *replace* every shading element with an explicit
-    white / clear declaration.  This overrides inherited character/paragraph
-    styles that carry gray form-field backgrounds in templates.
+    When remove_shading=True, replace every w:shd with explicit white/clear so
+    inherited gray field styles cannot re-apply in LibreOffice or Word.
+    When remove_shading=False, keep original shading from the template.
     """
     try:
         from docx.oxml.ns import qn  # type: ignore
@@ -231,10 +230,10 @@ def _remove_form_field_shading(doc, fill_white: bool = True) -> None:
     # ── 2. Run-level: replace w:shd with white, strip w:highlight ────────────
     for rpr in list(doc.element.body.iter(qn("w:rPr"))):
         for shd in list(rpr.findall(qn("w:shd"))):
-            if fill_white:
+            if remove_shading:
                 rpr.replace(shd, _make_white_shd())
             else:
-                rpr.remove(shd)
+                continue
         for hl in list(rpr.findall(qn("w:highlight"))):
             rpr.remove(hl)
         # Also remove character style references that carry gray form-field look
@@ -246,21 +245,21 @@ def _remove_form_field_shading(doc, fill_white: bool = True) -> None:
     # ── 3. Paragraph-level: replace w:shd with white ────────────────────────
     for ppr in list(doc.element.body.iter(qn("w:pPr"))):
         for shd in list(ppr.findall(qn("w:shd"))):
-            if fill_white:
+            if remove_shading:
                 ppr.replace(shd, _make_white_shd())
             else:
-                ppr.remove(shd)
+                continue
 
     # ── 4. Table-cell level: replace w:shd with white ───────────────────────
     for tcpr in list(doc.element.body.iter(qn("w:tcPr"))):
         for shd in list(tcpr.findall(qn("w:shd"))):
-            if fill_white:
+            if remove_shading:
                 tcpr.replace(shd, _make_white_shd())
             else:
-                tcpr.remove(shd)
+                continue
 
 
-def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out_docx: Path, log_fn=None, white_fill: bool = True) -> "Path | None":
+def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out_docx: Path, log_fn=None, remove_shading: bool = True) -> "Path | None":
     """Copy template byte-for-byte then fill ALL placeholders/bookmarks/content-controls."""
     try:
         from docx import Document  # type: ignore
@@ -448,12 +447,12 @@ def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out
         if not _fld_names_found:
             log_fn("  Підказка: шаблон не містить FORMTEXT полів (fldChar). Перевірте SDT/закладки або використайте {{ключ}} у тексті.")
 
-    _remove_form_field_shading(doc, fill_white=white_fill)
+    _apply_contract_field_shading(doc, remove_shading=remove_shading)
     doc.save(str(out_docx))
     return out_docx if out_docx.exists() else None
 
 
-def generate_contract_via_office_fallback(state: Dict[str, str], template_doc: Path, out_path: Path, log_fn=None, white_fill: bool = True) -> "Path | None":
+def generate_contract_via_office_fallback(state: Dict[str, str], template_doc: Path, out_path: Path, log_fn=None, remove_shading: bool = True) -> "Path | None":
     """Fallback without Word COM: try LibreOffice conversions while preserving template layout."""
     def _log(msg: str) -> None:
         if log_fn:
@@ -478,7 +477,7 @@ def generate_contract_via_office_fallback(state: Dict[str, str], template_doc: P
         _log(f"Конверсію виконано: {tpl_docx.name}, заповнюю...")
 
         filled_docx = tmp_dir / "filled.docx"
-        filled = _fill_docx_contract_template(state, tpl_docx, filled_docx, log_fn=log_fn, white_fill=white_fill)
+        filled = _fill_docx_contract_template(state, tpl_docx, filled_docx, log_fn=log_fn, remove_shading=remove_shading)
         if not filled:
             _log("Заповнення шаблону не вдалось")
             return None
@@ -504,7 +503,7 @@ def generate_contract_via_office_fallback(state: Dict[str, str], template_doc: P
         return final_docx
 
 
-def generate_contract_non_com(state: Dict[str, str], template_path: Path, out_path: Path, log_fn=None, white_fill: bool = True) -> "Path | None":
+def generate_contract_non_com(state: Dict[str, str], template_path: Path, out_path: Path, log_fn=None, remove_shading: bool = True) -> "Path | None":
     """Generate contract without Word COM.
     .docx template — fills directly (run-level, preserves formatting 1:1).
     .doc  template — converts via LibreOffice first.
@@ -512,7 +511,7 @@ def generate_contract_non_com(state: Dict[str, str], template_path: Path, out_pa
     suffix = template_path.suffix.lower()
     if suffix == ".docx":
         out_docx = out_path.with_suffix(".docx")
-        filled = _fill_docx_contract_template(state, template_path, out_docx, log_fn=log_fn, white_fill=white_fill)
+        filled = _fill_docx_contract_template(state, template_path, out_docx, log_fn=log_fn, remove_shading=remove_shading)
         if not filled:
             return None
         # Optionally convert to .doc if output extension requested
@@ -526,7 +525,7 @@ def generate_contract_non_com(state: Dict[str, str], template_path: Path, out_pa
                 return doc_result
         return filled  # keep .docx — looks identical to original template
     # .doc template — use LibreOffice conversion workflow
-    return generate_contract_via_office_fallback(state, template_path, out_path, log_fn=log_fn, white_fill=white_fill)
+    return generate_contract_via_office_fallback(state, template_path, out_path, log_fn=log_fn, remove_shading=remove_shading)
 
 
 def runtime_app_dir() -> Path:
@@ -1646,13 +1645,39 @@ def diagnose_word_template(template_path: Path, allow_com: bool = True) -> str:
     return "\n".join(lines)
 
 
-def generate_contract_doc_windows_from_state(state: Dict[str, str], dogovir_template: Path, out_path: Path, log_fn=None) -> Path:
+def generate_contract_doc_windows_from_state(
+    state: Dict[str, str],
+    dogovir_template: Path,
+    out_path: Path,
+    log_fn=None,
+    remove_shading: bool = True,
+) -> Path:
     def _log(msg: str) -> None:
         if log_fn:
             try:
                 log_fn(msg)
             except Exception:
                 pass
+
+    def _clear_com_range_shading(rng) -> None:
+        # Word COM constants by numeric value to avoid win32 constants dependency.
+        # wdNoHighlight = 0, wdTextureNone = 0, wdColorWhite = 16777215
+        try:
+            rng.HighlightColorIndex = 0
+        except Exception:
+            pass
+        try:
+            rng.Shading.Texture = 0
+        except Exception:
+            pass
+        try:
+            rng.Shading.BackgroundPatternColor = 16777215
+        except Exception:
+            pass
+        try:
+            rng.Shading.ForegroundPatternColor = 0
+        except Exception:
+            pass
 
     payload = parse_state(state)
     if not dogovir_template.exists():
@@ -1770,6 +1795,30 @@ def generate_contract_doc_windows_from_state(state: Dict[str, str], dogovir_temp
             _log(f"Find & Replace: {fr_filled} замін")
         except Exception as _e:
             _log(f"Find & Replace: помилка — {_e}")
+
+        # Optional: forcefully remove field shading in COM mode too.
+        if remove_shading:
+            try:
+                word.Options.FieldShading = 0
+            except Exception:
+                pass
+            try:
+                _clear_com_range_shading(doc.Content)
+            except Exception:
+                pass
+            try:
+                for i in range(1, doc.FormFields.Count + 1):
+                    _clear_com_range_shading(doc.FormFields(i).Range)
+            except Exception:
+                pass
+            try:
+                for i in range(1, doc.ContentControls.Count + 1):
+                    _clear_com_range_shading(doc.ContentControls(i).Range)
+            except Exception:
+                pass
+            _log("Застосовано режим: без затінення полів")
+        else:
+            _log("Застосовано режим: із затіненням полів")
 
         _log(f"Всього заповнено: закладки={bm_filled}, CC={cc_filled}, FormFields={ff_filled}, F&R={fr_filled}")
         doc.SaveAs(str(out_path.resolve()))
@@ -2340,7 +2389,7 @@ class App:
         self.editor_path = tk.StringVar(value="")
         self.open_after_save = tk.BooleanVar(value=True)
         self.use_word_com = tk.BooleanVar(value=True)
-        self.fill_white_bg = tk.BooleanVar(value=True)
+        self.remove_field_shading = tk.BooleanVar(value=True)
         self.contract_out_format = tk.StringVar(value="doc")
         self.act_out_format = tk.StringVar(value="xls")
         self.vidatkova_out_format = tk.StringVar(value="xls")
@@ -2380,7 +2429,7 @@ class App:
                 self.theme = build_theme_palette(_pref)
         self.open_after_save.set(_cfg.get("open_after_save", True))
         self.use_word_com.set(_cfg.get("use_word_com", True))
-        self.fill_white_bg.set(_cfg.get("fill_white_bg", True))
+        self.remove_field_shading.set(_cfg.get("remove_field_shading", _cfg.get("fill_white_bg", True)))
         if _cfg.get("contract_out_format") in ("doc", "docx"):
             self.contract_out_format.set(_cfg["contract_out_format"])
         if _cfg.get("act_out_format") in ("xls", "xlsx"):
@@ -2759,8 +2808,8 @@ class App:
         ).grid(row=theme_row + 2, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 6))
         tk.Checkbutton(
             dialog,
-            text="Залити білим (прибрати сірий фон полів)",
-            variable=self.fill_white_bg,
+            text="Прибрати затінення полів у договорі",
+            variable=self.remove_field_shading,
             bg=self.theme["card_bg"],
             fg=self.theme["label_fg"],
             selectcolor=self.theme["entry_bg"],
@@ -3164,7 +3213,8 @@ class App:
             "theme_pref": self.theme_pref.get(),
             "open_after_save": self.open_after_save.get(),
             "use_word_com": self.use_word_com.get(),
-            "fill_white_bg": self.fill_white_bg.get(),
+            "remove_field_shading": self.remove_field_shading.get(),
+            "fill_white_bg": self.remove_field_shading.get(),
             "contract_out_format": self.contract_out_format.get(),
             "act_out_format": self.act_out_format.get(),
             "vidatkova_out_format": self.vidatkova_out_format.get(),
@@ -3251,7 +3301,13 @@ class App:
             if _com_enabled:
                 try:
                     self.write_log("Генерація договору через Word COM...")
-                    out_path = generate_contract_doc_windows_from_state(state, template_doc, out_doc, log_fn=self.write_log)
+                    out_path = generate_contract_doc_windows_from_state(
+                        state,
+                        template_doc,
+                        out_doc,
+                        log_fn=self.write_log,
+                        remove_shading=self.remove_field_shading.get(),
+                    )
                 except Exception as exc:
                     self.write_log(f"Word COM помилка: {exc} → перемикаюсь на режим без COM")
                     _com_enabled = False
@@ -3263,7 +3319,7 @@ class App:
                     template_doc,
                     out_doc,
                     log_fn=self.write_log,
-                    white_fill=self.fill_white_bg.get(),
+                    remove_shading=self.remove_field_shading.get(),
                 )
                 if non_com:
                     out_path = non_com
