@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import datetime as dt
+import logging
 import os
 import platform
 import subprocess
@@ -10,10 +11,12 @@ import shutil
 import sys
 import tempfile
 import traceback
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Dict, Tuple
 
 import xlrd
+import xlwt
 from xlutils.copy import copy as xl_copy
 
 try:
@@ -26,23 +29,34 @@ except Exception:  # pragma: no cover
     ttk = None
 
 IS_WINDOWS = platform.system().lower().startswith("win")
+APP_LOGGER = logging.getLogger("japan_moto")
+
+
+def configure_app_logging(log_dir: Path) -> Path:
+    """Configure rotating file logging once and return log file path."""
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "japan_moto.log"
+    if not APP_LOGGER.handlers:
+        APP_LOGGER.setLevel(logging.INFO)
+        APP_LOGGER.propagate = False
+        handler = RotatingFileHandler(str(log_path), maxBytes=1_000_000, backupCount=5, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        APP_LOGGER.addHandler(handler)
+    return log_path
+
+
+def _global_excepthook(exc_type, exc_value, exc_tb) -> None:
+    try:
+        APP_LOGGER.exception("Unhandled exception", exc_info=(exc_type, exc_value, exc_tb))
+    except Exception:
+        pass
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
 
 
 def detect_theme_mode() -> str:
-    """Return 'dark' or 'light' based on Windows registry preference."""
-    if IS_WINDOWS:
-        try:
-            import winreg  # type: ignore
-
-            key = winreg.OpenKey(
-                winreg.HKEY_CURRENT_USER,
-                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
-            )
-            apps_use_light, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
-            return "light" if int(apps_use_light) == 1 else "dark"
-        except Exception:
-            pass
-    return "light"
+    """Return 'dark' or 'light' based on local system time."""
+    hour = dt.datetime.now().hour
+    return "light" if 7 <= hour < 19 else "dark"
 
 
 def build_theme_palette(mode: str) -> Dict[str, str]:
@@ -535,7 +549,7 @@ def read_xls_cell(path: Path, sheet_name: str, addr: str):
     return sh.cell_value(r, c)
 
 
-def write_xls_cells(path: Path, sheet_name: str, updates: Dict[str, object], backup: bool = True) -> None:
+def write_xls_cells(path: Path, sheet_name: str, updates: Dict[str, object], backup: bool = True, force_a3_tnr12: bool = False) -> None:
     if backup:
         ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_path = path.with_name(f"{path.stem}_backup_{ts}{path.suffix}")
@@ -554,9 +568,14 @@ def write_xls_cells(path: Path, sheet_name: str, updates: Dict[str, object], bac
 
     ws = wb.get_sheet(sheet_idx)
     rs = rb.sheet_by_index(sheet_idx)
+    a3_style = xlwt.easyxf("font: name Times New Roman, height 240;") if force_a3_tnr12 else None
     for addr, value in updates.items():
         r, c = a1_to_rc(addr)
         orig_xf = rs.cell_xf_index(r, c)
+        if force_a3_tnr12 and addr.upper() == "A3" and a3_style is not None:
+            # Explicitly enforce Times New Roman 12 for Act number/date in A3.
+            ws.write(r, c, value, a3_style)
+            continue
         ws.write(r, c, value)
         # Restore original XF index so cell formatting (fonts, borders, etc.) is preserved
         row_obj = ws._Worksheet__rows.get(r)
@@ -1253,7 +1272,7 @@ def generate_act_xls_from_state(state: Dict[str, str], source_6055: Path, out_pa
     updates["D56"] = short_fio or short_name(full_fio)
     updates.pop("E15", None)  # E15 is app-internal; short name used only in D56
     updates["C43"] = updates.get("C39", "")  # C43 (Номер рами) деривується з VIN
-    write_xls_cells(out_path, "Worksheet", updates, backup=False)
+    write_xls_cells(out_path, "Worksheet", updates, backup=False, force_a3_tnr12=True)
     return out_path
 
 
@@ -1441,7 +1460,7 @@ def generate_contract_docx_fallback(state: Dict[str, str], out_path: Path) -> "P
     return out_docx
 
 
-def diagnose_word_template(template_path: Path) -> str:
+def diagnose_word_template(template_path: Path, allow_com: bool = True) -> str:
     """Inspect a Word template and return a diagnostic report (bookmarks, CCs, form fields, protection, macros)."""
     import re as _re
     lines: list = [f"Шаблон: {template_path.name}  ({template_path.suffix})"]
@@ -1494,7 +1513,7 @@ def diagnose_word_template(template_path: Path) -> str:
                 av = al.get(_W + "val", "") if al is not None else ""
                 lines.append(f"  SDT tag={tv!r} alias={av!r}")
             # bookmarks
-            bms = _d.element.xpath(".//w:bookmarkStart", namespaces={"w": _ns})
+            bms = list(_d.element.body.iter(_dqn("w:bookmarkStart")))
             bm_names = [b.get(_W + "name", "?") for b in bms if not (b.get(_W + "name", "") or "").startswith("_")]
             lines.append(f"Закладки (XML): {len(bm_names)} → {bm_names[:20]}")
             # FORMTEXT legacy fields (w:fldChar / w:ffData)
@@ -1533,7 +1552,7 @@ def diagnose_word_template(template_path: Path) -> str:
             pass
 
     # ── COM path (Windows only, works for .doc and .docx) ───────────────────
-    if IS_WINDOWS:
+    if IS_WINDOWS and allow_com:
         _com_word = None
         try:
             import win32com.client as _win32  # type: ignore
@@ -1590,6 +1609,8 @@ def diagnose_word_template(template_path: Path) -> str:
                     _com_word.Quit()
                 except Exception:
                     pass
+    elif IS_WINDOWS and not allow_com:
+        lines.append("COM діагностика пропущена: інтеграція Microsoft Office вимкнена в налаштуваннях")
 
     return "\n".join(lines)
 
@@ -2288,6 +2309,7 @@ class App:
         self.editor_path = tk.StringVar(value="")
         self.open_after_save = tk.BooleanVar(value=True)
         self.use_word_com = tk.BooleanVar(value=True)
+        self.contract_out_format = tk.StringVar(value="doc")
 
         self.state_vars: Dict[str, tk.StringVar] = {}
         self.widgets: Dict[str, tk.Entry] = {}
@@ -2324,6 +2346,14 @@ class App:
                 self.theme = build_theme_palette(_pref)
         self.open_after_save.set(_cfg.get("open_after_save", True))
         self.use_word_com.set(_cfg.get("use_word_com", True))
+        if _cfg.get("contract_out_format") in ("doc", "docx"):
+            self.contract_out_format.set(_cfg["contract_out_format"])
+
+        try:
+            self.app_log_path = configure_app_logging(Path(self.output_dir_var.get().strip() or str(self.out_dir)))
+            APP_LOGGER.info("=== Application started ===")
+        except Exception:
+            self.app_log_path = self.out_dir / "japan_moto.log"
 
         self._load_state_from_source()
         self._build_ui()
@@ -2675,6 +2705,19 @@ class App:
             fg=self.theme["label_fg"],
             selectcolor=self.theme["entry_bg"],
         ).grid(row=theme_row + 2, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 6))
+        tk.Label(
+            dialog,
+            text="Формат договору",
+            bg=self.theme["card_bg"],
+            fg=self.theme["label_fg"],
+        ).grid(row=theme_row + 3, column=0, sticky="w", padx=16, pady=(0, 6))
+        fmt_menu = tk.OptionMenu(dialog, self.contract_out_format, "doc", "docx")
+        fmt_menu.configure(bg=self.theme["btn_bg"], fg=self.theme["btn_fg"],
+                           activebackground=self.theme["header_active_bg"],
+                           activeforeground=self.theme["header_fg"],
+                           highlightthickness=0)
+        fmt_menu["menu"].configure(bg=self.theme["entry_bg"], fg=self.theme["entry_fg"])
+        fmt_menu.grid(row=theme_row + 3, column=1, sticky="w", pady=(0, 6))
         tk.Button(
             dialog,
             text="🔍 Аналізувати шаблон договору",
@@ -2683,7 +2726,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 3, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 8))
+        ).grid(row=theme_row + 4, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 8))
         tk.Button(
             dialog,
             text="📋 Журнал генерації",
@@ -2692,7 +2735,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 3, column=2, sticky="e", padx=16, pady=(0, 8))
+        ).grid(row=theme_row + 4, column=2, sticky="e", padx=16, pady=(0, 8))
         tk.Button(
             dialog,
             text="↺ Перезавантажити шаблон",
@@ -2701,7 +2744,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 4, column=0, sticky="w", padx=16, pady=8)
+        ).grid(row=theme_row + 5, column=0, sticky="w", padx=16, pady=8)
         tk.Button(
             dialog,
             text="Зберегти налаштування",
@@ -2710,7 +2753,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 4, column=1, sticky="w", pady=8)
+        ).grid(row=theme_row + 5, column=1, sticky="w", pady=8)
         tk.Button(
             dialog,
             text="Закрити",
@@ -2719,7 +2762,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 4, column=2, sticky="e", padx=12, pady=12)
+        ).grid(row=theme_row + 5, column=2, sticky="e", padx=12, pady=12)
         dialog.protocol("WM_DELETE_WINDOW", lambda: [self._save_settings(), dialog.destroy()])
 
         # Auto-fit height after all widgets are created
@@ -2736,8 +2779,10 @@ class App:
         """Open the contract template, inspect its structure and show a report."""
         tpl = Path(self.dogovir_path.get())
         self.write_log("Аналізую шаблон договору...")
+        if IS_WINDOWS and not self.use_word_com.get():
+            self.write_log("COM-діагностика вимкнена (галочка Microsoft Office знята)")
         try:
-            report = diagnose_word_template(tpl)
+            report = diagnose_word_template(tpl, allow_com=self.use_word_com.get())
         except Exception as exc:
             report = f"Помилка аналізу: {exc}"
         self.write_log("=== ДІАГНОСТИКА ШАБЛОНУ ===")
@@ -2883,9 +2928,15 @@ class App:
         self.refresh_validation(silent=True)
 
     def write_log(self, text: str) -> None:
-        self.log_lines.append(text)
+        stamp = dt.datetime.now().strftime("%H:%M:%S")
+        line = f"[{stamp}] {text}"
+        self.log_lines.append(line)
+        try:
+            APP_LOGGER.info(text)
+        except Exception:
+            pass
         if hasattr(self, "log"):
-            self.log.insert("end", text + "\n")
+            self.log.insert("end", line + "\n")
             self.log.see("end")
 
     def save_source_changes(self) -> None:
@@ -2912,6 +2963,7 @@ class App:
             "theme_pref": self.theme_pref.get(),
             "open_after_save": self.open_after_save.get(),
             "use_word_com": self.use_word_com.get(),
+            "contract_out_format": self.contract_out_format.get(),
         })
 
     def paste_from_clipboard(self) -> None:
@@ -2967,7 +3019,10 @@ class App:
             generate_act_xls_from_state(state, Path(self.source_path.get()), out_path)
         elif kind == "contract":
             template_doc = Path(self.dogovir_path.get())
-            out_doc = out_dir / f"Договір{num_part}{ts}.doc"
+            ext = self.contract_out_format.get().strip().lower()
+            if ext not in ("doc", "docx"):
+                ext = "doc"
+            out_doc = out_dir / f"Договір{num_part}{ts}.{ext}"
             out_path = out_doc
             _com_enabled = IS_WINDOWS and self.use_word_com.get()
             if _com_enabled:
@@ -3187,11 +3242,25 @@ def main() -> int:
         run_demo(app_dir, resource_dir)
         return 0
 
+    try:
+        configure_app_logging(default_output_dir(app_dir))
+    except Exception:
+        pass
+    sys.excepthook = _global_excepthook
+
     if tk is None:
         print("Tkinter is unavailable in this environment.")
         return 1
 
     root = tk.Tk()
+    def _tk_report_callback_exception(exc, val, tb):
+        try:
+            APP_LOGGER.exception("Tk callback exception", exc_info=(exc, val, tb))
+        except Exception:
+            pass
+        traceback.print_exception(exc, val, tb)
+
+    root.report_callback_exception = _tk_report_callback_exception
     App(root)
     root.mainloop()
     return 0
