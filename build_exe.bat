@@ -28,7 +28,6 @@ pyinstaller ^
   --collect-submodules win32com ^
   --collect-data win32com ^
   --add-data "6055.xls;." ^
-  --add-data "6055_MOTO_template.xls;." ^
   --add-data "DOGOVIR_6055_template.doc;." ^
   --add-data "vidatkova.xls;." ^
   %ICON_ARG% ^

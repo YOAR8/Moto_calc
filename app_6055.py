@@ -2309,7 +2309,7 @@ class App:
         self.theme = build_theme_palette(self.theme_mode)
 
         self.source_path = tk.StringVar(value=str(self.resource_dir / "6055.xls"))
-        self.moto_path = tk.StringVar(value=str(self.resource_dir / "6055_MOTO_template.xls"))
+        self.moto_path = tk.StringVar(value=str(self.resource_dir / "6055.xls"))
         self.dogovir_path = tk.StringVar(value=str(self.resource_dir / "DOGOVIR_6055_template.doc"))
         self.vidatkova_path = tk.StringVar(value=str(self.resource_dir / "vidatkova.xls"))
         self.output_dir_var = tk.StringVar(value=str(self.out_dir))
@@ -2629,7 +2629,7 @@ class App:
 
         rows = [
             ("6055.xls", self.source_path, True),
-            ("6055_MOTO_template.xls", self.moto_path, True),
+            ("6055.xls (шаблон акта)", self.moto_path, True),
             ("DOGOVIR_6055_template.doc", self.dogovir_path, True),
             ("vidatkova.xls", self.vidatkova_path, False),
             ("Output folder", tk.StringVar(value=str(self.out_dir)), False),
@@ -2642,7 +2642,7 @@ class App:
             ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=5)
             entry = ttk.Entry(parent, textvariable=var)
             entry.grid(row=row, column=1, sticky="ew", pady=5)
-            if label in {"6055.xls", "6055_MOTO_template.xls", "DOGOVIR_6055_template.doc", "vidatkova.xls", "Output folder", "Editor path"}:
+            if label in {"6055.xls", "6055.xls (шаблон акта)", "DOGOVIR_6055_template.doc", "vidatkova.xls", "Output folder", "Editor path"}:
                 ttk.Button(parent, text="Огляд", command=lambda v=var: self.browse_path(v)).grid(row=row, column=2, padx=(8, 0))
 
         ttk.Checkbutton(parent, text="Відкривати файл після генерації", variable=self.open_after_save).grid(row=6, column=0, columnspan=2, sticky="w", pady=(12, 0))
@@ -3425,7 +3425,7 @@ else:
 
 def run_demo(app_dir: Path, resource_dir: Path) -> None:
     source = app_dir / "6055.xls"
-    moto = resource_dir / "6055_MOTO_template.xls"
+    moto = resource_dir / "6055.xls"
     dog = resource_dir / "DOGOVIR_6055_template.doc"
 
     updates = {
