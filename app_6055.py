@@ -53,6 +53,14 @@ def _global_excepthook(exc_type, exc_value, exc_tb) -> None:
     sys.__excepthook__(exc_type, exc_value, exc_tb)
 
 
+# ─── UI font scale (set in main() from config before UI is created) ──────────
+_FONT_SCALE: float = 1.0
+
+def _fs(n: int) -> int:
+    """Return font size n scaled by _FONT_SCALE (min 8)."""
+    return max(8, round(n * _FONT_SCALE))
+
+
 def detect_theme_mode() -> str:
     """Return 'dark' or 'light' based on local system time."""
     hour = dt.datetime.now().hour
@@ -297,6 +305,14 @@ def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out
     shutil.copy2(template_docx, out_docx)
     doc = Document(str(out_docx))
 
+    # Strip Word-level editing protection so python-docx can fill fields.
+    try:
+        prot = doc.settings.element.find(_qn("w:documentProtection"))
+        if prot is not None:
+            doc.settings.element.remove(prot)
+    except Exception:
+        pass
+
     # Remove document protection so all fill strategies can write freely.
     # Templates protected for form-filling (AllowOnlyFormFields) block text
     # replacements via python-docx — unprotecting here fixes that.
@@ -483,21 +499,10 @@ def generate_contract_via_office_fallback(state: Dict[str, str], template_doc: P
             return None
         _log("Шаблон заповнено")
 
-        if out_path.suffix.lower() == ".doc":
-            _log("Конвертую .docx → .doc через LibreOffice")
-            converted_doc = _office_convert(filled, out_path.parent, "doc")
-            if not converted_doc:
-                return None
-            final_doc = out_path.with_suffix(".doc")
-            if converted_doc != final_doc:
-                try:
-                    if final_doc.exists():
-                        final_doc.unlink()
-                    converted_doc.rename(final_doc)
-                except Exception:
-                    return converted_doc
-            return final_doc
-
+        # Skip the .docx → .doc back-conversion to preserve formatting/pagination.
+        # LibreOffice font substitution during that step is what caused 2-page output
+        # on Windows Server 2019. Always return .docx from this path.
+        _log("Зберігаю як .docx (без зворотної конвертації LibreOffice)")
         final_docx = out_path.with_suffix(".docx")
         shutil.copy2(filled, final_docx)
         return final_docx
@@ -514,16 +519,8 @@ def generate_contract_non_com(state: Dict[str, str], template_path: Path, out_pa
         filled = _fill_docx_contract_template(state, template_path, out_docx, log_fn=log_fn, remove_shading=remove_shading)
         if not filled:
             return None
-        # Optionally convert to .doc if output extension requested
-        if out_path.suffix.lower() == ".doc":
-            doc_result = _office_convert(filled, out_path.parent, "doc")
-            if doc_result:
-                try:
-                    filled.unlink()
-                except Exception:
-                    pass
-                return doc_result
-        return filled  # keep .docx — looks identical to original template
+        # Keep as .docx — no LibreOffice back-conversion to preserve 1:1 formatting.
+        return filled
     # .doc template — use LibreOffice conversion workflow
     return generate_contract_via_office_fallback(state, template_path, out_path, log_fn=log_fn, remove_shading=remove_shading)
 
@@ -2063,7 +2060,7 @@ class SmartEntry(tk.Frame if tk is not None else object):
         self._text = tk.Text(
             self, height=1, wrap="word", relief="flat", bd=0,
             bg=bg, fg=fg, insertbackground=insert_fg,
-            font=("Segoe UI", 12), padx=4, pady=2, undo=True,
+            font=("Segoe UI", _fs(12)), padx=4, pady=2, undo=True,
         )
         self._text.grid(row=0, column=0, sticky="ew")
 
@@ -2152,7 +2149,7 @@ class SmartEntry(tk.Frame if tk is not None else object):
                 self._popup, relief="solid", bd=1,
                 selectbackground=self._popup_select_bg,
                 selectforeground=self._popup_select_fg,
-                font=("Segoe UI", 10), activestyle="none",
+                font=("Segoe UI", _fs(10)), activestyle="none",
             )
             self._lb.pack(fill="both", expand=True)
             self._lb.bind("<ButtonRelease-1>",
@@ -2316,7 +2313,7 @@ class AutocompleteEntry(tk.Entry if tk is not None else object):
                 bd=1,
                 selectbackground="#e07b39",
                 selectforeground="white",
-                font=("Segoe UI", 10),
+                font=("Segoe UI", _fs(10)),
                 activestyle="none",
             )
             self._lb.pack(fill="both", expand=True)
@@ -2420,6 +2417,7 @@ class App:
         self.contract_out_format = tk.StringVar(value="doc")
         self.act_out_format = tk.StringVar(value="xls")
         self.vidatkova_out_format = tk.StringVar(value="xls")
+        self.ui_scale_var = tk.StringVar(value="1.0")
 
         self.state_vars: Dict[str, tk.StringVar] = {}
         self.widgets: Dict[str, tk.Entry] = {}
@@ -2463,6 +2461,9 @@ class App:
             self.act_out_format.set(_cfg["act_out_format"])
         if _cfg.get("vidatkova_out_format") in ("xls", "xlsx"):
             self.vidatkova_out_format.set(_cfg["vidatkova_out_format"])
+        _ui_scale_cfg = str(_cfg.get("ui_scale", "1.0"))
+        if _ui_scale_cfg in ("0.85", "1.0", "1.15", "1.3"):
+            self.ui_scale_var.set(_ui_scale_cfg)
 
         try:
             self.app_log_path = configure_app_logging(Path(self.output_dir_var.get().strip() or str(self.out_dir)))
@@ -2510,8 +2511,8 @@ class App:
 
         title_frame = tk.Frame(header, bg=self.theme["header_bg"])
         title_frame.grid(row=0, column=0, sticky="w")
-        tk.Label(title_frame, text="Japan moto", fg=self.theme["header_fg"], bg=self.theme["header_bg"], font=("Segoe UI", 21, "bold")).pack(anchor="w")
-        tk.Label(title_frame, text="Один екран для акта, договору та видаткової", fg=self.theme["header_sub_fg"], bg=self.theme["header_bg"], font=("Segoe UI", 10)).pack(anchor="w")
+        tk.Label(title_frame, text="Japan moto", fg=self.theme["header_fg"], bg=self.theme["header_bg"], font=("Segoe UI", _fs(21), "bold")).pack(anchor="w")
+        tk.Label(title_frame, text="Один екран для акта, договору та видаткової", fg=self.theme["header_sub_fg"], bg=self.theme["header_bg"], font=("Segoe UI", _fs(10))).pack(anchor="w")
 
         toolbar = tk.Frame(header, bg=self.theme["header_bg"])
         toolbar.grid(row=0, column=1, sticky="e")
@@ -2528,7 +2529,7 @@ class App:
             header, text="⚙", command=self.open_settings_dialog,
             bg=self.theme["header_bg"], fg=self.theme["header_muted_fg"], activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"], bd=0, relief="flat",
-            font=("Segoe UI", 16), padx=8, pady=4, cursor="hand2",
+            font=("Segoe UI", _fs(16)), padx=8, pady=4, cursor="hand2",
         )
         gear_btn.grid(row=0, column=2, sticky="ne", padx=(0, 4), pady=2)
 
@@ -2579,6 +2580,7 @@ class App:
             padx=12,
             pady=5,
             cursor="hand2",
+            font=("Segoe UI", _fs(10)),
         )
         button.grid(row=0, column=column, padx=(0, 6), sticky="e")
 
@@ -2690,7 +2692,7 @@ class App:
         row_offset = 0
         if group_name:
             tk.Label(parent, text=group_name, bg=self.theme["card_bg"], fg=self.theme["section_fg"],
-                     font=("Segoe UI", 14, "bold")).grid(
+                     font=("Segoe UI", _fs(14), "bold")).grid(
                          row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
             row_offset = 1
         for row, (cell, label, required) in enumerate(fields):
@@ -2780,7 +2782,7 @@ class App:
         tk.Label(
             dialog,
             text="Параметри шаблонів",
-            font=("Segoe UI", 16, "bold"),
+            font=("Segoe UI", _fs(16), "bold"),
             bg=self.theme["card_bg"],
             fg=self.theme["label_fg"],
         ).grid(row=0, column=0, columnspan=3, sticky="w", padx=16, pady=(14, 8))
@@ -2789,12 +2791,14 @@ class App:
             tk.Entry(dialog, textvariable=var, bg=self.theme["entry_bg"], fg=self.theme["entry_fg"], insertbackground=self.theme["entry_insert"]).grid(row=row, column=1, sticky="ew", pady=6)
             tk.Button(
                 dialog,
-                text="Огляд",
+                text="📂 Огляд",
                 command=lambda v=var: self.browse_path(v),
-                bg=self.theme["btn_bg"],
-                fg=self.theme["btn_fg"],
-                activebackground=self.theme["header_active_bg"],
-                activeforeground=self.theme["header_fg"],
+                bg="#0f766e",
+                fg="white",
+                activebackground="#0d9488",
+                activeforeground="white",
+                relief="flat",
+                cursor="hand2",
             ).grid(row=row, column=2, padx=12)
 
         theme_row = len(fields) + 1
@@ -2878,6 +2882,32 @@ class App:
                                highlightthickness=0)
         vid_fmt_menu["menu"].configure(bg=self.theme["entry_bg"], fg=self.theme["entry_fg"])
         vid_fmt_menu.grid(row=theme_row + 6, column=1, sticky="w", pady=(0, 6))
+        tk.Label(
+            dialog,
+            text="Масштаб інтерфейсу",
+            bg=self.theme["card_bg"],
+            fg=self.theme["label_fg"],
+        ).grid(row=theme_row + 7, column=0, sticky="w", padx=16, pady=(0, 6))
+        _scale_labels = {"0.85": "85%", "1.0": "100%", "1.15": "115%", "1.3": "130%"}
+        scale_frame = tk.Frame(dialog, bg=self.theme["card_bg"])
+        scale_frame.grid(row=theme_row + 7, column=1, columnspan=2, sticky="w", pady=(0, 6))
+        scale_menu = tk.OptionMenu(scale_frame, self.ui_scale_var,
+                                   *_scale_labels.keys(),
+                                   command=lambda _: None)
+        scale_menu.configure(bg=self.theme["btn_bg"], fg=self.theme["btn_fg"],
+                             activebackground=self.theme["header_active_bg"],
+                             activeforeground=self.theme["header_fg"],
+                             highlightthickness=0)
+        scale_menu["menu"].configure(bg=self.theme["entry_bg"], fg=self.theme["entry_fg"])
+        # Display readable labels
+        scale_menu["menu"].delete(0, "end")
+        for val, lbl in _scale_labels.items():
+            scale_menu["menu"].add_command(
+                label=lbl,
+                command=lambda v=val: self.ui_scale_var.set(v))
+        scale_menu.pack(side="left")
+        tk.Label(scale_frame, text="⚠ Набирає чинності після перезапуску",
+                 bg=self.theme["card_bg"], fg="#f59e0b").pack(side="left", padx=8)
         tk.Button(
             dialog,
             text="🔍 Аналізувати шаблон договору",
@@ -2886,7 +2916,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 7, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 8))
+        ).grid(row=theme_row + 8, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 8))
         tk.Button(
             dialog,
             text="📋 Журнал генерації",
@@ -2895,7 +2925,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 7, column=2, sticky="e", padx=16, pady=(0, 8))
+        ).grid(row=theme_row + 8, column=2, sticky="e", padx=16, pady=(0, 8))
         tk.Button(
             dialog,
             text="↺ Перезавантажити шаблон",
@@ -2904,7 +2934,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 8, column=0, sticky="w", padx=16, pady=8)
+        ).grid(row=theme_row + 9, column=0, sticky="w", padx=16, pady=8)
         tk.Button(
             dialog,
             text="Зберегти налаштування",
@@ -2913,7 +2943,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 8, column=1, sticky="w", pady=8)
+        ).grid(row=theme_row + 9, column=1, sticky="w", pady=8)
         tk.Button(
             dialog,
             text="Закрити",
@@ -2922,7 +2952,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 8, column=2, sticky="e", padx=12, pady=12)
+        ).grid(row=theme_row + 9, column=2, sticky="e", padx=12, pady=12)
         dialog.protocol("WM_DELETE_WINDOW", lambda: [self._save_settings(), dialog.destroy()])
 
         # Auto-fit height after all widgets are created
@@ -2955,7 +2985,7 @@ class App:
         win.configure(bg=self.theme["card_bg"])
         win.geometry("720x520")
         txt = tk.Text(win, wrap="word", bg=self.theme["entry_bg"], fg=self.theme["entry_fg"],
-                      font=("Consolas", 12), relief="flat", padx=8, pady=8)
+                      font=("Consolas", _fs(12)), relief="flat", padx=8, pady=8)
         sb = tk.Scrollbar(win, command=txt.yview)
         txt.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
@@ -2973,7 +3003,7 @@ class App:
         win.geometry("820x560")
         win.transient(parent_dialog or self.root)
         txt = tk.Text(win, wrap="word", bg=self.theme["entry_bg"], fg=self.theme["entry_fg"],
-                      font=("Consolas", 12), relief="flat", padx=8, pady=8)
+                      font=("Consolas", _fs(12)), relief="flat", padx=8, pady=8)
         sb = tk.Scrollbar(win, command=txt.yview)
         txt.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
@@ -3004,7 +3034,7 @@ class App:
         tk.Label(
             win,
             text="Всі данні",
-            font=("Segoe UI", 16, "bold"),
+            font=("Segoe UI", _fs(16), "bold"),
             bg=self.theme["card_bg"],
             fg=self.theme["label_fg"],
             anchor="w",
@@ -3246,6 +3276,7 @@ class App:
             "contract_out_format": self.contract_out_format.get(),
             "act_out_format": self.act_out_format.get(),
             "vidatkova_out_format": self.vidatkova_out_format.get(),
+            "ui_scale": self.ui_scale_var.get(),
         })
 
     def paste_from_clipboard(self) -> None:
@@ -3296,7 +3327,7 @@ class App:
         out_dir = output_dir or self._ensure_output_dir()
         ts = f"_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}" if use_timestamp else ""
         doc_num = contract_number_for_filename(payload.get("Number", ""))
-        num_part = f" {doc_num}" if doc_num else ""
+        num_part = f" №{doc_num}" if doc_num else ""
 
         if kind == "act":
             act_ext = self.act_out_format.get().strip().lower()
@@ -3411,7 +3442,7 @@ class App:
             text="⚠  Документ містить незаповнені або помилкові поля:",
             bg=self.theme["card_bg"],
             fg=self.theme["warn_fg"],
-            font=("Segoe UI", 12, "bold"),
+            font=("Segoe UI", _fs(12), "bold"),
             anchor="w",
         ).pack(fill="x", padx=16, pady=(14, 4))
 
@@ -3422,7 +3453,7 @@ class App:
             bg=self.theme["entry_bg"],
             fg=self.theme["entry_fg"],
             relief="flat",
-            font=("Segoe UI", 10),
+            font=("Segoe UI", _fs(10)),
             padx=8,
             pady=6,
         )
@@ -3436,7 +3467,7 @@ class App:
             text="Можна згенерувати документи зараз і заповнити поля вручну пізніше.",
             bg=self.theme["card_bg"],
             fg=self.theme["label_fg"],
-            font=("Segoe UI", 10),
+            font=("Segoe UI", _fs(10)),
             anchor="w",
             wraplength=460,
         ).pack(fill="x", padx=16, pady=(0, 10))
@@ -3461,7 +3492,7 @@ class App:
             fg="#ffffff",
             activebackground="#92400e",
             activeforeground="#ffffff",
-            font=("Segoe UI", 10, "bold"),
+            font=("Segoe UI", _fs(10), "bold"),
             padx=12,
             pady=4,
             relief="flat",
@@ -3514,7 +3545,9 @@ class App:
             self.save_draft("vidatkova", open_after=False, output_dir=case_dir, use_timestamp=False, allow_incomplete=allow_incomplete)
             transit_num = contract_number_for_filename(payload.get("Number", ""))
             transit_name = f"Номери транзиту №{transit_num}.txt" if transit_num else "Номери транзиту.txt"
-            transit_path = case_dir / transit_name
+            transit_dir = runtime_app_dir() / "Транзит"
+            transit_dir.mkdir(parents=True, exist_ok=True)
+            transit_path = transit_dir / transit_name
             transit_path.write_text(transit_summary_text(payload), encoding="utf-8")
             self.status_var.set(f"Усі документи збережено у {case_dir.name}")
             self.write_log(f"Усі документи збережено у {case_dir}")
@@ -3551,15 +3584,15 @@ if tk is not None:
             header = tk.Frame(self, bg="#0f766e", padx=14, pady=12)
             header.grid(row=0, column=0, sticky="ew")
             header.columnconfigure(0, weight=1)
-            tk.Label(header, text=self._title(), fg="white", bg="#0f766e", font=("Segoe UI", 17, "bold")).grid(row=0, column=0, sticky="w")
-            tk.Label(header, text="Файл відкрито у системній програмі. Перевірте і збережіть.", fg="#ccfbf1", bg="#0f766e", font=("Segoe UI", 10)).grid(row=1, column=0, sticky="w")
+            tk.Label(header, text=self._title(), fg="white", bg="#0f766e", font=("Segoe UI", _fs(17), "bold")).grid(row=0, column=0, sticky="w")
+            tk.Label(header, text="Файл відкрито у системній програмі. Перевірте і збережіть.", fg="#ccfbf1", bg="#0f766e", font=("Segoe UI", _fs(10))).grid(row=1, column=0, sticky="w")
 
             body = tk.Frame(self, bg="#f4efe7", padx=16, pady=14)
             body.grid(row=1, column=0, sticky="ew")
             body.columnconfigure(0, weight=1)
             self.status_lbl = tk.Label(body, text="Генерація файлу...", bg="#f4efe7", fg="#374151", anchor="w", wraplength=600)
             self.status_lbl.grid(row=0, column=0, sticky="ew")
-            self.path_lbl = tk.Label(body, text="", bg="#f4efe7", fg="#6b7280", anchor="w", wraplength=600, font=("Segoe UI", 10))
+            self.path_lbl = tk.Label(body, text="", bg="#f4efe7", fg="#6b7280", anchor="w", wraplength=600, font=("Segoe UI", _fs(10)))
             self.path_lbl.grid(row=1, column=0, sticky="ew", pady=(4, 0))
 
             actions = tk.Frame(self, bg="#f4efe7", padx=16, pady=12)
@@ -3610,7 +3643,7 @@ if tk is not None:
             case_dir = base_out_dir / build_case_folder_name(state)
             payload_s = parse_state(state)
             doc_num_s = contract_number_for_filename(payload_s.get("Number", ""))
-            num_part_s = f" {doc_num_s}" if doc_num_s else ""
+            num_part_s = f" №{doc_num_s}" if doc_num_s else ""
             _stem_map = {"act": "Акт", "contract": "Договір", "vidatkova": "Видаткова"}
             dest_name = _stem_map.get(self.kind, self._temp_path.stem) + num_part_s + self._temp_path.suffix
             dest = case_dir / dest_name
@@ -3656,17 +3689,17 @@ if tk is not None:
             hdr = tk.Frame(self, bg=t["header_bg"], padx=14, pady=12)
             hdr.pack(fill="x")
             tk.Label(hdr, text="Japan moto", fg=t["header_fg"], bg=t["header_bg"],
-                     font=("Segoe UI", 21, "bold")).pack(anchor="w")
+                     font=("Segoe UI", _fs(21), "bold")).pack(anchor="w")
             tk.Label(hdr, text="Крок 1 з 2 — оберіть завантажений акт МВС",
                      fg=t["header_sub_fg"], bg=t["header_bg"],
-                     font=("Segoe UI", 10)).pack(anchor="w")
+                     font=("Segoe UI", _fs(10))).pack(anchor="w")
 
             body = tk.Frame(self, bg=t["card_bg"], padx=20, pady=18)
             body.pack(fill="both", expand=True, padx=12, pady=12)
             body.columnconfigure(0, weight=1)
 
             tk.Label(body, text="Файл акта (XLS):", bg=t["card_bg"],
-                     fg=t["label_fg"], font=("Segoe UI", 10)).grid(
+                     fg=t["label_fg"], font=("Segoe UI", _fs(10))).grid(
                 row=0, column=0, sticky="w", pady=(0, 6))
 
             fr = tk.Frame(body, bg=t["card_bg"])
@@ -3676,17 +3709,19 @@ if tk is not None:
             self._file_var = tk.StringVar(value=self.app.source_path.get())
             tk.Entry(fr, textvariable=self._file_var, bg=t["entry_bg"], fg=t["entry_fg"],
                      insertbackground=t["entry_insert"], relief="flat",
-                     highlightthickness=1, bd=0, font=("Segoe UI", 10)).grid(
+                     highlightthickness=1, bd=0, font=("Segoe UI", _fs(10))).grid(
                 row=0, column=0, sticky="ew", ipady=4)
-            tk.Button(fr, text="Огляд…", command=self._browse, bg=t["btn_bg"],
-                      fg=t["btn_fg"], relief="flat", padx=12, pady=5,
-                      cursor="hand2", font=("Segoe UI", 10)).grid(
+            tk.Button(fr, text="📂 Огляд", command=self._browse,
+                      bg="#0f766e", fg="white",
+                      activebackground="#0d9488", activeforeground="white",
+                      relief="flat", padx=12, pady=5,
+                      cursor="hand2", font=("Segoe UI", _fs(10))).grid(
                 row=0, column=1, padx=(8, 0))
 
             tk.Button(body, text="Далі →", command=self._on_next,
                       bg="#0f766e", fg="white", activebackground="#0d6960",
                       activeforeground="white", relief="flat",
-                      font=("Segoe UI", 10, "bold"), padx=20, pady=6,
+                      font=("Segoe UI", _fs(10), "bold"), padx=20, pady=6,
                       cursor="hand2").grid(row=2, column=0, sticky="e")
 
         def _browse(self) -> None:
@@ -3735,18 +3770,18 @@ if tk is not None:
             info = tk.Frame(hdr, bg=t["header_bg"])
             info.grid(row=0, column=0, sticky="w")
             tk.Label(info, text="Japan moto", fg=t["header_fg"], bg=t["header_bg"],
-                     font=("Segoe UI", 21, "bold")).pack(anchor="w")
+                     font=("Segoe UI", _fs(21), "bold")).pack(anchor="w")
             src_name = Path(self.app.source_path.get()).name
             tk.Label(info, text=f"Крок 2 з 2 — {src_name}",
                      fg=t["header_sub_fg"], bg=t["header_bg"],
-                     font=("Segoe UI", 10)).pack(anchor="w")
+                     font=("Segoe UI", _fs(10))).pack(anchor="w")
 
             tk.Button(
                 hdr, text="⚙", command=self._open_full_form,
                 bg=t["header_bg"], fg=t["header_muted_fg"],
                 activebackground=t["header_active_bg"],
                 activeforeground=t["header_fg"],
-                bd=0, relief="flat", font=("Segoe UI", 16),
+                bd=0, relief="flat", font=("Segoe UI", _fs(16)),
                 padx=8, pady=4, cursor="hand2",
             ).grid(row=0, column=1, sticky="ne")
 
@@ -3755,7 +3790,7 @@ if tk is not None:
             body.columnconfigure(1, weight=1)
 
             tk.Label(body, text="Основна інформація", bg=t["card_bg"],
-                     fg=t["section_fg"], font=("Segoe UI", 14, "bold")).grid(
+                     fg=t["section_fg"], font=("Segoe UI", _fs(14), "bold")).grid(
                 row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
             for i, (cell, label) in enumerate([
@@ -3764,13 +3799,13 @@ if tk is not None:
                 ("C50", "Номер транзиту"),
             ]):
                 tk.Label(body, text=label, bg=t["card_bg"], fg=t["label_fg"],
-                         anchor="w", font=("Segoe UI", 10)).grid(
+                         anchor="w", font=("Segoe UI", _fs(10))).grid(
                     row=i + 1, column=0, sticky="w", padx=(0, 14), pady=6)
                 tk.Entry(body, textvariable=self.app.state_vars[cell],
                          bg=t["entry_bg"], fg=t["entry_fg"],
                          insertbackground=t["entry_insert"], relief="flat",
                          highlightthickness=1, bd=0,
-                         font=("Segoe UI", 10)).grid(
+                         font=("Segoe UI", _fs(10))).grid(
                     row=i + 1, column=1, sticky="ew", pady=6, ipady=4)
 
             btn_row = tk.Frame(self, bg=t["root_bg"])
@@ -3778,11 +3813,11 @@ if tk is not None:
             tk.Button(btn_row, text="← Назад", command=self._show_step1,
                       bg=t["btn_bg"], fg=t["btn_fg"], relief="flat",
                       padx=12, pady=6, cursor="hand2",
-                      font=("Segoe UI", 10)).pack(side="left")
+                      font=("Segoe UI", _fs(10))).pack(side="left")
             tk.Button(btn_row, text="⟲ Генерувати всі документи",
                       command=self._on_generate, bg="#0f766e", fg="white",
                       activebackground="#0d6960", activeforeground="white",
-                      relief="flat", font=("Segoe UI", 10, "bold"),
+                      relief="flat", font=("Segoe UI", _fs(10), "bold"),
                       padx=20, pady=6, cursor="hand2").pack(side="right")
 
         def _open_full_form(self) -> None:
@@ -3815,9 +3850,11 @@ if tk is not None:
                 self.app.save_draft("vidatkova", open_after=False, output_dir=src_dir,
                                     use_timestamp=False, allow_incomplete=True)
                 doc_num = contract_number_for_filename(payload.get("Number", ""))
-                transit_name = (f"Номери транзиту {doc_num}.txt" if doc_num
+                transit_name = (f"Номери транзиту №{doc_num}.txt" if doc_num
                                 else "Номери транзиту.txt")
-                (src_dir / transit_name).write_text(
+                transit_dir = runtime_app_dir() / "Транзит"
+                transit_dir.mkdir(parents=True, exist_ok=True)
+                (transit_dir / transit_name).write_text(
                     transit_summary_text(payload), encoding="utf-8")
                 messagebox.showinfo("Готово ✓", f"Документи збережено:\n{src_dir}",
                                     parent=self)
@@ -3890,6 +3927,12 @@ def main() -> int:
     if tk is None:
         print("Tkinter is unavailable in this environment.")
         return 1
+
+    global _FONT_SCALE
+    _cfg_early = load_app_config()
+    _scale_str = str(_cfg_early.get("ui_scale", "1.0"))
+    if _scale_str in ("0.85", "1.0", "1.15", "1.3"):
+        _FONT_SCALE = float(_scale_str)
 
     root = tk.Tk()
     root.withdraw()  # Hidden until the wizard hands control to the full form.
