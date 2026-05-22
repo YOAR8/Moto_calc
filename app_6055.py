@@ -601,7 +601,10 @@ def write_xls_cells(path: Path, sheet_name: str, updates: Dict[str, object], bac
     a3_style = xlwt.easyxf("font: name Times New Roman, height 200;") if force_a3_tnr10 else None
     for addr, value in updates.items():
         r, c = a1_to_rc(addr)
-        orig_xf = rs.cell_xf_index(r, c)
+        try:
+            orig_xf = rs.cell_xf_index(r, c)
+        except Exception:
+            orig_xf = 0
         if force_a3_tnr10 and addr.upper() == "A3" and a3_style is not None:
             # Explicitly enforce Times New Roman 10 for Act number/date in A3.
             ws.write(r, c, value, a3_style)
@@ -2060,7 +2063,7 @@ class SmartEntry(tk.Frame if tk is not None else object):
         self._text = tk.Text(
             self, height=1, wrap="word", relief="flat", bd=0,
             bg=bg, fg=fg, insertbackground=insert_fg,
-            font=("Segoe UI", 10), padx=4, pady=2, undo=True,
+            font=("Segoe UI", 12), padx=4, pady=2, undo=True,
         )
         self._text.grid(row=0, column=0, sticky="ew")
 
@@ -2149,7 +2152,7 @@ class SmartEntry(tk.Frame if tk is not None else object):
                 self._popup, relief="solid", bd=1,
                 selectbackground=self._popup_select_bg,
                 selectforeground=self._popup_select_fg,
-                font=("Segoe UI", 9), activestyle="none",
+                font=("Segoe UI", 10), activestyle="none",
             )
             self._lb.pack(fill="both", expand=True)
             self._lb.bind("<ButtonRelease-1>",
@@ -2313,7 +2316,7 @@ class AutocompleteEntry(tk.Entry if tk is not None else object):
                 bd=1,
                 selectbackground="#e07b39",
                 selectforeground="white",
-                font=("Segoe UI", 9),
+                font=("Segoe UI", 10),
                 activestyle="none",
             )
             self._lb.pack(fill="both", expand=True)
@@ -2495,9 +2498,8 @@ class App:
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(1, weight=0)
-        self.root.rowconfigure(2, weight=1)
-        self.root.rowconfigure(3, weight=0)
+        self.root.rowconfigure(1, weight=1)
+        self.root.rowconfigure(2, weight=0)
         self.root.configure(bg=self.theme["root_bg"])
 
         header = tk.Frame(self.root, bg=self.theme["header_bg"], padx=10, pady=8)
@@ -2508,8 +2510,8 @@ class App:
 
         title_frame = tk.Frame(header, bg=self.theme["header_bg"])
         title_frame.grid(row=0, column=0, sticky="w")
-        tk.Label(title_frame, text="Japan moto", fg=self.theme["header_fg"], bg=self.theme["header_bg"], font=("Segoe UI", 18, "bold")).pack(anchor="w")
-        tk.Label(title_frame, text="Один екран для акта, договору та видаткової", fg=self.theme["header_sub_fg"], bg=self.theme["header_bg"], font=("Segoe UI", 9)).pack(anchor="w")
+        tk.Label(title_frame, text="Japan moto", fg=self.theme["header_fg"], bg=self.theme["header_bg"], font=("Segoe UI", 21, "bold")).pack(anchor="w")
+        tk.Label(title_frame, text="Один екран для акта, договору та видаткової", fg=self.theme["header_sub_fg"], bg=self.theme["header_bg"], font=("Segoe UI", 10)).pack(anchor="w")
 
         toolbar = tk.Frame(header, bg=self.theme["header_bg"])
         toolbar.grid(row=0, column=1, sticky="e")
@@ -2518,32 +2520,26 @@ class App:
         self._make_toolbar_button(toolbar, "Договір", lambda: self.open_draft("contract"), 1)
         self._make_toolbar_button(toolbar, "Видаткова", lambda: self.open_draft("vidatkova"), 2)
         self._make_toolbar_button(toolbar, "↺ Відновити з файлу", self.reload_source, 3)
-        self._make_toolbar_button(toolbar, "📋 Всі данні", self.open_all_data_dialog, 4)
-        self._make_toolbar_button(toolbar, "✖ Очистити", self.clear_form, 5)
-        self._make_toolbar_button(toolbar, "⟲ Генерувати", self.generate_all, 6)
-        self._make_toolbar_button(toolbar, "↓ Вставити", self.paste_from_clipboard, 7)
+        self._make_toolbar_button(toolbar, "✖ Очистити", self.clear_form, 4)
+        self._make_toolbar_button(toolbar, "⟲ Генерувати", self.generate_all, 5)
+        self._make_toolbar_button(toolbar, "↓ Вставити", self.paste_from_clipboard, 6)
 
         gear_btn = tk.Button(
             header, text="⚙", command=self.open_settings_dialog,
             bg=self.theme["header_bg"], fg=self.theme["header_muted_fg"], activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"], bd=0, relief="flat",
-            font=("Segoe UI", 14), padx=8, pady=4, cursor="hand2",
+            font=("Segoe UI", 16), padx=8, pady=4, cursor="hand2",
         )
         gear_btn.grid(row=0, column=2, sticky="ne", padx=(0, 4), pady=2)
 
-        quick = tk.Frame(self.root, bg=self.theme["surface_bg"])
-        quick.grid(row=1, column=0, sticky="ew", padx=12, pady=(12, 0))
-        quick.columnconfigure(0, weight=1)
-        self._build_quick_panel(quick)
-
         main = tk.Frame(self.root, bg=self.theme["surface_bg"])
-        main.grid(row=2, column=0, sticky="nsew", padx=12, pady=12)
+        main.grid(row=1, column=0, sticky="nsew", padx=12, pady=12)
         main.columnconfigure(0, weight=1)
         main.rowconfigure(0, weight=1)
         self._build_data_tab(main)
 
         bottom = tk.Frame(self.root, bg=self.theme["status_bg"], padx=12, pady=6)
-        bottom.grid(row=3, column=0, sticky="ew")
+        bottom.grid(row=2, column=0, sticky="ew")
         bottom.columnconfigure(0, weight=1)
         bottom.columnconfigure(1, weight=1)
         bottom.columnconfigure(2, weight=1)
@@ -2580,65 +2576,11 @@ class App:
             activeforeground=self.theme["header_fg"],
             bd=0,
             relief="flat",
-            padx=10,
-            pady=4,
-            cursor="hand2",
-        )
-        button.grid(row=0, column=column, padx=(0, 6), sticky="e")
-
-    def _make_action_button(self, parent, text: str, command, column: int, row: int) -> None:
-        button = tk.Button(
-            parent,
-            text=text,
-            command=command,
-            bg=self.theme["btn_bg"],
-            fg=self.theme["btn_fg"],
-            activebackground=self.theme["header_active_bg"],
-            activeforeground=self.theme["header_fg"],
-            bd=0,
-            relief="flat",
             padx=12,
             pady=5,
             cursor="hand2",
         )
-        button.grid(row=row, column=column, padx=(0, 8), pady=4, sticky="w")
-
-    def _build_quick_panel(self, parent: tk.Frame) -> None:
-        panel = tk.Frame(
-            parent,
-            bg=self.theme["card_bg"],
-            highlightbackground=self.theme["card_border"],
-            highlightthickness=1,
-            padx=14,
-            pady=12,
-        )
-        panel.grid(row=0, column=0, sticky="ew")
-        panel.columnconfigure(0, weight=2)
-        panel.columnconfigure(1, weight=1)
-
-        left = tk.Frame(panel, bg=self.theme["card_bg"])
-        left.grid(row=0, column=0, sticky="ew")
-        left.columnconfigure(1, weight=1)
-
-        tk.Label(left, text="Швидкий старт", bg=self.theme["card_bg"], fg=self.theme["section_fg"], font=("Segoe UI", 12, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
-        tk.Label(left, text="Номер акта", bg=self.theme["card_bg"], fg=self.theme["label_fg"], anchor="w").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=4)
-        tk.Entry(left, textvariable=self.state_vars["A3"], bg=self.theme["entry_bg"], fg=self.theme["entry_fg"], insertbackground=self.theme["entry_insert"], relief="flat", highlightthickness=1, bd=0).grid(row=1, column=1, sticky="ew", pady=4)
-        tk.Label(left, text="Дата народження клієнта", bg=self.theme["card_bg"], fg=self.theme["label_fg"], anchor="w").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=4)
-        tk.Entry(left, textvariable=self.state_vars["C12"], bg=self.theme["entry_bg"], fg=self.theme["entry_fg"], insertbackground=self.theme["entry_insert"], relief="flat", highlightthickness=1, bd=0).grid(row=2, column=1, sticky="ew", pady=4)
-        tk.Label(left, text="Номер транзиту", bg=self.theme["card_bg"], fg=self.theme["label_fg"], anchor="w").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=4)
-        tk.Entry(left, textvariable=self.state_vars["C50"], bg=self.theme["entry_bg"], fg=self.theme["entry_fg"], insertbackground=self.theme["entry_insert"], relief="flat", highlightthickness=1, bd=0).grid(row=3, column=1, sticky="ew", pady=4)
-
-        actions = tk.Frame(panel, bg=self.theme["card_bg"])
-        actions.grid(row=0, column=1, sticky="ne", padx=(16, 0))
-        tk.Label(actions, text="Дії", bg=self.theme["card_bg"], fg=self.theme["section_fg"], font=("Segoe UI", 12, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
-        self._make_action_button(actions, "Акт", lambda: self.open_draft("act"), 0, 1)
-        self._make_action_button(actions, "Договір", lambda: self.open_draft("contract"), 1, 1)
-        self._make_action_button(actions, "Видаткова", lambda: self.open_draft("vidatkova"), 0, 2)
-        self._make_action_button(actions, "Генерувати", self.generate_all, 1, 2)
-        self._make_action_button(actions, "Всі данні", self.open_all_data_dialog, 0, 3)
-        self._make_action_button(actions, "Очистити", self.clear_form, 1, 3)
-        self._make_action_button(actions, "Відновити", self.reload_source, 0, 4)
-        self._make_action_button(actions, "Вставити", self.paste_from_clipboard, 1, 4)
+        button.grid(row=0, column=column, padx=(0, 6), sticky="e")
 
     def _add_copy_paste_menu(self, entry) -> None:
         if isinstance(entry, SmartEntry):
@@ -2748,7 +2690,7 @@ class App:
         row_offset = 0
         if group_name:
             tk.Label(parent, text=group_name, bg=self.theme["card_bg"], fg=self.theme["section_fg"],
-                     font=("Segoe UI", 12, "bold")).grid(
+                     font=("Segoe UI", 14, "bold")).grid(
                          row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
             row_offset = 1
         for row, (cell, label, required) in enumerate(fields):
@@ -2828,7 +2770,6 @@ class App:
 
         dialog.columnconfigure(1, weight=1)
         fields = [
-            ("Витягнути інфо з файла", self.source_path),
             ("Шаблон акту", self.moto_path),
             ("Шаблон договору", self.dogovir_path),
             ("Шаблон видаткової", self.vidatkova_path),
@@ -2839,7 +2780,7 @@ class App:
         tk.Label(
             dialog,
             text="Параметри шаблонів",
-            font=("Segoe UI", 14, "bold"),
+            font=("Segoe UI", 16, "bold"),
             bg=self.theme["card_bg"],
             fg=self.theme["label_fg"],
         ).grid(row=0, column=0, columnspan=3, sticky="w", padx=16, pady=(14, 8))
@@ -3014,7 +2955,7 @@ class App:
         win.configure(bg=self.theme["card_bg"])
         win.geometry("720x520")
         txt = tk.Text(win, wrap="word", bg=self.theme["entry_bg"], fg=self.theme["entry_fg"],
-                      font=("Consolas", 10), relief="flat", padx=8, pady=8)
+                      font=("Consolas", 12), relief="flat", padx=8, pady=8)
         sb = tk.Scrollbar(win, command=txt.yview)
         txt.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
@@ -3032,7 +2973,7 @@ class App:
         win.geometry("820x560")
         win.transient(parent_dialog or self.root)
         txt = tk.Text(win, wrap="word", bg=self.theme["entry_bg"], fg=self.theme["entry_fg"],
-                      font=("Consolas", 10), relief="flat", padx=8, pady=8)
+                      font=("Consolas", 12), relief="flat", padx=8, pady=8)
         sb = tk.Scrollbar(win, command=txt.yview)
         txt.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
@@ -3063,7 +3004,7 @@ class App:
         tk.Label(
             win,
             text="Всі данні",
-            font=("Segoe UI", 14, "bold"),
+            font=("Segoe UI", 16, "bold"),
             bg=self.theme["card_bg"],
             fg=self.theme["label_fg"],
             anchor="w",
@@ -3288,8 +3229,10 @@ class App:
 
     def _save_settings(self) -> None:
         """Persist all settings (paths, theme, flags) to JSON config file."""
+        # Keep source_path in sync with moto_path (both point to the same act file).
+        self.source_path.set(self.moto_path.get())
         save_app_config({
-            "source_path": self.source_path.get(),
+            "source_path": self.moto_path.get(),
             "moto_path": self.moto_path.get(),
             "dogovir_path": self.dogovir_path.get(),
             "vidatkova_path": self.vidatkova_path.get(),
@@ -3353,7 +3296,7 @@ class App:
         out_dir = output_dir or self._ensure_output_dir()
         ts = f"_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}" if use_timestamp else ""
         doc_num = contract_number_for_filename(payload.get("Number", ""))
-        num_part = f" \u2116{doc_num}" if doc_num else ""
+        num_part = f" {doc_num}" if doc_num else ""
 
         if kind == "act":
             act_ext = self.act_out_format.get().strip().lower()
@@ -3468,7 +3411,7 @@ class App:
             text="⚠  Документ містить незаповнені або помилкові поля:",
             bg=self.theme["card_bg"],
             fg=self.theme["warn_fg"],
-            font=("Segoe UI", 10, "bold"),
+            font=("Segoe UI", 12, "bold"),
             anchor="w",
         ).pack(fill="x", padx=16, pady=(14, 4))
 
@@ -3479,7 +3422,7 @@ class App:
             bg=self.theme["entry_bg"],
             fg=self.theme["entry_fg"],
             relief="flat",
-            font=("Segoe UI", 9),
+            font=("Segoe UI", 10),
             padx=8,
             pady=6,
         )
@@ -3493,7 +3436,7 @@ class App:
             text="Можна згенерувати документи зараз і заповнити поля вручну пізніше.",
             bg=self.theme["card_bg"],
             fg=self.theme["label_fg"],
-            font=("Segoe UI", 9),
+            font=("Segoe UI", 10),
             anchor="w",
             wraplength=460,
         ).pack(fill="x", padx=16, pady=(0, 10))
@@ -3518,7 +3461,7 @@ class App:
             fg="#ffffff",
             activebackground="#92400e",
             activeforeground="#ffffff",
-            font=("Segoe UI", 9, "bold"),
+            font=("Segoe UI", 10, "bold"),
             padx=12,
             pady=4,
             relief="flat",
@@ -3608,15 +3551,15 @@ if tk is not None:
             header = tk.Frame(self, bg="#0f766e", padx=14, pady=12)
             header.grid(row=0, column=0, sticky="ew")
             header.columnconfigure(0, weight=1)
-            tk.Label(header, text=self._title(), fg="white", bg="#0f766e", font=("Segoe UI", 15, "bold")).grid(row=0, column=0, sticky="w")
-            tk.Label(header, text="Файл відкрито у системній програмі. Перевірте і збережіть.", fg="#ccfbf1", bg="#0f766e", font=("Segoe UI", 9)).grid(row=1, column=0, sticky="w")
+            tk.Label(header, text=self._title(), fg="white", bg="#0f766e", font=("Segoe UI", 17, "bold")).grid(row=0, column=0, sticky="w")
+            tk.Label(header, text="Файл відкрито у системній програмі. Перевірте і збережіть.", fg="#ccfbf1", bg="#0f766e", font=("Segoe UI", 10)).grid(row=1, column=0, sticky="w")
 
             body = tk.Frame(self, bg="#f4efe7", padx=16, pady=14)
             body.grid(row=1, column=0, sticky="ew")
             body.columnconfigure(0, weight=1)
             self.status_lbl = tk.Label(body, text="Генерація файлу...", bg="#f4efe7", fg="#374151", anchor="w", wraplength=600)
             self.status_lbl.grid(row=0, column=0, sticky="ew")
-            self.path_lbl = tk.Label(body, text="", bg="#f4efe7", fg="#6b7280", anchor="w", wraplength=600, font=("Segoe UI", 9))
+            self.path_lbl = tk.Label(body, text="", bg="#f4efe7", fg="#6b7280", anchor="w", wraplength=600, font=("Segoe UI", 10))
             self.path_lbl.grid(row=1, column=0, sticky="ew", pady=(4, 0))
 
             actions = tk.Frame(self, bg="#f4efe7", padx=16, pady=12)
@@ -3667,7 +3610,7 @@ if tk is not None:
             case_dir = base_out_dir / build_case_folder_name(state)
             payload_s = parse_state(state)
             doc_num_s = contract_number_for_filename(payload_s.get("Number", ""))
-            num_part_s = f" №{doc_num_s}" if doc_num_s else ""
+            num_part_s = f" {doc_num_s}" if doc_num_s else ""
             _stem_map = {"act": "Акт", "contract": "Договір", "vidatkova": "Видаткова"}
             dest_name = _stem_map.get(self.kind, self._temp_path.stem) + num_part_s + self._temp_path.suffix
             dest = case_dir / dest_name
@@ -3679,6 +3622,210 @@ if tk is not None:
             messagebox.showinfo("Збережено", f"Файл збережено:\n{dest}", parent=self)
             self.app.write_log(f"Збережено: {dest}")
             self.app.status_var.set(f"Збережено {dest.name}")
+
+    class WizardWindow(tk.Toplevel):
+        """Startup wizard: Step 1 = select source act, Step 2 = quick 3-field form."""
+
+        def __init__(self, master: tk.Tk, app: "App") -> None:
+            super().__init__(master)
+            self.app = app
+            self.title("Japan moto")
+            self.resizable(False, False)
+            self.protocol("WM_DELETE_WINDOW", self._on_close)
+            self._show_step1()
+            self.update_idletasks()
+            w, h = 620, 270
+            sx = self.winfo_screenwidth()
+            sy = self.winfo_screenheight()
+            self.geometry(f"{w}x{h}+{(sx - w) // 2}+{(sy - h) // 2}")
+            self.lift()
+            self.focus_force()
+
+        def _on_close(self) -> None:
+            self.master.quit()
+
+        def _clear(self) -> None:
+            for child in self.winfo_children():
+                child.destroy()
+
+        def _show_step1(self) -> None:
+            self._clear()
+            t = self.app.theme
+            self.configure(bg=t["root_bg"])
+
+            hdr = tk.Frame(self, bg=t["header_bg"], padx=14, pady=12)
+            hdr.pack(fill="x")
+            tk.Label(hdr, text="Japan moto", fg=t["header_fg"], bg=t["header_bg"],
+                     font=("Segoe UI", 21, "bold")).pack(anchor="w")
+            tk.Label(hdr, text="Крок 1 з 2 — оберіть завантажений акт МВС",
+                     fg=t["header_sub_fg"], bg=t["header_bg"],
+                     font=("Segoe UI", 10)).pack(anchor="w")
+
+            body = tk.Frame(self, bg=t["card_bg"], padx=20, pady=18)
+            body.pack(fill="both", expand=True, padx=12, pady=12)
+            body.columnconfigure(0, weight=1)
+
+            tk.Label(body, text="Файл акта (XLS):", bg=t["card_bg"],
+                     fg=t["label_fg"], font=("Segoe UI", 10)).grid(
+                row=0, column=0, sticky="w", pady=(0, 6))
+
+            fr = tk.Frame(body, bg=t["card_bg"])
+            fr.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+            fr.columnconfigure(0, weight=1)
+
+            self._file_var = tk.StringVar(value=self.app.source_path.get())
+            tk.Entry(fr, textvariable=self._file_var, bg=t["entry_bg"], fg=t["entry_fg"],
+                     insertbackground=t["entry_insert"], relief="flat",
+                     highlightthickness=1, bd=0, font=("Segoe UI", 10)).grid(
+                row=0, column=0, sticky="ew", ipady=4)
+            tk.Button(fr, text="Огляд…", command=self._browse, bg=t["btn_bg"],
+                      fg=t["btn_fg"], relief="flat", padx=12, pady=5,
+                      cursor="hand2", font=("Segoe UI", 10)).grid(
+                row=0, column=1, padx=(8, 0))
+
+            tk.Button(body, text="Далі →", command=self._on_next,
+                      bg="#0f766e", fg="white", activebackground="#0d6960",
+                      activeforeground="white", relief="flat",
+                      font=("Segoe UI", 10, "bold"), padx=20, pady=6,
+                      cursor="hand2").grid(row=2, column=0, sticky="e")
+
+        def _browse(self) -> None:
+            from tkinter import filedialog
+            cur = self._file_var.get()
+            initial = str(Path(cur).parent) if cur and Path(cur).parent.exists() else ""
+            path = filedialog.askopenfilename(
+                parent=self,
+                title="Оберіть акт МВС (XLS)",
+                filetypes=[("Excel files", "*.xls *.xlsx"), ("All files", "*.*")],
+                initialdir=initial,
+            )
+            if path:
+                self._file_var.set(path)
+
+        def _on_next(self) -> None:
+            from tkinter import messagebox
+            path_str = self._file_var.get().strip()
+            if not path_str or not Path(path_str).exists():
+                messagebox.showerror("Помилка", "Файл не знайдено. Оберіть коректний файл акта.",
+                                     parent=self)
+                return
+            self.app.source_path.set(path_str)
+            self.app.moto_path.set(path_str)
+            try:
+                self.app.reload_source()
+            except Exception as exc:
+                messagebox.showerror("Помилка читання", str(exc), parent=self)
+                return
+            self._show_step2()
+            self.update_idletasks()
+            w, h = 660, 430
+            sx = self.winfo_screenwidth()
+            sy = self.winfo_screenheight()
+            self.geometry(f"{w}x{h}+{(sx - w) // 2}+{(sy - h) // 2}")
+
+        def _show_step2(self) -> None:
+            self._clear()
+            t = self.app.theme
+            self.configure(bg=t["root_bg"])
+
+            hdr = tk.Frame(self, bg=t["header_bg"], padx=14, pady=12)
+            hdr.pack(fill="x")
+            hdr.columnconfigure(0, weight=1)
+
+            info = tk.Frame(hdr, bg=t["header_bg"])
+            info.grid(row=0, column=0, sticky="w")
+            tk.Label(info, text="Japan moto", fg=t["header_fg"], bg=t["header_bg"],
+                     font=("Segoe UI", 21, "bold")).pack(anchor="w")
+            src_name = Path(self.app.source_path.get()).name
+            tk.Label(info, text=f"Крок 2 з 2 — {src_name}",
+                     fg=t["header_sub_fg"], bg=t["header_bg"],
+                     font=("Segoe UI", 10)).pack(anchor="w")
+
+            tk.Button(
+                hdr, text="⚙", command=self._open_full_form,
+                bg=t["header_bg"], fg=t["header_muted_fg"],
+                activebackground=t["header_active_bg"],
+                activeforeground=t["header_fg"],
+                bd=0, relief="flat", font=("Segoe UI", 16),
+                padx=8, pady=4, cursor="hand2",
+            ).grid(row=0, column=1, sticky="ne")
+
+            body = tk.Frame(self, bg=t["card_bg"], padx=20, pady=18)
+            body.pack(fill="both", expand=True, padx=12, pady=(12, 6))
+            body.columnconfigure(1, weight=1)
+
+            tk.Label(body, text="Основна інформація", bg=t["card_bg"],
+                     fg=t["section_fg"], font=("Segoe UI", 14, "bold")).grid(
+                row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+            for i, (cell, label) in enumerate([
+                ("A3", "Номер акта *"),
+                ("C12", "Дата народження клієнта"),
+                ("C50", "Номер транзиту"),
+            ]):
+                tk.Label(body, text=label, bg=t["card_bg"], fg=t["label_fg"],
+                         anchor="w", font=("Segoe UI", 10)).grid(
+                    row=i + 1, column=0, sticky="w", padx=(0, 14), pady=6)
+                tk.Entry(body, textvariable=self.app.state_vars[cell],
+                         bg=t["entry_bg"], fg=t["entry_fg"],
+                         insertbackground=t["entry_insert"], relief="flat",
+                         highlightthickness=1, bd=0,
+                         font=("Segoe UI", 10)).grid(
+                    row=i + 1, column=1, sticky="ew", pady=6, ipady=4)
+
+            btn_row = tk.Frame(self, bg=t["root_bg"])
+            btn_row.pack(fill="x", padx=12, pady=(0, 12))
+            tk.Button(btn_row, text="← Назад", command=self._show_step1,
+                      bg=t["btn_bg"], fg=t["btn_fg"], relief="flat",
+                      padx=12, pady=6, cursor="hand2",
+                      font=("Segoe UI", 10)).pack(side="left")
+            tk.Button(btn_row, text="⟲ Генерувати всі документи",
+                      command=self._on_generate, bg="#0f766e", fg="white",
+                      activebackground="#0d6960", activeforeground="white",
+                      relief="flat", font=("Segoe UI", 10, "bold"),
+                      padx=20, pady=6, cursor="hand2").pack(side="right")
+
+        def _open_full_form(self) -> None:
+            """Close wizard and reveal the main App window."""
+            self.destroy()
+            self.master.deiconify()
+            self.master.lift()
+
+        def _on_generate(self) -> None:
+            from tkinter import messagebox
+            src_dir = Path(self.app.source_path.get()).parent
+            state = self.app.collect_state()
+            payload, errors, _warnings = validate_state(state)
+            if errors:
+                proceed = messagebox.askyesno(
+                    "Незаповнені поля",
+                    "Деякі поля не заповнені:\n"
+                    + "\n".join(f"• {e}" for e in errors[:5])
+                    + ("\n  ..." if len(errors) > 5 else "")
+                    + "\n\nГенерувати як є?",
+                    parent=self,
+                )
+                if not proceed:
+                    return
+            try:
+                self.app.save_draft("act", open_after=False, output_dir=src_dir,
+                                    use_timestamp=False, allow_incomplete=True)
+                self.app.save_draft("contract", open_after=False, output_dir=src_dir,
+                                    use_timestamp=False, allow_incomplete=True)
+                self.app.save_draft("vidatkova", open_after=False, output_dir=src_dir,
+                                    use_timestamp=False, allow_incomplete=True)
+                doc_num = contract_number_for_filename(payload.get("Number", ""))
+                transit_name = (f"Номери транзиту {doc_num}.txt" if doc_num
+                                else "Номери транзиту.txt")
+                (src_dir / transit_name).write_text(
+                    transit_summary_text(payload), encoding="utf-8")
+                messagebox.showinfo("Готово ✓", f"Документи збережено:\n{src_dir}",
+                                    parent=self)
+            except Exception as exc:
+                messagebox.showerror("Помилка генерації", str(exc), parent=self)
+                return
+            self.master.quit()
+
 else:
     class DraftWindow:
         def __init__(self, *args, **kwargs):
@@ -3745,6 +3892,8 @@ def main() -> int:
         return 1
 
     root = tk.Tk()
+    root.withdraw()  # Hidden until the wizard hands control to the full form.
+
     def _tk_report_callback_exception(exc, val, tb):
         try:
             APP_LOGGER.exception("Tk callback exception", exc_info=(exc, val, tb))
@@ -3753,7 +3902,8 @@ def main() -> int:
         traceback.print_exception(exc, val, tb)
 
     root.report_callback_exception = _tk_report_callback_exception
-    App(root)
+    app = App(root)
+    WizardWindow(root, app)
     root.mainloop()
     return 0
 
