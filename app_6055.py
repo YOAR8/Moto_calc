@@ -583,6 +583,14 @@ def write_xls_cells(path: Path, sheet_name: str, updates: Dict[str, object], bac
         shutil.copy2(path, backup_path)
 
     rb = xlrd.open_workbook(str(path), formatting_info=True)
+    # Clamp out-of-range XF indices to prevent xl_copy from crashing on
+    # non-standard or previously-written XLS files (fix IndexError in xlutils).
+    _max_xf = len(rb.xf_list)
+    for _sh in rb.sheets():
+        if hasattr(_sh, "_cell_xf_index") and _sh._cell_xf_index:
+            for _i in range(len(_sh._cell_xf_index)):
+                if _sh._cell_xf_index[_i] >= _max_xf:
+                    _sh._cell_xf_index[_i] = 0
     wb = xl_copy(rb)
 
     sheet_idx = None
@@ -2076,6 +2084,20 @@ class SmartEntry(tk.Frame if tk is not None else object):
         self._text.bind("<Up>", self._move_up)
         self._text.bind("<Tab>", self._on_tab)
         self._text.bind("<Return>", self._on_return)
+        self._text.bind("<<Paste>>", self._after_paste)
+
+    def _after_paste(self, event=None) -> None:
+        """Ensure StringVar syncs after clipboard paste (deferred to allow text insertion)."""
+        self._text.after(1, self._sync_to_var)
+
+    def _sync_to_var(self) -> None:
+        new_val = self._text.get("1.0", "end-1c")
+        if not self._syncing and self._var.get() != new_val:
+            self._syncing = True
+            self._var.set(new_val)
+            self._text.edit_modified(False)
+            self._adjust_height()
+            self._syncing = False
 
     def set_bg(self, color: str) -> None:
         self._text.configure(bg=color)
@@ -2399,8 +2421,8 @@ class App:
         self.out_dir = default_output_dir(self.app_dir)
 
         self.root.title("Japan moto")
-        self.root.geometry("1320x920")
-        self.root.minsize(1160, 780)
+        self.root.geometry(f"{int(1320 * _FONT_SCALE)}x{int(920 * _FONT_SCALE)}")
+        self.root.minsize(int(1160 * _FONT_SCALE), int(780 * _FONT_SCALE))
         self.theme_pref = tk.StringVar(value="auto")
         self.theme_mode = detect_theme_mode()
         self.theme = build_theme_palette(self.theme_mode)
@@ -2418,6 +2440,7 @@ class App:
         self.act_out_format = tk.StringVar(value="xls")
         self.vidatkova_out_format = tk.StringVar(value="xls")
         self.ui_scale_var = tk.StringVar(value="1.0")
+        self.start_folder_var = tk.StringVar(value="")
 
         self.state_vars: Dict[str, tk.StringVar] = {}
         self.widgets: Dict[str, tk.Entry] = {}
@@ -2429,7 +2452,7 @@ class App:
         self._syncing_form = False
         self._generation_suggested = False
 
-        ac_db_path = self.out_dir / "autocomplete.json"
+        ac_db_path = self.app_dir / "autocomplete.json"
         AutocompleteEntry.load_db(ac_db_path)
 
         # Load persisted settings (overrides defaults set above)
@@ -2464,12 +2487,14 @@ class App:
         _ui_scale_cfg = str(_cfg.get("ui_scale", "1.0"))
         if _ui_scale_cfg in ("0.85", "1.0", "1.15", "1.3"):
             self.ui_scale_var.set(_ui_scale_cfg)
+        if _cfg.get("start_folder"):
+            self.start_folder_var.set(_cfg["start_folder"])
 
         try:
-            self.app_log_path = configure_app_logging(Path(self.output_dir_var.get().strip() or str(self.out_dir)))
+            self.app_log_path = configure_app_logging(self.app_dir / "logs")
             APP_LOGGER.info("=== Application started ===")
         except Exception:
-            self.app_log_path = self.out_dir / "japan_moto.log"
+            self.app_log_path = self.app_dir / "logs" / "japan_moto.log"
 
         self._load_state_from_source()
         self._build_ui()
@@ -2756,10 +2781,13 @@ class App:
         self.log.grid(row=0, column=0, sticky="nsew")
 
     def browse_path(self, var: tk.StringVar) -> None:
-        if var is self.output_dir_var:
-            value = filedialog.askdirectory(initialdir=var.get() or str(self.out_dir)) if filedialog else ""
+        if var is self.output_dir_var or var is self.start_folder_var:
+            cur_dir = var.get() or str(self.out_dir)
+            value = filedialog.askdirectory(initialdir=cur_dir) if filedialog else ""
         else:
-            value = filedialog.askopenfilename(initialdir=str(self.app_dir)) if filedialog else ""
+            cur = var.get()
+            initial = str(Path(cur).parent) if cur and Path(cur).parent.exists() else str(self.app_dir)
+            value = filedialog.askopenfilename(initialdir=initial) if filedialog else ""
         if value:
             var.set(value)
 
@@ -2776,6 +2804,7 @@ class App:
             ("Шаблон договору", self.dogovir_path),
             ("Шаблон видаткової", self.vidatkova_path),
             ("Папка збереження", self.output_dir_var),
+            ("Папка старту", self.start_folder_var),
             ("Редактор", self.editor_path),
         ]
 
@@ -3277,6 +3306,7 @@ class App:
             "act_out_format": self.act_out_format.get(),
             "vidatkova_out_format": self.vidatkova_out_format.get(),
             "ui_scale": self.ui_scale_var.get(),
+            "start_folder": self.start_folder_var.get(),
         })
 
     def paste_from_clipboard(self) -> None:
@@ -3382,6 +3412,13 @@ class App:
                 )
                 if non_com:
                     out_path = non_com
+                    if ext == "doc" and out_path.suffix.lower() == ".docx":
+                        try:
+                            _doc_out = out_path.with_suffix(".doc")
+                            out_path.rename(_doc_out)
+                            out_path = _doc_out
+                        except Exception:
+                            pass
                 else:
                     # Last resort: full text docx generator (different appearance)
                     self.write_log("Шаблонне заповнення не вдалось → генерую резервний текстовий договір")
@@ -3389,6 +3426,13 @@ class App:
                     result = generate_contract_docx_fallback(state, out_docx)
                     if result:
                         out_path = result
+                        if ext == "doc" and out_path.suffix.lower() == ".docx":
+                            try:
+                                _doc_out = out_path.with_suffix(".doc")
+                                out_path.rename(_doc_out)
+                                out_path = _doc_out
+                            except Exception:
+                                pass
                     else:
                         out_path = out_doc.with_suffix(".txt")
                         save_text_preview(out_path, "ЧОРНОВИК ДОГОВОРУ", preview_text_for_contract(payload))
@@ -3521,6 +3565,13 @@ class App:
 
     def generate_all(self, allow_incomplete: bool = False) -> None:
         try:
+            if not allow_incomplete:
+                if not messagebox.askyesno(
+                    "Генерація документів",
+                    "Згенерувати всі документи?",
+                    default=messagebox.YES,
+                ):
+                    return
             state = self.collect_state()
             payload, errors, _ = validate_state(state)
             if errors and not allow_incomplete:
@@ -3667,6 +3718,7 @@ if tk is not None:
             self.protocol("WM_DELETE_WINDOW", self._on_close)
             self._show_step1()
             self.update_idletasks()
+            self.after(200, self._browse)
             w, h = 620, 270
             sx = self.winfo_screenwidth()
             sy = self.winfo_screenheight()
@@ -3727,7 +3779,13 @@ if tk is not None:
         def _browse(self) -> None:
             from tkinter import filedialog
             cur = self._file_var.get()
-            initial = str(Path(cur).parent) if cur and Path(cur).parent.exists() else ""
+            start = self.app.start_folder_var.get()
+            if cur and Path(cur).parent.exists():
+                initial = str(Path(cur).parent)
+            elif start and Path(start).exists():
+                initial = start
+            else:
+                initial = ""
             path = filedialog.askopenfilename(
                 parent=self,
                 title="Оберіть акт МВС (XLS)",
@@ -3746,6 +3804,7 @@ if tk is not None:
                 return
             self.app.source_path.set(path_str)
             self.app.moto_path.set(path_str)
+            self.app.output_dir_var.set(str(Path(path_str).parent))
             try:
                 self.app.reload_source()
             except Exception as exc:
@@ -3814,6 +3873,11 @@ if tk is not None:
                       bg=t["btn_bg"], fg=t["btn_fg"], relief="flat",
                       padx=12, pady=6, cursor="hand2",
                       font=("Segoe UI", _fs(10))).pack(side="left")
+            tk.Button(btn_row, text="📋 Вставити",
+                      command=self._paste_clipboard,
+                      bg=t["btn_bg"], fg=t["btn_fg"], relief="flat",
+                      padx=12, pady=6, cursor="hand2",
+                      font=("Segoe UI", _fs(10))).pack(side="left", padx=(8, 0))
             tk.Button(btn_row, text="⟲ Генерувати всі документи",
                       command=self._on_generate, bg="#0f766e", fg="white",
                       activebackground="#0d6960", activeforeground="white",
@@ -3825,6 +3889,20 @@ if tk is not None:
             self.destroy()
             self.master.deiconify()
             self.master.lift()
+
+        def _paste_clipboard(self) -> None:
+            try:
+                text = self.master.clipboard_get()
+            except Exception:
+                return
+            if not text or not text.strip():
+                return
+            filled = _parse_clipboard_to_fields(text)
+            for cell, value in filled.items():
+                if cell in self.app.state_vars and value:
+                    self.app.state_vars[cell].set(value)
+            if "C15" in filled:
+                self.app.state_vars["E15"].set(short_name(filled["C15"]))
 
         def _on_generate(self) -> None:
             from tkinter import messagebox
@@ -3919,7 +3997,7 @@ def main() -> int:
         return 0
 
     try:
-        configure_app_logging(default_output_dir(app_dir))
+        configure_app_logging(app_dir / "logs")
     except Exception:
         pass
     sys.excepthook = _global_excepthook
