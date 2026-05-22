@@ -643,6 +643,18 @@ def short_name(full_name: str) -> str:
     return f"{tokens[0]} {tokens[1][0]}. {tokens[2][0]}."
 
 
+def contract_number_for_filename(number: str) -> str:
+    raw = str(number or "").strip()
+    if not raw:
+        return ""
+    tail = raw.split("/")[-1].strip()
+    if tail:
+        tail = re.sub(r'[\\/:*?"<>|]', "-", tail).strip("-")
+        if tail:
+            return tail
+    return re.sub(r'[\\/:*?"<>|]', "-", raw).strip("-")
+
+
 def load_source_values(source_6055: Path) -> Dict[str, object]:
     wb = xlrd.open_workbook(str(source_6055), formatting_info=False)
     sh = wb.sheet_by_name("Worksheet")
@@ -816,16 +828,6 @@ def windows_transfer_all(source_6055: Path, moto_template: Path, dogovir_templat
 
 FIELD_SECTIONS = [
     (
-        "Суб'єкт господарювання",
-        [
-            ("C5", "Найменування", False),
-            ("C6", "Код ЄДРПОУ", False),
-            ("C7", "Місцезнаходження", False),
-            ("C8", "Реєстр. номер МВС", False),
-            ("A56", "Продавець (підпис)", False),
-        ],
-    ),
-    (
         "Документ",
         [
             ("A3", "Номер і дата", True),
@@ -834,6 +836,17 @@ FIELD_SECTIONS = [
             ("C48", "Акт приймання-передачі", False),
             ("C49", "Свідоцтво про реєстрацію", False),
             ("C53", "Висновок", False),
+        ],
+    ),
+    (
+        "Покупець",
+        [
+            ("C15", "ПІБ покупця", True),
+            ("E15", "ПІБ скорочено", False),
+            ("C12", "Дата народження", False),
+            ("C16", "Адреса", True),
+            ("C17", "Паспорт", True),
+            ("C18", "ІПН / код", True),
         ],
     ),
     (
@@ -875,14 +888,13 @@ FIELD_SECTIONS = [
         ],
     ),
     (
-        "Покупець",
+        "Суб'єкт господарювання",
         [
-            ("C15", "ПІБ покупця", True),
-            ("E15", "ПІБ скорочено", False),
-            ("C12", "Дата народження", False),
-            ("C16", "Адреса", True),
-            ("C17", "Паспорт", True),
-            ("C18", "ІПН / код", True),
+            ("C5", "Найменування", False),
+            ("C6", "Код ЄДРПОУ", False),
+            ("C7", "Місцезнаходження", False),
+            ("C8", "Реєстр. номер МВС", False),
+            ("A56", "Продавець (підпис)", False),
         ],
     ),
 ]
@@ -1286,6 +1298,18 @@ def preview_text_for_vidatkova(payload: Dict[str, str]) -> str:
         f"ПДВ: {payload.get('C45', '')}",
         f"Всього: {payload.get('C46', '')}",
         f"Сума прописом: {payload.get('sumtext', '')}",
+    ])
+
+
+def transit_summary_text(payload: Dict[str, str]) -> str:
+    return "\n".join([
+        "НОМЕРИ ТРАНЗИТУ",
+        "",
+        f"Номер акта: {payload.get('Number', '')}",
+        f"Дата народження клієнта: {payload.get('BirthDay', '')}",
+        f"Покупець: {payload.get('FIO', '')}",
+        f"Номер транзиту: {payload.get('znak', '')}",
+        f"VIN / рама: {payload.get('cuzov', '')}",
     ])
 
 
@@ -2471,8 +2495,9 @@ class App:
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(1, weight=1)
-        self.root.rowconfigure(2, weight=0)
+        self.root.rowconfigure(1, weight=0)
+        self.root.rowconfigure(2, weight=1)
+        self.root.rowconfigure(3, weight=0)
         self.root.configure(bg=self.theme["root_bg"])
 
         header = tk.Frame(self.root, bg=self.theme["header_bg"], padx=10, pady=8)
@@ -2506,14 +2531,19 @@ class App:
         )
         gear_btn.grid(row=0, column=2, sticky="ne", padx=(0, 4), pady=2)
 
+        quick = tk.Frame(self.root, bg=self.theme["surface_bg"])
+        quick.grid(row=1, column=0, sticky="ew", padx=12, pady=(12, 0))
+        quick.columnconfigure(0, weight=1)
+        self._build_quick_panel(quick)
+
         main = tk.Frame(self.root, bg=self.theme["surface_bg"])
-        main.grid(row=1, column=0, sticky="nsew", padx=12, pady=12)
+        main.grid(row=2, column=0, sticky="nsew", padx=12, pady=12)
         main.columnconfigure(0, weight=1)
         main.rowconfigure(0, weight=1)
         self._build_data_tab(main)
 
         bottom = tk.Frame(self.root, bg=self.theme["status_bg"], padx=12, pady=6)
-        bottom.grid(row=2, column=0, sticky="ew")
+        bottom.grid(row=3, column=0, sticky="ew")
         bottom.columnconfigure(0, weight=1)
         bottom.columnconfigure(1, weight=1)
         bottom.columnconfigure(2, weight=1)
@@ -2555,6 +2585,60 @@ class App:
             cursor="hand2",
         )
         button.grid(row=0, column=column, padx=(0, 6), sticky="e")
+
+    def _make_action_button(self, parent, text: str, command, column: int, row: int) -> None:
+        button = tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg=self.theme["btn_bg"],
+            fg=self.theme["btn_fg"],
+            activebackground=self.theme["header_active_bg"],
+            activeforeground=self.theme["header_fg"],
+            bd=0,
+            relief="flat",
+            padx=12,
+            pady=5,
+            cursor="hand2",
+        )
+        button.grid(row=row, column=column, padx=(0, 8), pady=4, sticky="w")
+
+    def _build_quick_panel(self, parent: tk.Frame) -> None:
+        panel = tk.Frame(
+            parent,
+            bg=self.theme["card_bg"],
+            highlightbackground=self.theme["card_border"],
+            highlightthickness=1,
+            padx=14,
+            pady=12,
+        )
+        panel.grid(row=0, column=0, sticky="ew")
+        panel.columnconfigure(0, weight=2)
+        panel.columnconfigure(1, weight=1)
+
+        left = tk.Frame(panel, bg=self.theme["card_bg"])
+        left.grid(row=0, column=0, sticky="ew")
+        left.columnconfigure(1, weight=1)
+
+        tk.Label(left, text="Швидкий старт", bg=self.theme["card_bg"], fg=self.theme["section_fg"], font=("Segoe UI", 12, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        tk.Label(left, text="Номер акта", bg=self.theme["card_bg"], fg=self.theme["label_fg"], anchor="w").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=4)
+        tk.Entry(left, textvariable=self.state_vars["A3"], bg=self.theme["entry_bg"], fg=self.theme["entry_fg"], insertbackground=self.theme["entry_insert"], relief="flat", highlightthickness=1, bd=0).grid(row=1, column=1, sticky="ew", pady=4)
+        tk.Label(left, text="Дата народження клієнта", bg=self.theme["card_bg"], fg=self.theme["label_fg"], anchor="w").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=4)
+        tk.Entry(left, textvariable=self.state_vars["C12"], bg=self.theme["entry_bg"], fg=self.theme["entry_fg"], insertbackground=self.theme["entry_insert"], relief="flat", highlightthickness=1, bd=0).grid(row=2, column=1, sticky="ew", pady=4)
+        tk.Label(left, text="Номер транзиту", bg=self.theme["card_bg"], fg=self.theme["label_fg"], anchor="w").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=4)
+        tk.Entry(left, textvariable=self.state_vars["C50"], bg=self.theme["entry_bg"], fg=self.theme["entry_fg"], insertbackground=self.theme["entry_insert"], relief="flat", highlightthickness=1, bd=0).grid(row=3, column=1, sticky="ew", pady=4)
+
+        actions = tk.Frame(panel, bg=self.theme["card_bg"])
+        actions.grid(row=0, column=1, sticky="ne", padx=(16, 0))
+        tk.Label(actions, text="Дії", bg=self.theme["card_bg"], fg=self.theme["section_fg"], font=("Segoe UI", 12, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        self._make_action_button(actions, "Акт", lambda: self.open_draft("act"), 0, 1)
+        self._make_action_button(actions, "Договір", lambda: self.open_draft("contract"), 1, 1)
+        self._make_action_button(actions, "Видаткова", lambda: self.open_draft("vidatkova"), 0, 2)
+        self._make_action_button(actions, "Генерувати", self.generate_all, 1, 2)
+        self._make_action_button(actions, "Всі данні", self.open_all_data_dialog, 0, 3)
+        self._make_action_button(actions, "Очистити", self.clear_form, 1, 3)
+        self._make_action_button(actions, "Відновити", self.reload_source, 0, 4)
+        self._make_action_button(actions, "Вставити", self.paste_from_clipboard, 1, 4)
 
     def _add_copy_paste_menu(self, entry) -> None:
         if isinstance(entry, SmartEntry):
@@ -3200,6 +3284,7 @@ class App:
         write_xls_cells(source, "Worksheet", updates, backup=True)
         self.write_log(f"Збережено 6055 у {source}")
         self.status_var.set(f"Збережено у {source.name}")
+        self.reload_source()
 
     def _save_settings(self) -> None:
         """Persist all settings (paths, theme, flags) to JSON config file."""
@@ -3267,7 +3352,7 @@ class App:
 
         out_dir = output_dir or self._ensure_output_dir()
         ts = f"_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}" if use_timestamp else ""
-        doc_num = re.sub(r'[\\/:*?"<>|]', "-", payload.get("Number", "")).strip("-")
+        doc_num = contract_number_for_filename(payload.get("Number", ""))
         num_part = f" \u2116{doc_num}" if doc_num else ""
 
         if kind == "act":
@@ -3484,13 +3569,17 @@ class App:
             self.save_draft("act", open_after=False, output_dir=case_dir, use_timestamp=False, allow_incomplete=allow_incomplete)
             self.save_draft("contract", open_after=False, output_dir=case_dir, use_timestamp=False, allow_incomplete=allow_incomplete)
             self.save_draft("vidatkova", open_after=False, output_dir=case_dir, use_timestamp=False, allow_incomplete=allow_incomplete)
+            transit_num = contract_number_for_filename(payload.get("Number", ""))
+            transit_name = f"Номери транзиту №{transit_num}.txt" if transit_num else "Номери транзиту.txt"
+            transit_path = case_dir / transit_name
+            transit_path.write_text(transit_summary_text(payload), encoding="utf-8")
             self.status_var.set(f"Усі документи збережено у {case_dir.name}")
             self.write_log(f"Усі документи збережено у {case_dir}")
             if self.open_after_save.get():
                 try:
-                    open_file_with_preference(case_dir, self.editor_path.get().strip())
+                    open_file_with_preference(transit_path, self.editor_path.get().strip())
                 except Exception as exc:
-                    self.write_log(f"Не вдалося відкрити папку кейсу: {exc}")
+                    self.write_log(f"Не вдалося відкрити файл транзитів: {exc}")
         except Exception as exc:
             self.write_log(f"ERROR: {exc}")
             self.write_log(traceback.format_exc())
@@ -3577,7 +3666,7 @@ if tk is not None:
             base_out_dir = self.app._ensure_output_dir()
             case_dir = base_out_dir / build_case_folder_name(state)
             payload_s = parse_state(state)
-            doc_num_s = re.sub(r'[\\/:*?"<>|]', "-", payload_s.get("Number", "")).strip("-")
+            doc_num_s = contract_number_for_filename(payload_s.get("Number", ""))
             num_part_s = f" №{doc_num_s}" if doc_num_s else ""
             _stem_map = {"act": "Акт", "contract": "Договір", "vidatkova": "Видаткова"}
             dest_name = _stem_map.get(self.kind, self._temp_path.stem) + num_part_s + self._temp_path.suffix
