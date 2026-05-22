@@ -298,6 +298,12 @@ def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out
         "price": str(payload.get("price", "")),
         "sumtext": contract_sumtext_plain(payload.get("sumtext", "")),
         "FIO2": str(payload.get("FIO2", "")),
+        # Seller (company) fields — filled only when the template has placeholders;
+        # if the template already contains literal text these keys won't match.
+        "SELLER_NAME": str(payload.get("C5", "")),
+        "SELLER_CODE": str(payload.get("C6", "")),
+        "C5": str(payload.get("C5", "")),
+        "C6": str(payload.get("C6", "")),
     }
     _XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
 
@@ -349,6 +355,26 @@ def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out
     # --- Strategy B: run-level fill on EVERY paragraph in the document -------
     # Covers both top-level paragraphs AND paragraphs nested inside content
     # controls (w:sdt) and table cells that doc.paragraphs / doc.tables miss.
+    # Keys that need bold + underline applied when filled (seller identity fields)
+    _SELLER_BOLD_KEYS = {"SELLER_NAME", "SELLER_CODE", "C5", "C6"}
+
+    def _apply_bold_underline(run_elem) -> None:
+        """Apply bold+underline formatting to a w:r element."""
+        try:
+            from lxml import etree as _lxml_et  # type: ignore
+            rpr = run_elem.find(_qn("w:rPr"))
+            if rpr is None:
+                rpr = _lxml_et.Element(_qn("w:rPr"))
+                run_elem.insert(0, rpr)
+            if rpr.find(_qn("w:b")) is None:
+                _lxml_et.SubElement(rpr, _qn("w:b"))
+            u_el = rpr.find(_qn("w:u"))
+            if u_el is None:
+                u_el = _lxml_et.SubElement(rpr, _qn("w:u"))
+            u_el.set(_qn("w:val"), "single")
+        except Exception:
+            pass
+
     def _fill_para_elem(para_elem) -> None:
         runs = list(para_elem.iter(_qn("w:r")))
         if not runs:
@@ -359,12 +385,17 @@ def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out
                 if ph not in para_text:
                     continue
                 # Pass 1: single-run replacement (preserves run formatting)
+                _affected_runs = []
                 for run in runs:
                     t = run.find(_qn("w:t"))
                     if t is not None and t.text and ph in t.text:
                         t.text = t.text.replace(ph, val)
                         if t.text and (t.text[0] == " " or t.text[-1] == " "):
                             t.set(_XML_SPACE, "preserve")
+                        _affected_runs.append(run)
+                if key in _SELLER_BOLD_KEYS and val:
+                    for run in _affected_runs:
+                        _apply_bold_underline(run)
                 # Pass 2: cross-run merge into first run
                 para_text_now = "".join((r.findtext(_qn("w:t")) or "") for r in runs)
                 if ph in para_text_now:
@@ -378,6 +409,8 @@ def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out
                         t = run.find(_qn("w:t"))
                         if t is not None:
                             t.text = ""
+                    if key in _SELLER_BOLD_KEYS and val:
+                        _apply_bold_underline(runs[0])
 
     for para_elem in doc.element.body.iter(_qn("w:p")):
         _fill_para_elem(para_elem)
@@ -576,22 +609,30 @@ def read_xls_cell(path: Path, sheet_name: str, addr: str):
     return sh.cell_value(r, c)
 
 
-def write_xls_cells(path: Path, sheet_name: str, updates: Dict[str, object], backup: bool = True, force_a3_tnr10: bool = False) -> None:
+def write_xls_cells(path: Path, sheet_name: str, updates: Dict[str, object], backup: bool = True, force_a3_tnr10: bool = False, preserve_xf: bool = False) -> None:
     if backup:
         ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_path = path.with_name(f"{path.stem}_backup_{ts}{path.suffix}")
         shutil.copy2(path, backup_path)
 
     rb = xlrd.open_workbook(str(path), formatting_info=True)
-    # Clamp out-of-range XF indices to prevent xl_copy from crashing on
-    # non-standard or previously-written XLS files (fix IndexError in xlutils).
-    _max_xf = len(rb.xf_list)
-    for _sh in rb.sheets():
-        if hasattr(_sh, "_cell_xf_index") and _sh._cell_xf_index:
-            for _i in range(len(_sh._cell_xf_index)):
-                if _sh._cell_xf_index[_i] >= _max_xf:
-                    _sh._cell_xf_index[_i] = 0
-    wb = xl_copy(rb)
+    # Wrap xf_list with a safe fallback accessor to prevent xl_copy from
+    # crashing on XLS files that reference out-of-range XF style indices.
+    if rb.xf_list:
+        _xf_fallback = rb.xf_list[0]
+        class _SafeXFList(list):
+            def __getitem__(self, idx):
+                try:
+                    return list.__getitem__(self, idx)
+                except IndexError:
+                    return _xf_fallback
+        rb.xf_list = _SafeXFList(rb.xf_list)
+    try:
+        wb = xl_copy(rb)
+    except Exception:
+        # Last-resort fallback: reopen without formatting (loses styles but won't crash)
+        rb = xlrd.open_workbook(str(path), formatting_info=False)
+        wb = xl_copy(rb)
 
     sheet_idx = None
     for i, name in enumerate(rb.sheet_names()):
@@ -615,12 +656,14 @@ def write_xls_cells(path: Path, sheet_name: str, updates: Dict[str, object], bac
             ws.write(r, c, value, a3_style)
             continue
         ws.write(r, c, value)
-        # Restore original XF index so cell formatting (fonts, borders, etc.) is preserved
-        row_obj = ws._Worksheet__rows.get(r)
-        if row_obj is not None:
-            cell_obj = row_obj._Row__cells.get(c)
-            if cell_obj is not None:
-                cell_obj.xf_idx = orig_xf
+        # Optionally restore original XF index (preserves template cell formatting).
+        # When preserve_xf=False (default), xlwt left-aligns with default style.
+        if preserve_xf:
+            row_obj = ws._Worksheet__rows.get(r)
+            if row_obj is not None:
+                cell_obj = row_obj._Row__cells.get(c)
+                if cell_obj is not None:
+                    cell_obj.xf_idx = orig_xf
 
     wb.save(str(path))
 
@@ -962,6 +1005,8 @@ def parse_state(state: Dict[str, str]) -> Dict[str, str]:
     payload["cub"] = payload.get("C36", "")
     payload["znak"] = payload.get("C50", "")
     payload["price"] = payload.get("C46", "")
+    payload["SELLER_NAME"] = payload.get("C5", "")
+    payload["SELLER_CODE"] = payload.get("C6", "")
     payload["sumtext"] = amount_to_words_uah(payload.get("C46", ""))
     payload["fio_short"] = short_name(payload.get("C15", ""))
     return payload
@@ -1324,7 +1369,7 @@ def transit_summary_text(payload: Dict[str, str]) -> str:
 _XLS_CELL_RE = re.compile(r"^[A-Z]+\d+$")
 
 
-def generate_act_xls_from_state(state: Dict[str, str], source_6055: Path, out_path: Path) -> Path:
+def generate_act_xls_from_state(state: Dict[str, str], source_6055: Path, out_path: Path, preserve_xf: bool = False) -> Path:
     shutil.copy2(source_6055, out_path)
     updates = {cell: state.get(cell, "") for cell in FORM_CELLS if _XLS_CELL_RE.match(cell)}
     full_fio = str(state.get("C15", "")).strip()
@@ -1334,11 +1379,11 @@ def generate_act_xls_from_state(state: Dict[str, str], source_6055: Path, out_pa
     updates["D56"] = short_fio or short_name(full_fio)
     updates.pop("E15", None)  # E15 is app-internal; short name used only in D56
     updates["C43"] = updates.get("C39", "")  # C43 (Номер рами) деривується з VIN
-    write_xls_cells(out_path, "Worksheet", updates, backup=False, force_a3_tnr10=True)
+    write_xls_cells(out_path, "Worksheet", updates, backup=False, force_a3_tnr10=True, preserve_xf=preserve_xf)
     return out_path
 
 
-def generate_vidatkova_xls_from_state(state: Dict[str, str], template_path: Path, out_path: Path) -> Path:
+def generate_vidatkova_xls_from_state(state: Dict[str, str], template_path: Path, out_path: Path, preserve_xf: bool = False) -> Path:
     payload = parse_state(state)
     shutil.copy2(template_path, out_path)
 
@@ -1379,7 +1424,7 @@ def generate_vidatkova_xls_from_state(state: Dict[str, str], template_path: Path
     }
     if discount > 0:
         updates["H14"] = discount
-    write_xls_cells(out_path, "Лист1", updates, backup=False)
+    write_xls_cells(out_path, "Лист1", updates, backup=False, preserve_xf=preserve_xf)
     return out_path
 
 
@@ -1915,6 +1960,22 @@ def _parse_clipboard_to_fields(text: str) -> Dict[str, str]:
     result: Dict[str, str] = {}
     clean = " ".join(text.split())  # normalise whitespace
 
+    # Номер акта + дата: №NNN/NN/NNN від DD Місяць YYYY року
+    act_num_m = re.search(
+        r'(№\s*\d+/\d+/\d+\s+від\s+\d{1,2}\s+[\u0430-яіїєґ]+\s+\d{4}(?:\s*року?)?)',
+        clean, re.IGNORECASE,
+    )
+    if act_num_m:
+        result["A3"] = act_num_m.group(1).strip()
+
+    # Номер транзитного знаку (український формат): 2 кирилиці + 4-5 цифр + 2 кирилиці [+ 1 цифра]
+    transit_m = re.search(
+        r'\b([А-ЯІЇЄҐ]{2}\d{4,5}[А-ЯІЇЄҐ]{2}\d?)\b',
+        clean, re.IGNORECASE,
+    )
+    if transit_m and "C50" not in result:
+        result["C50"] = transit_m.group(1)
+
     # ПІБ: Ukrainian person name = exactly 3 uppercase Cyrillic words where
     # the LAST word (patronymic) ends with a known Ukrainian/Russian suffix.
     # Prevents matching institution names like "ДЕРЖАВНА МИТНА СЛУЖБА".
@@ -1971,6 +2032,14 @@ def _parse_clipboard_to_fields(text: str) -> Dict[str, str]:
         )
         if yr_m:
             result["C12"] = yr_m.group(1)
+        elif "C12" not in result:
+            # Bare DD.MM.YYYY not yet matched — use as birth date if not inside act date
+            bare_date_m = re.search(r'(?<![/\d])(\d{2}\.\d{2}\.\d{4})(?![/\d])', clean)
+            if bare_date_m:
+                act_span = act_num_m.span() if act_num_m else (-1, -1)
+                bd_start = bare_date_m.start()
+                if not (act_span[0] <= bd_start < act_span[1]):
+                    result["C12"] = bare_date_m.group(1)
 
     # Адреса: після ключових слів
     addr_m = re.search(
@@ -2441,6 +2510,10 @@ class App:
         self.vidatkova_out_format = tk.StringVar(value="xls")
         self.ui_scale_var = tk.StringVar(value="1.0")
         self.start_folder_var = tk.StringVar(value="")
+        self.generate_new_act_var = tk.BooleanVar(value=False)
+        self.use_case_subfolder_var = tk.BooleanVar(value=False)
+        self.ask_output_dir_var = tk.BooleanVar(value=False)
+        self.preserve_cell_xf_var = tk.BooleanVar(value=False)
 
         self.state_vars: Dict[str, tk.StringVar] = {}
         self.widgets: Dict[str, tk.Entry] = {}
@@ -2485,10 +2558,14 @@ class App:
         if _cfg.get("vidatkova_out_format") in ("xls", "xlsx"):
             self.vidatkova_out_format.set(_cfg["vidatkova_out_format"])
         _ui_scale_cfg = str(_cfg.get("ui_scale", "1.0"))
-        if _ui_scale_cfg in ("0.85", "1.0", "1.15", "1.3"):
+        if _ui_scale_cfg in ("0.85", "1.0", "1.15", "1.3", "1.4", "1.5"):
             self.ui_scale_var.set(_ui_scale_cfg)
         if _cfg.get("start_folder"):
             self.start_folder_var.set(_cfg["start_folder"])
+        self.generate_new_act_var.set(bool(_cfg.get("generate_new_act", False)))
+        self.use_case_subfolder_var.set(bool(_cfg.get("use_case_subfolder", False)))
+        self.ask_output_dir_var.set(bool(_cfg.get("ask_output_dir", False)))
+        self.preserve_cell_xf_var.set(bool(_cfg.get("preserve_cell_xf", False)))
 
         try:
             self.app_log_path = configure_app_logging(self.app_dir / "logs")
@@ -2917,7 +2994,7 @@ class App:
             bg=self.theme["card_bg"],
             fg=self.theme["label_fg"],
         ).grid(row=theme_row + 7, column=0, sticky="w", padx=16, pady=(0, 6))
-        _scale_labels = {"0.85": "85%", "1.0": "100%", "1.15": "115%", "1.3": "130%"}
+        _scale_labels = {"0.85": "85%", "1.0": "100%", "1.15": "115%", "1.3": "130%", "1.4": "140%", "1.5": "150%"}
         scale_frame = tk.Frame(dialog, bg=self.theme["card_bg"])
         scale_frame.grid(row=theme_row + 7, column=1, columnspan=2, sticky="w", pady=(0, 6))
         scale_menu = tk.OptionMenu(scale_frame, self.ui_scale_var,
@@ -2937,6 +3014,39 @@ class App:
         scale_menu.pack(side="left")
         tk.Label(scale_frame, text="⚠ Набирає чинності після перезапуску",
                  bg=self.theme["card_bg"], fg="#f59e0b").pack(side="left", padx=8)
+        # ── New workflow toggles ──────────────────────────────────────────────
+        tk.Checkbutton(
+            dialog,
+            text="Генерувати новий акт (копія файлу)",
+            variable=self.generate_new_act_var,
+            bg=self.theme["card_bg"],
+            fg=self.theme["label_fg"],
+            selectcolor=self.theme["entry_bg"],
+        ).grid(row=theme_row + 8, column=0, columnspan=3, sticky="w", padx=16, pady=(8, 2))
+        tk.Checkbutton(
+            dialog,
+            text="Запитувати папку при генерації",
+            variable=self.ask_output_dir_var,
+            bg=self.theme["card_bg"],
+            fg=self.theme["label_fg"],
+            selectcolor=self.theme["entry_bg"],
+        ).grid(row=theme_row + 9, column=0, columnspan=3, sticky="w", padx=16, pady=2)
+        tk.Checkbutton(
+            dialog,
+            text="Підтека для кожного клієнта",
+            variable=self.use_case_subfolder_var,
+            bg=self.theme["card_bg"],
+            fg=self.theme["label_fg"],
+            selectcolor=self.theme["entry_bg"],
+        ).grid(row=theme_row + 10, column=0, columnspan=3, sticky="w", padx=16, pady=2)
+        tk.Checkbutton(
+            dialog,
+            text="Зберегти форматування клітинок акту (центрування)",
+            variable=self.preserve_cell_xf_var,
+            bg=self.theme["card_bg"],
+            fg=self.theme["label_fg"],
+            selectcolor=self.theme["entry_bg"],
+        ).grid(row=theme_row + 11, column=0, columnspan=3, sticky="w", padx=16, pady=(2, 8))
         tk.Button(
             dialog,
             text="🔍 Аналізувати шаблон договору",
@@ -2945,7 +3055,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 8, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 8))
+        ).grid(row=theme_row + 12, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 8))
         tk.Button(
             dialog,
             text="📋 Журнал генерації",
@@ -2954,7 +3064,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 8, column=2, sticky="e", padx=16, pady=(0, 8))
+        ).grid(row=theme_row + 12, column=2, sticky="e", padx=16, pady=(0, 8))
         tk.Button(
             dialog,
             text="↺ Перезавантажити шаблон",
@@ -2963,7 +3073,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 9, column=0, sticky="w", padx=16, pady=8)
+        ).grid(row=theme_row + 13, column=0, sticky="w", padx=16, pady=8)
         tk.Button(
             dialog,
             text="Зберегти налаштування",
@@ -2972,7 +3082,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 9, column=1, sticky="w", pady=8)
+        ).grid(row=theme_row + 13, column=1, sticky="w", pady=8)
         tk.Button(
             dialog,
             text="Закрити",
@@ -2981,7 +3091,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 9, column=2, sticky="e", padx=12, pady=12)
+        ).grid(row=theme_row + 13, column=2, sticky="e", padx=12, pady=12)
         dialog.protocol("WM_DELETE_WINDOW", lambda: [self._save_settings(), dialog.destroy()])
 
         # Auto-fit height after all widgets are created
@@ -3307,6 +3417,10 @@ class App:
             "vidatkova_out_format": self.vidatkova_out_format.get(),
             "ui_scale": self.ui_scale_var.get(),
             "start_folder": self.start_folder_var.get(),
+            "generate_new_act": self.generate_new_act_var.get(),
+            "use_case_subfolder": self.use_case_subfolder_var.get(),
+            "ask_output_dir": self.ask_output_dir_var.get(),
+            "preserve_cell_xf": self.preserve_cell_xf_var.get(),
         })
 
     def paste_from_clipboard(self) -> None:
@@ -3364,7 +3478,8 @@ class App:
             if act_ext not in ("xls", "xlsx"):
                 act_ext = "xls"
             out_xls = out_dir / f"Акт{num_part}{ts}.xls"
-            generate_act_xls_from_state(state, Path(self.source_path.get()), out_xls)
+            generate_act_xls_from_state(state, Path(self.source_path.get()), out_xls,
+                                        preserve_xf=self.preserve_cell_xf_var.get())
             if act_ext == "xls":
                 out_path = out_xls
             else:
@@ -3441,7 +3556,8 @@ class App:
             if vid_ext not in ("xls", "xlsx"):
                 vid_ext = "xls"
             out_xls = out_dir / f"Видаткова{num_part}{ts}.xls"
-            generate_vidatkova_xls_from_state(state, Path(self.vidatkova_path.get()), out_xls)
+            generate_vidatkova_xls_from_state(state, Path(self.vidatkova_path.get()), out_xls,
+                                              preserve_xf=self.preserve_cell_xf_var.get())
             if vid_ext == "xls":
                 out_path = out_xls
             else:
@@ -3583,15 +3699,31 @@ class App:
                 self.write_log("Увага: пакетна генерація з незаповненими/помилковими полями")
                 self.write_log("; ".join(errors))
             base_out_dir = self._ensure_output_dir()
-            case_dir = base_out_dir / build_case_folder_name(state)
-            if case_dir.exists():
-                if not messagebox.askyesno(
-                    "Перезаписати?",
-                    f"Папка вже існує:\n{case_dir}\n\nПерезаписати всі документи?",
-                ):
+            # Ask for output folder if setting is enabled
+            if self.ask_output_dir_var.get():
+                chosen = filedialog.askdirectory(
+                    title="Оберіть папку для збереження документів",
+                    initialdir=str(base_out_dir),
+                )
+                if not chosen:
                     return
+                base_out_dir = Path(chosen)
+                base_out_dir.mkdir(parents=True, exist_ok=True)
+            # Determine output folder (with or without per-client subfolder)
+            if self.use_case_subfolder_var.get():
+                case_dir = base_out_dir / build_case_folder_name(state)
+                if case_dir.exists():
+                    if not messagebox.askyesno(
+                        "Перезаписати?",
+                        f"Папка вже існує:\n{case_dir}\n\nПерезаписати всі документи?",
+                    ):
+                        return
+            else:
+                case_dir = base_out_dir
             case_dir.mkdir(parents=True, exist_ok=True)
-            self.save_draft("act", open_after=False, output_dir=case_dir, use_timestamp=False, allow_incomplete=allow_incomplete)
+            # Generate new act only when toggle is enabled
+            if self.generate_new_act_var.get():
+                self.save_draft("act", open_after=False, output_dir=case_dir, use_timestamp=False, allow_incomplete=allow_incomplete)
             self.save_draft("contract", open_after=False, output_dir=case_dir, use_timestamp=False, allow_incomplete=allow_incomplete)
             self.save_draft("vidatkova", open_after=False, output_dir=case_dir, use_timestamp=False, allow_incomplete=allow_incomplete)
             transit_num = contract_number_for_filename(payload.get("Number", ""))
@@ -3602,11 +3734,14 @@ class App:
             transit_path.write_text(transit_summary_text(payload), encoding="utf-8")
             self.status_var.set(f"Усі документи збережено у {case_dir.name}")
             self.write_log(f"Усі документи збережено у {case_dir}")
-            if self.open_after_save.get():
-                try:
-                    open_file_with_preference(transit_path, self.editor_path.get().strip())
-                except Exception as exc:
-                    self.write_log(f"Не вдалося відкрити файл транзитів: {exc}")
+            # Open output folder in file manager
+            try:
+                if IS_WINDOWS:
+                    os.startfile(str(case_dir))  # type: ignore[attr-defined]
+                else:
+                    subprocess.Popen(["xdg-open", str(case_dir)])
+            except Exception as exc:
+                self.write_log(f"Не вдалося відкрити папку: {exc}")
         except Exception as exc:
             self.write_log(f"ERROR: {exc}")
             self.write_log(traceback.format_exc())
@@ -3812,7 +3947,7 @@ if tk is not None:
                 return
             self._show_step2()
             self.update_idletasks()
-            w, h = 660, 430
+            w, h = int(660 * _FONT_SCALE), int(430 * _FONT_SCALE)
             sx = self.winfo_screenwidth()
             sy = self.winfo_screenheight()
             self.geometry(f"{w}x{h}+{(sx - w) // 2}+{(sy - h) // 2}")
@@ -3906,7 +4041,8 @@ if tk is not None:
 
         def _on_generate(self) -> None:
             from tkinter import messagebox
-            src_dir = Path(self.app.source_path.get()).parent
+            src_path = Path(self.app.source_path.get())
+            src_dir = src_path.parent
             state = self.app.collect_state()
             payload, errors, _warnings = validate_state(state)
             if errors:
@@ -3921,8 +4057,24 @@ if tk is not None:
                 if not proceed:
                     return
             try:
-                self.app.save_draft("act", open_after=False, output_dir=src_dir,
-                                    use_timestamp=False, allow_incomplete=True)
+                if not self.app.generate_new_act_var.get():
+                    # Default: write only A3/C12/C50 into the EXISTING act (in-place)
+                    wizard_updates = {}
+                    for cell in ("A3", "C12", "C50"):
+                        val = state.get(cell, "").strip()
+                        if val:
+                            wizard_updates[cell] = val
+                    if wizard_updates:
+                        write_xls_cells(
+                            src_path, "Worksheet", wizard_updates,
+                            backup=False,
+                            force_a3_tnr10=("A3" in wizard_updates),
+                            preserve_xf=self.app.preserve_cell_xf_var.get(),
+                        )
+                else:
+                    # Generate a full new act copy
+                    self.app.save_draft("act", open_after=False, output_dir=src_dir,
+                                        use_timestamp=False, allow_incomplete=True)
                 self.app.save_draft("contract", open_after=False, output_dir=src_dir,
                                     use_timestamp=False, allow_incomplete=True)
                 self.app.save_draft("vidatkova", open_after=False, output_dir=src_dir,
@@ -3934,6 +4086,14 @@ if tk is not None:
                 transit_dir.mkdir(parents=True, exist_ok=True)
                 (transit_dir / transit_name).write_text(
                     transit_summary_text(payload), encoding="utf-8")
+                # Open output folder in file manager
+                try:
+                    if IS_WINDOWS:
+                        os.startfile(str(src_dir))  # type: ignore[attr-defined]
+                    else:
+                        subprocess.Popen(["xdg-open", str(src_dir)])
+                except Exception:
+                    pass
                 messagebox.showinfo("Готово ✓", f"Документи збережено:\n{src_dir}",
                                     parent=self)
             except Exception as exc:
@@ -4009,7 +4169,7 @@ def main() -> int:
     global _FONT_SCALE
     _cfg_early = load_app_config()
     _scale_str = str(_cfg_early.get("ui_scale", "1.0"))
-    if _scale_str in ("0.85", "1.0", "1.15", "1.3"):
+    if _scale_str in ("0.85", "1.0", "1.15", "1.3", "1.4", "1.5"):
         _FONT_SCALE = float(_scale_str)
 
     root = tk.Tk()
