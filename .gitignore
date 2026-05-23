@@ -11,8 +11,19 @@ dist/
 
 # Runtime artifacts
 out/
+Транзит/
+logs/
+jm_config.json
+autocomplete.json
 *_backup_*.xls
 *_vba.txt
+
+# Generated user documents (not for the repo)
+Акт№*.xls
+Договір№*.doc
+Договір№*.docx
+Видаткова№*.xls
+Номери транзиту*.txt
 
 # OS/editor
 .DS_Store

@@ -2492,6 +2492,20 @@ class App:
         self.root.title("Japan moto")
         self.root.geometry(f"{int(1320 * _FONT_SCALE)}x{int(920 * _FONT_SCALE)}")
         self.root.minsize(int(1160 * _FONT_SCALE), int(780 * _FONT_SCALE))
+        # Set application icon if available
+        _ico_candidates = [
+            self.resource_dir / "icon" / "iconwn.ico",
+            self.app_dir / "icon" / "iconwn.ico",
+            self.resource_dir / "iconwn.ico",
+            self.app_dir / "iconwn.ico",
+        ]
+        for _ico_path in _ico_candidates:
+            if _ico_path.exists():
+                try:
+                    self.root.iconbitmap(str(_ico_path))
+                except Exception:
+                    pass
+                break
         self.theme_pref = tk.StringVar(value="auto")
         self.theme_mode = detect_theme_mode()
         self.theme = build_theme_palette(self.theme_mode)
@@ -3077,7 +3091,7 @@ class App:
         tk.Button(
             dialog,
             text="Зберегти налаштування",
-            command=lambda: [self._save_settings(), self.save_source_changes(), dialog.destroy()],
+            command=lambda: [self._save_settings(), dialog.destroy()],
             bg=self.theme["btn_bg"],
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
@@ -3386,12 +3400,12 @@ class App:
     def save_source_changes(self) -> None:
         source = Path(self.source_path.get())
         state = self.collect_state()
-        updates = {cell: state.get(cell, "") for cell in FORM_CELLS if cell != "E15" and _XLS_CELL_RE.match(cell)}
-        updates["E15"] = short_name(state.get("C15", ""))
-        updates["C39"] = state.get("C39", "")
-        updates["C42"] = state.get("C42", "")
-        updates["C43"] = state.get("C39", "")  # C43 (Номер рами) auto-derived from VIN
-        write_xls_cells(source, "Worksheet", updates, backup=True)
+        # Exclude E15 and DISC — E15 is app-internal (short FIO shown in sidebar),
+        # writing it to the act causes a duplicate name to appear on screen.
+        updates = {cell: state.get(cell, "") for cell in FORM_CELLS
+                   if cell not in ("E15", "DISC") and _XLS_CELL_RE.match(cell)}
+        updates["C43"] = state.get("C39", "")  # C43 (Номер рами) = VIN
+        write_xls_cells(source, "Worksheet", updates, backup=False)  # no backup files in user folders
         self.write_log(f"Збережено 6055 у {source}")
         self.status_var.set(f"Збережено у {source.name}")
         self.reload_source()
@@ -3473,11 +3487,20 @@ class App:
         doc_num = contract_number_for_filename(payload.get("Number", ""))
         num_part = f" №{doc_num}" if doc_num else ""
 
+        def _remove_if_exists(p: Path) -> None:
+            """Delete a file silently so the next write is a clean overwrite."""
+            try:
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+
         if kind == "act":
             act_ext = self.act_out_format.get().strip().lower()
             if act_ext not in ("xls", "xlsx"):
                 act_ext = "xls"
             out_xls = out_dir / f"Акт{num_part}{ts}.xls"
+            _remove_if_exists(out_xls)
             generate_act_xls_from_state(state, Path(self.source_path.get()), out_xls,
                                         preserve_xf=self.preserve_cell_xf_var.get())
             if act_ext == "xls":
@@ -3500,6 +3523,7 @@ class App:
             if ext not in ("doc", "docx"):
                 ext = "doc"
             out_doc = out_dir / f"Договір{num_part}{ts}.{ext}"
+            _remove_if_exists(out_doc)
             out_path = out_doc
             _com_enabled = IS_WINDOWS and self.use_word_com.get()
             if _com_enabled:
@@ -3556,6 +3580,7 @@ class App:
             if vid_ext not in ("xls", "xlsx"):
                 vid_ext = "xls"
             out_xls = out_dir / f"Видаткова{num_part}{ts}.xls"
+            _remove_if_exists(out_xls)
             generate_vidatkova_xls_from_state(state, Path(self.vidatkova_path.get()), out_xls,
                                               preserve_xf=self.preserve_cell_xf_var.get())
             if vid_ext == "xls":
@@ -3849,15 +3874,16 @@ if tk is not None:
             super().__init__(master)
             self.app = app
             self.title("Japan moto")
-            self.resizable(False, False)
+            self.resizable(True, True)
             self.protocol("WM_DELETE_WINDOW", self._on_close)
             self._show_step1()
             self.update_idletasks()
             self.after(200, self._browse)
-            w, h = 620, 270
+            w, h = int(620 * _FONT_SCALE), int(290 * _FONT_SCALE)
             sx = self.winfo_screenwidth()
             sy = self.winfo_screenheight()
             self.geometry(f"{w}x{h}+{(sx - w) // 2}+{(sy - h) // 2}")
+            self.minsize(int(520 * _FONT_SCALE), int(220 * _FONT_SCALE))
             self.lift()
             self.focus_force()
 
@@ -3947,10 +3973,11 @@ if tk is not None:
                 return
             self._show_step2()
             self.update_idletasks()
-            w, h = int(660 * _FONT_SCALE), int(430 * _FONT_SCALE)
+            w, h = int(660 * _FONT_SCALE), int(440 * _FONT_SCALE)
             sx = self.winfo_screenwidth()
             sy = self.winfo_screenheight()
             self.geometry(f"{w}x{h}+{(sx - w) // 2}+{(sy - h) // 2}")
+            self.minsize(int(540 * _FONT_SCALE), int(360 * _FONT_SCALE))
 
         def _show_step2(self) -> None:
             self._clear()
@@ -3987,6 +4014,22 @@ if tk is not None:
                      fg=t["section_fg"], font=("Segoe UI", _fs(14), "bold")).grid(
                 row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
+            self._generate_prompted = False
+            _wizard_cells = ("A3", "C12", "C50")
+
+            def _check_all_filled(*_args):
+                if self._generate_prompted:
+                    return
+                if all(self.app.state_vars[c].get().strip() for c in _wizard_cells):
+                    self._generate_prompted = True
+                    if messagebox.askyesno(
+                        "Поля заповнені",
+                        "Усі три поля заповнені.\nГенерувати документи зараз?",
+                        default=messagebox.YES,
+                        parent=self,
+                    ):
+                        self._on_generate()
+
             for i, (cell, label) in enumerate([
                 ("A3", "Номер акта *"),
                 ("C12", "Дата народження клієнта"),
@@ -4001,6 +4044,7 @@ if tk is not None:
                          highlightthickness=1, bd=0,
                          font=("Segoe UI", _fs(10))).grid(
                     row=i + 1, column=1, sticky="ew", pady=6, ipady=4)
+                self.app.state_vars[cell].trace_add("write", _check_all_filled)
 
             btn_row = tk.Frame(self, bg=t["root_bg"])
             btn_row.pack(fill="x", padx=12, pady=(0, 12))

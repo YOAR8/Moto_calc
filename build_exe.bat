@@ -15,8 +15,8 @@ if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
 
 set ICON_ARG=
+if exist "icon\iconwn.ico" set ICON_ARG=--icon "icon\iconwn.ico"
 if exist "assets\japanmoto.ico" set ICON_ARG=--icon "assets\japanmoto.ico"
-if exist "japanmoto.ico" set ICON_ARG=--icon "japanmoto.ico"
 
 pyinstaller ^
   --noconfirm ^
@@ -30,6 +30,7 @@ pyinstaller ^
   --add-data "6055.xls;." ^
   --add-data "DOGOVIR_6055_template.doc;." ^
   --add-data "vidatkova.xls;." ^
+  --add-data "icon\iconwn.ico;icon" ^
   %ICON_ARG% ^
   app_6055.py
 
