@@ -3876,6 +3876,12 @@ if tk is not None:
             self.title("Japan moto")
             self.resizable(True, True)
             self.protocol("WM_DELETE_WINDOW", self._on_close)
+            # Inherit root icon explicitly (required on some Windows builds)
+            if IS_WINDOWS:
+                try:
+                    self.iconbitmap(master.iconbitmap())
+                except Exception:
+                    pass
             self._show_step1()
             self.update_idletasks()
             self.after(200, self._browse)
@@ -4218,6 +4224,49 @@ def main() -> int:
 
     root = tk.Tk()
     root.withdraw()  # Hidden until the wizard hands control to the full form.
+
+    # Set window icon as early as possible so every Toplevel inherits it.
+    _ico_candidates_main = [
+        runtime_resource_dir() / "icon" / "iconwn.ico",
+        runtime_app_dir() / "icon" / "iconwn.ico",
+        runtime_resource_dir() / "iconwn.ico",
+        runtime_app_dir() / "iconwn.ico",
+    ]
+    _app_ico_path: Path | None = None
+    for _p in _ico_candidates_main:
+        if _p.exists():
+            _app_ico_path = _p
+            break
+    if _app_ico_path and IS_WINDOWS:
+        try:
+            root.iconbitmap(str(_app_ico_path))
+        except Exception:
+            pass
+
+    # On first run (Windows only): offer to create a desktop shortcut.
+    if IS_WINDOWS and getattr(sys, "frozen", False) and not _cfg_early.get("shortcut_offered"):
+        try:
+            _exe = Path(sys.executable)
+            _desktop = Path(os.environ.get("USERPROFILE", "")) / "Desktop"
+            _lnk = _desktop / "Japan moto.lnk"
+            if not _lnk.exists() and _desktop.exists():
+                _ps = (
+                    f'$ws=New-Object -ComObject WScript.Shell;'
+                    f'$s=$ws.CreateShortcut("{_lnk}");'
+                    f'$s.TargetPath="{_exe}";'
+                    f'$s.WorkingDirectory="{_exe.parent}";'
+                    f'$s.IconLocation="{_exe},0";'
+                    f'$s.Description="Japan moto - акт, договір, видаткова";'
+                    f'$s.Save()'
+                )
+                subprocess.run(
+                    ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", _ps],
+                    capture_output=True, timeout=10,
+                )
+        except Exception:
+            pass
+        _cfg_early["shortcut_offered"] = True
+        save_app_config(_cfg_early)
 
     def _tk_report_callback_exception(exc, val, tb):
         try:
