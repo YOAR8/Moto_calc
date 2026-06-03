@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   build-windows:
-    runs-on: windows-2025
+    runs-on: windows-2025-vs2026
 
     steps:
       - name: Checkout
@@ -36,20 +36,26 @@ jobs:
       - name: Build onedir exe
         shell: pwsh
         run: |
-          $iconArg = ""
-          if (Test-Path "icon/iconwn.ico") { $iconArg = "--icon icon/iconwn.ico" }
-          python -m PyInstaller --noconfirm --clean --noupx --onedir --windowed --name JapanMoto `
-            --collect-submodules win32com --collect-data win32com `
-            --add-data "6055.xls;." `
-            --add-data "6055_MOTO_template.xls;." `
-            --add-data "DOGOVIR_6055_template.doc;." `
-            --add-data "vidatkova.xls;." `
-            --add-data "icon/iconwn.ico;icon" `
-            --add-data "icon/iconwn 48.ico;icon" `
-            --add-data "icon/iconwn 64.ico;icon" `
-            --add-data "ІНСТРУКЦІЯ.md;." `
-            $iconArg `
-            app_6055.py
+          $args = @(
+            '-m', 'PyInstaller',
+            '--noconfirm', '--clean', '--noupx', '--onedir', '--windowed',
+            '--name', 'JapanMoto',
+            '--collect-submodules', 'win32com',
+            '--collect-data', 'win32com',
+            '--add-data', '6055.xls;.',
+            '--add-data', '6055_MOTO_template.xls;.',
+            '--add-data', 'DOGOVIR_6055_template.doc;.',
+            '--add-data', 'vidatkova.xls;.',
+            '--add-data', 'icon/iconwn.ico;icon',
+            '--add-data', 'icon/iconwn 48.ico;icon',
+            '--add-data', 'icon/iconwn 64.ico;icon',
+            '--add-data', 'ІНСТРУКЦІЯ.md;.',
+            'app_6055.py'
+          )
+          if (Test-Path 'icon/iconwn.ico') {
+            $args += @('--icon', 'icon/iconwn.ico')
+          }
+          python @args
 
       - name: Copy helper files to dist
         shell: pwsh

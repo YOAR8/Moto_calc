@@ -2618,7 +2618,7 @@ class App:
         self.generate_new_act_var = tk.BooleanVar(value=False)
         self.use_case_subfolder_var = tk.BooleanVar(value=False)
         self.ask_output_dir_var = tk.BooleanVar(value=False)
-        self.preserve_cell_xf_var = tk.BooleanVar(value=False)
+        self.preserve_cell_xf_var = tk.BooleanVar(value=True)
 
         self.state_vars: Dict[str, tk.StringVar] = {}
         self.widgets: Dict[str, tk.Entry] = {}
@@ -2672,7 +2672,7 @@ class App:
         self.generate_new_act_var.set(bool(_cfg.get("generate_new_act", False)))
         self.use_case_subfolder_var.set(bool(_cfg.get("use_case_subfolder", False)))
         self.ask_output_dir_var.set(bool(_cfg.get("ask_output_dir", False)))
-        self.preserve_cell_xf_var.set(bool(_cfg.get("preserve_cell_xf", False)))
+        self.preserve_cell_xf_var.set(bool(_cfg.get("preserve_cell_xf", True)))
 
         try:
             self.app_log_path = configure_app_logging(self.app_dir / "logs")
