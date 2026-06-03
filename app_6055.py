@@ -3577,13 +3577,17 @@ class App:
         try:
             text = self.root.clipboard_get()
         except Exception:
+            self.write_log("Буфер недоступний: clipboard_get() викликав виняток")
             self.status_var.set("Буфер порожній або недоступний")
             return
         if not text or not text.strip():
+            self.write_log("Буфер порожній: вставка скасована")
             self.status_var.set("Буфер порожній")
             return
+        self.write_log(f"Буфер отримано: {len(text)} символів")
         filled = _parse_clipboard_to_fields(text)
         if not filled:
+            self.write_log("Буфер не розпізнано: жодне поле не витягнуто")
             self.status_var.set("Не розпізнано жодного поля з буфера обміну")
             return
         self._syncing_form = True
@@ -3596,6 +3600,33 @@ class App:
         self.write_log(f"Вставлено з буфера: {', '.join(filled.keys())}")
         self.status_var.set(f"Заповнено {len(filled)} поля(-ів) з буфера")
         self.refresh_validation(silent=True)
+
+    def _resolve_template_path(self, configured_path: str, default_name: str) -> Path:
+        """Resolve template path with runtime fallbacks for packaged builds."""
+        candidates: list[Path] = []
+        if configured_path:
+            candidates.append(Path(configured_path))
+        candidates.extend([
+            self.resource_dir / default_name,
+            self.app_dir / default_name,
+            runtime_resource_dir() / default_name,
+            runtime_app_dir() / default_name,
+            Path.cwd() / default_name,
+        ])
+        seen: set[str] = set()
+        uniq: list[Path] = []
+        for c in candidates:
+            k = str(c)
+            if k not in seen:
+                seen.add(k)
+                uniq.append(c)
+        for c in uniq:
+            if c.exists():
+                if configured_path and str(c) != configured_path:
+                    self.write_log(f"Шаблон '{default_name}' взято з fallback: {c}")
+                return c
+        self.write_log(f"Шаблон '{default_name}' не знайдено. Перевірено: " + " | ".join(str(c) for c in uniq))
+        raise FileNotFoundError(f"Template not found: {default_name}")
 
     def current_payload(self) -> Dict[str, str]:
         payload, errors, warnings = validate_state(self.collect_state())
@@ -3612,6 +3643,10 @@ class App:
     def save_draft(self, kind: str, open_after: bool = True, output_dir: Path | None = None, use_timestamp: bool = True, allow_incomplete: bool = False) -> Path:
         state = self.collect_state()
         payload, errors, warnings = validate_state(state)
+        self.write_log(
+            f"save_draft start: kind={kind}, out={output_dir or self.output_dir_var.get()}, "
+            f"ts={'on' if use_timestamp else 'off'}, allow_incomplete={allow_incomplete}"
+        )
         if errors and not allow_incomplete:
             raise ValueError("Потрібно виправити помилки перед збереженням: " + "; ".join(errors))
         if errors and allow_incomplete:
@@ -3653,7 +3688,8 @@ class App:
                     self.write_log("Не вдалося конвертувати Акт у .xlsx, залишаю .xls")
                     out_path = out_xls
         elif kind == "contract":
-            template_doc = Path(self.dogovir_path.get())
+            template_doc = self._resolve_template_path(self.dogovir_path.get(), "DOGOVIR_6055_template.doc")
+            self.write_log(f"Шаблон договору: {template_doc}")
             ext = self.contract_out_format.get().strip().lower()
             if ext not in ("doc", "docx"):
                 ext = "doc"
@@ -3711,12 +3747,14 @@ class App:
                         out_path = out_doc.with_suffix(".txt")
                         save_text_preview(out_path, "ЧОРНОВИК ДОГОВОРУ", preview_text_for_contract(payload))
         elif kind == "vidatkova":
+            tpl = self._resolve_template_path(self.vidatkova_path.get(), "vidatkova.xls")
+            self.write_log(f"Шаблон видаткової: {tpl}")
             vid_ext = self.vidatkova_out_format.get().strip().lower()
             if vid_ext not in ("xls", "xlsx"):
                 vid_ext = "xls"
             out_xls = out_dir / f"Видаткова{num_part}{ts}.xls"
             _remove_if_exists(out_xls)
-            generate_vidatkova_xls_from_state(state, Path(self.vidatkova_path.get()), out_xls,
+            generate_vidatkova_xls_from_state(state, tpl, out_xls,
                                               preserve_xf=self.preserve_cell_xf_var.get())
             if vid_ext == "xls":
                 out_path = out_xls
@@ -3733,9 +3771,11 @@ class App:
                     self.write_log("Не вдалося конвертувати Видаткову у .xlsx, залишаю .xls")
                     out_path = out_xls
         elif kind == "moto_act":
+            tpl = self._resolve_template_path(self.moto_act_path.get(), "6055_MOTO_template.xls")
+            self.write_log(f"Шаблон акту прийому-передачі: {tpl}")
             out_xls = out_dir / f"Акт МОТО{num_part}{ts}.xls"
             _remove_if_exists(out_xls)
-            generate_moto_act_xls_from_state(state, Path(self.moto_act_path.get()), out_xls,
+            generate_moto_act_xls_from_state(state, tpl, out_xls,
                                              preserve_xf=self.preserve_cell_xf_var.get())
             out_path = out_xls
         else:
@@ -3751,6 +3791,7 @@ class App:
                 open_file_with_preference(out_path, self.editor_path.get().strip())
             except Exception as exc:
                 self.write_log(f"Не вдалося відкрити файл: {exc}")
+            self.write_log(f"save_draft done: kind={kind}, path={out_path}")
         return out_path
 
     def _ask_generate_with_errors(self, errors: list) -> bool:
@@ -4163,20 +4204,50 @@ if tk is not None:
                 row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
             self._generate_prompted = False
-            _wizard_cells = ("A3", "C50")
+            _required_cells = ("A3", "C50", "C15", "PHONE")
+            _entry_widgets: dict[str, tk.Entry] = {}
 
-            def _check_all_filled(*_args):
+            def _valid_like(cell: str, value: str) -> bool:
+                v = value.strip()
+                if not v:
+                    return False
+                if cell == "A3":
+                    return "№" in v and "від" in v.lower()
+                if cell == "C50":
+                    return re.fullmatch(r"[А-ЯІЇЄҐ]{2}\d{4,5}[А-ЯІЇЄҐ]{2}\d?", v, re.IGNORECASE) is not None
+                if cell == "PHONE":
+                    digits = re.sub(r"\D", "", v)
+                    if digits.startswith("380"):
+                        digits = "0" + digits[3:]
+                    return re.fullmatch(r"0\d{9}", digits) is not None
+                if cell == "C15":
+                    return len([t for t in v.split() if t]) >= 2
+                return True
+
+            def _all_ready() -> bool:
+                for c in _required_cells:
+                    vv = self.app.state_vars[c].get()
+                    if not _valid_like(c, vv):
+                        return False
+                return True
+
+            def _maybe_prompt_on_focus_out(_event=None) -> None:
                 if self._generate_prompted:
                     return
-                if all(self.app.state_vars[c].get().strip() for c in _wizard_cells):
-                    self._generate_prompted = True
-                    if messagebox.askyesno(
-                        "Поля заповнені",
-                        "Усі три поля заповнені.\nГенерувати документи зараз?",
-                        default=messagebox.YES,
-                        parent=self,
-                    ):
-                        self._on_generate()
+                focused = self.focus_get()
+                if focused in _entry_widgets.values():
+                    return
+                if not _all_ready():
+                    return
+                self._generate_prompted = True
+                self.app.write_log("Wizard: всі обов'язкові поля валідні після втрати фокусу")
+                if messagebox.askyesno(
+                    "Поля заповнені",
+                    "Усі ключові поля заповнені.\nГенерувати документи зараз?",
+                    default=messagebox.YES,
+                    parent=self,
+                ):
+                    self._on_generate()
 
             for i, (cell, label) in enumerate([
                 ("A3", "Номер акта *"),
@@ -4187,13 +4258,16 @@ if tk is not None:
                 tk.Label(body, text=label, bg=t["card_bg"], fg=t["label_fg"],
                          anchor="w", font=("Segoe UI", _fs(10))).grid(
                     row=i + 1, column=0, sticky="w", padx=(0, 14), pady=6)
-                tk.Entry(body, textvariable=self.app.state_vars[cell],
+                _e = tk.Entry(body, textvariable=self.app.state_vars[cell],
                          bg=t["entry_bg"], fg=t["entry_fg"],
                          insertbackground=t["entry_insert"], relief="flat",
                          highlightthickness=1, bd=0,
-                         font=("Segoe UI", _fs(10))).grid(
+                         font=("Segoe UI", _fs(10)))
+                _e.grid(
                     row=i + 1, column=1, sticky="ew", pady=6, ipady=4)
-                self.app.state_vars[cell].trace_add("write", _check_all_filled)
+                _entry_widgets[cell] = _e
+                self.app._add_copy_paste_menu(_e)
+                _e.bind("<FocusOut>", lambda _evt: self.after(20, _maybe_prompt_on_focus_out))
 
             btn_row = tk.Frame(self, bg=t["root_bg"])
             btn_row.pack(fill="x", padx=12, pady=(0, 12))
@@ -4222,10 +4296,13 @@ if tk is not None:
             try:
                 text = self.master.clipboard_get()
             except Exception:
+                self.app.write_log("Wizard: буфер недоступний")
                 return
             if not text or not text.strip():
+                self.app.write_log("Wizard: буфер порожній")
                 return
             filled = _parse_clipboard_to_fields(text)
+            self.app.write_log("Wizard: вставлено з буфера -> " + ", ".join(sorted(filled.keys())) if filled else "Wizard: вставка не розпізнала поля")
             for cell, value in filled.items():
                 if cell in self.app.state_vars and value:
                     self.app.state_vars[cell].set(value)
