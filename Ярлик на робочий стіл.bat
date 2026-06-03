@@ -23,7 +23,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
    $s.TargetPath = $exe; ^
    $s.WorkingDirectory = $work; ^
    $s.Description = 'Japan moto - акт, договір, видаткова'; ^
-   if (Test-Path $ico) { $s.IconLocation = $ico } else { $s.IconLocation = $exe + ',0' }; ^
+   if (Test-Path $ico) { $s.IconLocation = "$ico,0" } else { $s.IconLocation = "$exe,0" }; ^
    $s.Save(); ^
    Write-Host 'Ярлик створено на робочому столі: ' + $lnk"
 

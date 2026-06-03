@@ -895,6 +895,7 @@ FIELD_SECTIONS = [
             ("C15", "ПІБ покупця", True),
             ("E15", "ПІБ скорочено", False),
             ("C12", "Дата народження", False),
+            ("PHONE", "Телефон покупця", False),
             ("C16", "Адреса", True),
             ("C17", "Паспорт", True),
             ("C18", "ІПН / код", True),
@@ -1383,7 +1384,28 @@ def generate_act_xls_from_state(state: Dict[str, str], source_6055: Path, out_pa
     return out_path
 
 
-def generate_vidatkova_xls_from_state(state: Dict[str, str], template_path: Path, out_path: Path, preserve_xf: bool = False) -> Path:
+def generate_moto_act_xls_from_state(state: Dict[str, str], template_path: Path, out_path: Path, preserve_xf: bool = True) -> Path:
+    """Fill 6055_MOTO_template.xls from state (акт прийому-передачі)."""
+    payload = parse_state(state)
+    shutil.copy2(template_path, out_path)
+    number, date_txt = split_number_date(state.get("A3", ""))
+    fio = payload.get("FIO", "")
+    fio_short = str(state.get("E15", "")).strip() or short_name(fio)
+    updates: Dict[str, object] = {
+        "B12": number,
+        "L12": date_txt,
+        "H18": fio,
+        "C24": payload.get("model", ""),
+        "E24": payload.get("year", ""),
+        "H24": payload.get("cuzov", ""),
+        "K24": payload.get("color", ""),
+        "N33": fio_short,
+    }
+    write_xls_cells(out_path, "Worksheet", updates, backup=False, preserve_xf=preserve_xf)
+    return out_path
+
+
+def generate_vidatkova_xls_from_state(state: Dict[str, str], template_path: Path, out_path: Path, preserve_xf: bool = True) -> Path:
     payload = parse_state(state)
     shutil.copy2(template_path, out_path)
 
@@ -1403,9 +1425,10 @@ def generate_vidatkova_xls_from_state(state: Dict[str, str], template_path: Path
         price_total_d = price_total
         sumtext = payload.get("sumtext", "")
 
+    phone = str(state.get("PHONE", "")).strip()
     updates: Dict[str, object] = {
         "C6": payload["FIO"],
-        "C7": "той самий",
+        "C7": f"той самий  тел. {phone}" if phone else "той самий",
         "G9": payload["A3"],
         "D10": payload["A3"],
         "B13": payload.get("C21", "МОПЕД"),
@@ -1424,7 +1447,7 @@ def generate_vidatkova_xls_from_state(state: Dict[str, str], template_path: Path
     }
     if discount > 0:
         updates["H14"] = discount
-    write_xls_cells(out_path, "Лист1", updates, backup=False, preserve_xf=preserve_xf)
+    write_xls_cells(out_path, "Лист1", updates, backup=False, preserve_xf=True)
     return out_path
 
 
@@ -1976,6 +1999,19 @@ def _parse_clipboard_to_fields(text: str) -> Dict[str, str]:
     if transit_m and "C50" not in result:
         result["C50"] = transit_m.group(1)
 
+    # Телефон: +380XXXXXXXXX / 0XXXXXXXXX / with separators
+    phone_m = re.search(r'(?<!\d)(\+?380\s*\(?\d{2}\)?\s*\d{3}[\s-]*\d{2}[\s-]*\d{2}|0\d{2}\s*\d{3}[\s-]*\d{2}[\s-]*\d{2})(?!\d)', clean)
+    if phone_m:
+        phone_raw = re.sub(r'[^\d+]', '', phone_m.group(1))
+        if phone_raw.startswith("+380"):
+            phone_digits = "0" + phone_raw[4:]
+        elif phone_raw.startswith("380"):
+            phone_digits = "0" + phone_raw[3:]
+        else:
+            phone_digits = phone_raw
+        if re.fullmatch(r'0\d{9}', phone_digits):
+            result["PHONE"] = phone_digits
+
     # ПІБ: Ukrainian person name = exactly 3 uppercase Cyrillic words where
     # the LAST word (patronymic) ends with a known Ukrainian/Russian suffix.
     # Prevents matching institution names like "ДЕРЖАВНА МИТНА СЛУЖБА".
@@ -2154,6 +2190,45 @@ class SmartEntry(tk.Frame if tk is not None else object):
         self._text.bind("<Tab>", self._on_tab)
         self._text.bind("<Return>", self._on_return)
         self._text.bind("<<Paste>>", self._after_paste)
+        self._text.bind("<Control-c>", self._on_ctrl_copy)
+        self._text.bind("<Control-C>", self._on_ctrl_copy)
+        self._text.bind("<Control-x>", self._on_ctrl_cut)
+        self._text.bind("<Control-X>", self._on_ctrl_cut)
+        self._text.bind("<Control-v>", self._on_ctrl_paste)
+        self._text.bind("<Control-V>", self._on_ctrl_paste)
+
+    def _on_ctrl_copy(self, event=None) -> str:
+        try:
+            selected = self._text.get("sel.first", "sel.last")
+            self._text.clipboard_clear()
+            self._text.clipboard_append(selected)
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _on_ctrl_cut(self, event=None) -> str:
+        try:
+            selected = self._text.get("sel.first", "sel.last")
+            self._text.clipboard_clear()
+            self._text.clipboard_append(selected)
+            self._text.delete("sel.first", "sel.last")
+            self._sync_to_var()
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _on_ctrl_paste(self, event=None) -> str:
+        try:
+            clip = self._text.clipboard_get()
+            try:
+                self._text.delete("sel.first", "sel.last")
+            except tk.TclError:
+                pass
+            self._text.insert("insert", clip)
+            self._sync_to_var()
+        except Exception:
+            pass
+        return "break"
 
     def _after_paste(self, event=None) -> None:
         """Ensure StringVar syncs after clipboard paste (deferred to allow text insertion)."""
@@ -2382,6 +2457,21 @@ class AutocompleteEntry(tk.Entry if tk is not None else object):
         self.bind("<Up>", self._move_up)
         self.bind("<Tab>", self._on_tab)
         self.bind("<Return>", self._on_enter)
+        self.bind("<Control-v>", self._on_ctrl_paste)
+        self.bind("<Control-V>", self._on_ctrl_paste)
+
+    def _on_ctrl_paste(self, event=None):
+        try:
+            text = self.clipboard_get()
+            try:
+                self.delete("sel.first", "sel.last")
+            except tk.TclError:
+                pass
+            self.insert(tk.INSERT, text)
+        except Exception:
+            pass
+        self._close()
+        return "break"
 
     def _candidates(self) -> list:
         typed = self._var.get().strip().upper()
@@ -2514,6 +2604,7 @@ class App:
         self.moto_path = tk.StringVar(value=str(self.resource_dir / "6055.xls"))
         self.dogovir_path = tk.StringVar(value=str(self.resource_dir / "DOGOVIR_6055_template.doc"))
         self.vidatkova_path = tk.StringVar(value=str(self.resource_dir / "vidatkova.xls"))
+        self.moto_act_path = tk.StringVar(value=str(self.resource_dir / "6055_MOTO_template.xls"))
         self.output_dir_var = tk.StringVar(value=str(self.out_dir))
         self.editor_path = tk.StringVar(value="")
         self.open_after_save = tk.BooleanVar(value=True)
@@ -2552,6 +2643,8 @@ class App:
             self.dogovir_path.set(_cfg["dogovir_path"])
         if _cfg.get("vidatkova_path"):
             self.vidatkova_path.set(_cfg["vidatkova_path"])
+        if _cfg.get("moto_act_path"):
+            self.moto_act_path.set(_cfg["moto_act_path"])
         if _cfg.get("output_dir"):
             self.output_dir_var.set(_cfg["output_dir"])
         if _cfg.get("editor_path"):
@@ -2636,10 +2729,11 @@ class App:
         self._make_toolbar_button(toolbar, "Акт", lambda: self.open_draft("act"), 0)
         self._make_toolbar_button(toolbar, "Договір", lambda: self.open_draft("contract"), 1)
         self._make_toolbar_button(toolbar, "Видаткова", lambda: self.open_draft("vidatkova"), 2)
-        self._make_toolbar_button(toolbar, "↺ Відновити з файлу", self.reload_source, 3)
-        self._make_toolbar_button(toolbar, "✖ Очистити", self.clear_form, 4)
-        self._make_toolbar_button(toolbar, "⟲ Генерувати", self.generate_all, 5)
-        self._make_toolbar_button(toolbar, "↓ Вставити", self.paste_from_clipboard, 6)
+        self._make_toolbar_button(toolbar, "Акт МОТО", lambda: self.open_draft("moto_act"), 3)
+        self._make_toolbar_button(toolbar, "↺ Відновити з файлу", self.reload_source, 4)
+        self._make_toolbar_button(toolbar, "✖ Очистити", self.clear_form, 5)
+        self._make_toolbar_button(toolbar, "⟲ Генерувати", self.generate_all, 6)
+        self._make_toolbar_button(toolbar, "↓ Вставити", self.paste_from_clipboard, 7)
 
         gear_btn = tk.Button(
             header, text="⚙", command=self.open_settings_dialog,
@@ -2711,6 +2805,39 @@ class App:
             def _select_all(event: "tk.Event") -> str:
                 target.tag_add("sel", "1.0", "end")
                 return "break"
+
+            def _copy_fn(event=None) -> str:
+                try:
+                    data = target.get("sel.first", "sel.last")
+                    target.clipboard_clear()
+                    target.clipboard_append(data)
+                except tk.TclError:
+                    pass
+                return "break"
+
+            def _cut_fn(event=None) -> str:
+                try:
+                    data = target.get("sel.first", "sel.last")
+                    target.clipboard_clear()
+                    target.clipboard_append(data)
+                    target.delete("sel.first", "sel.last")
+                    entry._sync_to_var()
+                except tk.TclError:
+                    pass
+                return "break"
+
+            def _paste_fn(event=None) -> str:
+                try:
+                    data = target.clipboard_get()
+                    try:
+                        target.delete("sel.first", "sel.last")
+                    except tk.TclError:
+                        pass
+                    target.insert("insert", data)
+                    entry._sync_to_var()
+                except Exception:
+                    pass
+                return "break"
         else:
             target = entry
 
@@ -2723,10 +2850,41 @@ class App:
                 event.widget.icursor("end")
                 return "break"
 
+            def _copy_fn(event=None) -> str:
+                try:
+                    data = target.selection_get()
+                    target.clipboard_clear()
+                    target.clipboard_append(data)
+                except tk.TclError:
+                    pass
+                return "break"
+
+            def _cut_fn(event=None) -> str:
+                try:
+                    data = target.selection_get()
+                    target.clipboard_clear()
+                    target.clipboard_append(data)
+                    target.delete("sel.first", "sel.last")
+                except tk.TclError:
+                    pass
+                return "break"
+
+            def _paste_fn(event=None) -> str:
+                try:
+                    data = target.clipboard_get()
+                    try:
+                        target.delete("sel.first", "sel.last")
+                    except tk.TclError:
+                        pass
+                    target.insert("insert", data)
+                except Exception:
+                    pass
+                return "break"
+
         menu = tk.Menu(target, tearoff=0)
-        menu.add_command(label="Вирізати", command=lambda: target.event_generate("<<Cut>>"))
-        menu.add_command(label="Копіювати", command=lambda: target.event_generate("<<Copy>>"))
-        menu.add_command(label="Вставити", command=lambda: target.event_generate("<<Paste>>"))
+        menu.add_command(label="Вирізати", command=_cut_fn)
+        menu.add_command(label="Копіювати", command=_copy_fn)
+        menu.add_command(label="Вставити", command=_paste_fn)
         menu.add_separator()
         menu.add_command(label="Виділити все", command=_select_all_fn)
 
@@ -2735,6 +2893,12 @@ class App:
 
         target.bind("<Button-3>", _show_menu)
         target.bind("<Control-a>", _select_all)
+        target.bind("<Control-c>", _copy_fn)
+        target.bind("<Control-C>", _copy_fn)
+        target.bind("<Control-x>", _cut_fn)
+        target.bind("<Control-X>", _cut_fn)
+        target.bind("<Control-v>", _paste_fn)
+        target.bind("<Control-V>", _paste_fn)
 
     def _build_data_tab(self, parent: tk.Frame) -> None:
         parent.columnconfigure(0, weight=1)
@@ -2840,37 +3004,6 @@ class App:
             if cell != "E15":
                 var.trace_add("write", self._on_state_change)
 
-    def _build_settings_tab(self, parent: ttk.Frame) -> None:
-        parent.columnconfigure(1, weight=1)
-
-        rows = [
-            ("6055.xls", self.source_path, True),
-            ("6055.xls (шаблон акта)", self.moto_path, True),
-            ("DOGOVIR_6055_template.doc", self.dogovir_path, True),
-            ("vidatkova.xls", self.vidatkova_path, False),
-            ("Output folder", tk.StringVar(value=str(self.out_dir)), False),
-            ("Editor path", self.editor_path, False),
-        ]
-
-        self.output_dir_var = rows[4][1]
-
-        for row, (label, var, editable) in enumerate(rows):
-            ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 10), pady=5)
-            entry = ttk.Entry(parent, textvariable=var)
-            entry.grid(row=row, column=1, sticky="ew", pady=5)
-            if label in {"6055.xls", "6055.xls (шаблон акта)", "DOGOVIR_6055_template.doc", "vidatkova.xls", "Output folder", "Editor path"}:
-                ttk.Button(parent, text="Огляд", command=lambda v=var: self.browse_path(v)).grid(row=row, column=2, padx=(8, 0))
-
-        ttk.Checkbutton(parent, text="Відкривати файл після генерації", variable=self.open_after_save).grid(row=6, column=0, columnspan=2, sticky="w", pady=(12, 0))
-        ttk.Button(parent, text="Перезавантажити шаблон", command=self.reload_source).grid(row=7, column=0, sticky="w", pady=(12, 0))
-        ttk.Button(parent, text="Зберегти новий шаблон", command=self.save_source_changes).grid(row=7, column=1, sticky="w", pady=(12, 0))
-
-    def _build_log_tab(self, parent: ttk.Frame) -> None:
-        parent.rowconfigure(0, weight=1)
-        parent.columnconfigure(0, weight=1)
-        self.log = tk.Text(parent, height=12, wrap="word")
-        self.log.grid(row=0, column=0, sticky="nsew")
-
     def browse_path(self, var: tk.StringVar) -> None:
         if var is self.output_dir_var or var is self.start_folder_var:
             cur_dir = var.get() or str(self.out_dir)
@@ -2894,6 +3027,7 @@ class App:
             ("Шаблон акту", self.moto_path),
             ("Шаблон договору", self.dogovir_path),
             ("Шаблон видаткової", self.vidatkova_path),
+            ("Шаблон акту МОТО", self.moto_act_path),
             ("Папка збереження", self.output_dir_var),
             ("Папка старту", self.start_folder_var),
             ("Редактор", self.editor_path),
@@ -3419,6 +3553,7 @@ class App:
             "moto_path": self.moto_path.get(),
             "dogovir_path": self.dogovir_path.get(),
             "vidatkova_path": self.vidatkova_path.get(),
+            "moto_act_path": self.moto_act_path.get(),
             "output_dir": self.output_dir_var.get(),
             "editor_path": self.editor_path.get(),
             "theme_pref": self.theme_pref.get(),
@@ -3597,6 +3732,12 @@ class App:
                 else:
                     self.write_log("Не вдалося конвертувати Видаткову у .xlsx, залишаю .xls")
                     out_path = out_xls
+        elif kind == "moto_act":
+            out_xls = out_dir / f"Акт МОТО{num_part}{ts}.xls"
+            _remove_if_exists(out_xls)
+            generate_moto_act_xls_from_state(state, Path(self.moto_act_path.get()), out_xls,
+                                             preserve_xf=self.preserve_cell_xf_var.get())
+            out_path = out_xls
         else:
             raise ValueError(f"Невідомий тип чорновика: {kind}")
 
@@ -3751,6 +3892,7 @@ class App:
                 self.save_draft("act", open_after=False, output_dir=case_dir, use_timestamp=False, allow_incomplete=allow_incomplete)
             self.save_draft("contract", open_after=False, output_dir=case_dir, use_timestamp=False, allow_incomplete=allow_incomplete)
             self.save_draft("vidatkova", open_after=False, output_dir=case_dir, use_timestamp=False, allow_incomplete=allow_incomplete)
+            self.save_draft("moto_act", open_after=False, output_dir=case_dir, use_timestamp=False, allow_incomplete=allow_incomplete)
             transit_num = contract_number_for_filename(payload.get("Number", ""))
             transit_name = f"Номери транзиту №{transit_num}.txt" if transit_num else "Номери транзиту.txt"
             transit_dir = runtime_app_dir() / "Транзит"
@@ -3979,11 +4121,11 @@ if tk is not None:
                 return
             self._show_step2()
             self.update_idletasks()
-            w, h = int(660 * _FONT_SCALE), int(440 * _FONT_SCALE)
+            w, h = int(660 * _FONT_SCALE), int(500 * _FONT_SCALE)
             sx = self.winfo_screenwidth()
             sy = self.winfo_screenheight()
             self.geometry(f"{w}x{h}+{(sx - w) // 2}+{(sy - h) // 2}")
-            self.minsize(int(540 * _FONT_SCALE), int(360 * _FONT_SCALE))
+            self.minsize(int(540 * _FONT_SCALE), int(420 * _FONT_SCALE))
 
         def _show_step2(self) -> None:
             self._clear()
@@ -4021,7 +4163,7 @@ if tk is not None:
                 row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
             self._generate_prompted = False
-            _wizard_cells = ("A3", "C12", "C50")
+            _wizard_cells = ("A3", "C50")
 
             def _check_all_filled(*_args):
                 if self._generate_prompted:
@@ -4038,8 +4180,9 @@ if tk is not None:
 
             for i, (cell, label) in enumerate([
                 ("A3", "Номер акта *"),
-                ("C12", "Дата народження клієнта"),
                 ("C50", "Номер транзиту"),
+                ("C15", "ПІБ покупця"),
+                ("PHONE", "Телефон покупця"),
             ]):
                 tk.Label(body, text=label, bg=t["card_bg"], fg=t["label_fg"],
                          anchor="w", font=("Segoe UI", _fs(10))).grid(
@@ -4128,6 +4271,8 @@ if tk is not None:
                 self.app.save_draft("contract", open_after=False, output_dir=src_dir,
                                     use_timestamp=False, allow_incomplete=True)
                 self.app.save_draft("vidatkova", open_after=False, output_dir=src_dir,
+                                    use_timestamp=False, allow_incomplete=True)
+                self.app.save_draft("moto_act", open_after=False, output_dir=src_dir,
                                     use_timestamp=False, allow_incomplete=True)
                 doc_num = contract_number_for_filename(payload.get("Number", ""))
                 transit_name = (f"Номери транзиту №{doc_num}.txt" if doc_num
@@ -4250,12 +4395,14 @@ def main() -> int:
             _desktop = Path(os.environ.get("USERPROFILE", "")) / "Desktop"
             _lnk = _desktop / "Japan moto.lnk"
             if not _lnk.exists() and _desktop.exists():
+                _ico = _exe.parent / "icon" / "iconwn.ico"
+                _ico_location = f"{_ico},0" if _ico.exists() else f"{_exe},0"
                 _ps = (
                     f'$ws=New-Object -ComObject WScript.Shell;'
                     f'$s=$ws.CreateShortcut("{_lnk}");'
                     f'$s.TargetPath="{_exe}";'
                     f'$s.WorkingDirectory="{_exe.parent}";'
-                    f'$s.IconLocation="{_exe},0";'
+                    f'$s.IconLocation="{_ico_location}";'
                     f'$s.Description="Japan moto - акт, договір, видаткова";'
                     f'$s.Save()'
                 )
