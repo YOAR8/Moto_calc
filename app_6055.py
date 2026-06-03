@@ -10,6 +10,7 @@ import json
 import shutil
 import sys
 import tempfile
+import time
 import traceback
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -2619,6 +2620,7 @@ class App:
         self.use_case_subfolder_var = tk.BooleanVar(value=False)
         self.ask_output_dir_var = tk.BooleanVar(value=False)
         self.preserve_cell_xf_var = tk.BooleanVar(value=True)
+        self.use_moto_macro_com_var = tk.BooleanVar(value=False)
 
         self.state_vars: Dict[str, tk.StringVar] = {}
         self.widgets: Dict[str, tk.Entry] = {}
@@ -2673,6 +2675,7 @@ class App:
         self.use_case_subfolder_var.set(bool(_cfg.get("use_case_subfolder", False)))
         self.ask_output_dir_var.set(bool(_cfg.get("ask_output_dir", False)))
         self.preserve_cell_xf_var.set(bool(_cfg.get("preserve_cell_xf", True)))
+        self.use_moto_macro_com_var.set(bool(_cfg.get("use_moto_macro_com", False)))
 
         try:
             self.app_log_path = configure_app_logging(self.app_dir / "logs")
@@ -3195,6 +3198,14 @@ class App:
             fg=self.theme["label_fg"],
             selectcolor=self.theme["entry_bg"],
         ).grid(row=theme_row + 11, column=0, columnspan=3, sticky="w", padx=16, pady=(2, 8))
+        tk.Checkbutton(
+            dialog,
+            text="Windows COM: запускати макроси 6055_MOTO (кнопки переносу в акт/договір)",
+            variable=self.use_moto_macro_com_var,
+            bg=self.theme["card_bg"],
+            fg=self.theme["label_fg"],
+            selectcolor=self.theme["entry_bg"],
+        ).grid(row=theme_row + 12, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 8))
         tk.Button(
             dialog,
             text="🔍 Аналізувати шаблон договору",
@@ -3203,7 +3214,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 12, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 8))
+        ).grid(row=theme_row + 13, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 8))
         tk.Button(
             dialog,
             text="📋 Журнал генерації",
@@ -3212,7 +3223,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 12, column=2, sticky="e", padx=16, pady=(0, 8))
+        ).grid(row=theme_row + 13, column=2, sticky="e", padx=16, pady=(0, 8))
         tk.Button(
             dialog,
             text="↺ Перезавантажити шаблон",
@@ -3221,7 +3232,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 13, column=0, sticky="w", padx=16, pady=8)
+        ).grid(row=theme_row + 14, column=0, sticky="w", padx=16, pady=8)
         tk.Button(
             dialog,
             text="Зберегти налаштування",
@@ -3230,7 +3241,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 13, column=1, sticky="w", pady=8)
+        ).grid(row=theme_row + 14, column=1, sticky="w", pady=8)
         tk.Button(
             dialog,
             text="Закрити",
@@ -3239,7 +3250,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 13, column=2, sticky="e", padx=12, pady=12)
+        ).grid(row=theme_row + 14, column=2, sticky="e", padx=12, pady=12)
         dialog.protocol("WM_DELETE_WINDOW", lambda: [self._save_settings(), dialog.destroy()])
 
         # Auto-fit height after all widgets are created
@@ -3570,6 +3581,7 @@ class App:
             "use_case_subfolder": self.use_case_subfolder_var.get(),
             "ask_output_dir": self.ask_output_dir_var.get(),
             "preserve_cell_xf": self.preserve_cell_xf_var.get(),
+            "use_moto_macro_com": self.use_moto_macro_com_var.get(),
         })
 
     def paste_from_clipboard(self) -> None:
@@ -3627,6 +3639,137 @@ class App:
                 return c
         self.write_log(f"Шаблон '{default_name}' не знайдено. Перевірено: " + " | ".join(str(c) for c in uniq))
         raise FileNotFoundError(f"Template not found: {default_name}")
+
+    def _generate_via_moto_macros(self, out_dir: Path, use_timestamp: bool = False,
+                                  allow_incomplete: bool = False) -> tuple[Path, Path]:
+        """Windows COM pipeline: run legacy Excel macros (buttons) from 6055_MOTO template.
+        1) Prepare work dir with exact filenames expected by VBA.
+        2) Write app data into 6055.xls copy.
+        3) Run Кнопка1_Щелчок (акт), Кнопка2_Щелчок (договір).
+        4) Save generated act/contract into selected output folder.
+        """
+        if not IS_WINDOWS:
+            raise RuntimeError("Режим макросів 6055_MOTO доступний лише на Windows")
+
+        state = self.collect_state()
+        payload, errors, _warnings = validate_state(state)
+        if errors and not allow_incomplete:
+            raise ValueError("Потрібно виправити помилки перед генерацією: " + "; ".join(errors))
+
+        doc_num = contract_number_for_filename(payload.get("Number", ""))
+        num_part = f" №{doc_num}" if doc_num else ""
+        ts = f"_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}" if use_timestamp else ""
+
+        src_6055 = self._resolve_template_path(self.source_path.get(), "6055.xls")
+        tpl_moto = self._resolve_template_path(self.moto_act_path.get(), "6055_MOTO_template.xls")
+        tpl_dog = Path(self.dogovir_path.get())
+        if tpl_dog.suffix.lower() != ".doc":
+            raise RuntimeError(
+                "Для режиму макросів потрібен шаблон договору .doc (VBA відкриває DOGOVIR_6055_template.doc)"
+            )
+        tpl_dog = self._resolve_template_path(str(tpl_dog), "DOGOVIR_6055_template.doc")
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        work_dir = Path(tempfile.mkdtemp(prefix="jm_macro_", dir=str(out_dir)))
+        self.write_log(f"Macro COM: робоча папка {work_dir}")
+
+        work_6055 = work_dir / "6055.xls"
+        work_moto = work_dir / "6055_MOTO_template.xls"
+        work_dog = work_dir / "DOGOVIR_6055_template.doc"
+        shutil.copy2(src_6055, work_6055)
+        shutil.copy2(tpl_moto, work_moto)
+        shutil.copy2(tpl_dog, work_dog)
+
+        # In macro mode we only inject the 3 fields requested for downloaded 6055.
+        updates: Dict[str, str] = {}
+        for cell in ("A3", "C12", "C50"):
+            val = str(state.get(cell, "")).strip()
+            if val:
+                updates[cell] = val
+        write_xls_cells(
+            work_6055,
+            "Worksheet",
+            updates,
+            backup=False,
+            force_a3_tnr10=("A3" in updates),
+            preserve_xf=self.preserve_cell_xf_var.get(),
+        )
+        self.write_log(f"Macro COM: підготовлено 6055.xls (поля: {', '.join(sorted(updates.keys())) or 'немає'})")
+
+        out_act = out_dir / f"Акт МОТО{num_part}{ts}.xls"
+        out_contract_ext = self.contract_out_format.get().strip().lower()
+        if out_contract_ext not in ("doc", "docx"):
+            out_contract_ext = "doc"
+        out_contract = out_dir / f"Договір{num_part}{ts}.{out_contract_ext}"
+
+        excel = None
+        word = None
+        wb_moto = None
+        success = False
+        try:
+            import win32com.client as win32  # type: ignore
+
+            excel = win32.DispatchEx("Excel.Application")
+            excel.Visible = False
+            excel.DisplayAlerts = False
+            wb_moto = excel.Workbooks.Open(str(work_moto.resolve()))
+            self.write_log("Macro COM: запущено Excel, відкрито 6055_MOTO_template.xls")
+
+            excel.Run(f"'{wb_moto.Name}'!Кнопка1_Щелчок")
+            self.write_log("Macro COM: виконано Кнопка1_Щелчок (акт)")
+            if out_act.exists():
+                out_act.unlink()
+            wb_moto.SaveAs(str(out_act.resolve()), FileFormat=56)
+            self.write_log(f"Macro COM: збережено акт {out_act}")
+
+            excel.Run(f"'{wb_moto.Name}'!Кнопка2_Щелчок")
+            self.write_log("Macro COM: виконано Кнопка2_Щелчок (договір)")
+
+            for _ in range(30):
+                try:
+                    word = win32.GetActiveObject("Word.Application")
+                    if word is not None and word.Documents.Count > 0:
+                        break
+                except Exception:
+                    word = None
+                time.sleep(0.2)
+
+            if word is None or word.Documents.Count == 0:
+                raise RuntimeError("Macro COM: не вдалося отримати активний документ Word після запуску макроса")
+
+            if out_contract.exists():
+                out_contract.unlink()
+            doc = word.ActiveDocument
+            if out_contract_ext == "docx":
+                doc.SaveAs(str(out_contract.resolve()), FileFormat=16)
+            else:
+                doc.SaveAs(str(out_contract.resolve()), FileFormat=0)
+            doc.Close(SaveChanges=False)
+            self.write_log(f"Macro COM: збережено договір {out_contract}")
+            success = True
+        finally:
+            try:
+                if wb_moto is not None:
+                    wb_moto.Close(SaveChanges=False)
+            except Exception:
+                pass
+            try:
+                if excel is not None:
+                    excel.Quit()
+            except Exception:
+                pass
+            try:
+                if word is not None:
+                    word.Quit()
+            except Exception:
+                pass
+
+            if success:
+                shutil.rmtree(work_dir, ignore_errors=True)
+            else:
+                self.write_log(f"Macro COM: робочу папку залишено для діагностики: {work_dir}")
+
+        return out_act, out_contract
 
     def current_payload(self) -> Dict[str, str]:
         payload, errors, warnings = validate_state(self.collect_state())
@@ -3928,12 +4071,26 @@ class App:
             else:
                 case_dir = base_out_dir
             case_dir.mkdir(parents=True, exist_ok=True)
+            use_macro_mode = self.use_moto_macro_com_var.get() and IS_WINDOWS
             # Generate new act only when toggle is enabled
             if self.generate_new_act_var.get():
                 self.save_draft("act", open_after=False, output_dir=case_dir, use_timestamp=False, allow_incomplete=allow_incomplete)
-            self.save_draft("contract", open_after=False, output_dir=case_dir, use_timestamp=False, allow_incomplete=allow_incomplete)
-            self.save_draft("vidatkova", open_after=False, output_dir=case_dir, use_timestamp=False, allow_incomplete=allow_incomplete)
-            self.save_draft("moto_act", open_after=False, output_dir=case_dir, use_timestamp=False, allow_incomplete=allow_incomplete)
+
+            if use_macro_mode:
+                self.write_log("Режим генерації: 6055_MOTO VBA макроси (Windows COM)")
+                self._generate_via_moto_macros(
+                    case_dir,
+                    use_timestamp=False,
+                    allow_incomplete=allow_incomplete,
+                )
+                self.save_draft("vidatkova", open_after=False, output_dir=case_dir,
+                                use_timestamp=False, allow_incomplete=allow_incomplete)
+            else:
+                if self.use_moto_macro_com_var.get() and not IS_WINDOWS:
+                    self.write_log("Macro COM режим увімкнено, але ОС не Windows — перемикаюсь на Python режим")
+                self.save_draft("contract", open_after=False, output_dir=case_dir, use_timestamp=False, allow_incomplete=allow_incomplete)
+                self.save_draft("vidatkova", open_after=False, output_dir=case_dir, use_timestamp=False, allow_incomplete=allow_incomplete)
+                self.save_draft("moto_act", open_after=False, output_dir=case_dir, use_timestamp=False, allow_incomplete=allow_incomplete)
             transit_num = contract_number_for_filename(payload.get("Number", ""))
             transit_name = f"Номери транзиту №{transit_num}.txt" if transit_num else "Номери транзиту.txt"
             transit_dir = runtime_app_dir() / "Транзит"
@@ -4345,12 +4502,22 @@ if tk is not None:
                     # Generate a full new act copy
                     self.app.save_draft("act", open_after=False, output_dir=src_dir,
                                         use_timestamp=False, allow_incomplete=True)
-                self.app.save_draft("contract", open_after=False, output_dir=src_dir,
-                                    use_timestamp=False, allow_incomplete=True)
-                self.app.save_draft("vidatkova", open_after=False, output_dir=src_dir,
-                                    use_timestamp=False, allow_incomplete=True)
-                self.app.save_draft("moto_act", open_after=False, output_dir=src_dir,
-                                    use_timestamp=False, allow_incomplete=True)
+                if self.app.use_moto_macro_com_var.get() and IS_WINDOWS:
+                    self.app.write_log("Wizard: режим 6055_MOTO VBA макросів (Windows COM)")
+                    self.app._generate_via_moto_macros(
+                        src_dir,
+                        use_timestamp=False,
+                        allow_incomplete=True,
+                    )
+                    self.app.save_draft("vidatkova", open_after=False, output_dir=src_dir,
+                                        use_timestamp=False, allow_incomplete=True)
+                else:
+                    self.app.save_draft("contract", open_after=False, output_dir=src_dir,
+                                        use_timestamp=False, allow_incomplete=True)
+                    self.app.save_draft("vidatkova", open_after=False, output_dir=src_dir,
+                                        use_timestamp=False, allow_incomplete=True)
+                    self.app.save_draft("moto_act", open_after=False, output_dir=src_dir,
+                                        use_timestamp=False, allow_incomplete=True)
                 doc_num = contract_number_for_filename(payload.get("Number", ""))
                 transit_name = (f"Номери транзиту №{doc_num}.txt" if doc_num
                                 else "Номери транзиту.txt")
