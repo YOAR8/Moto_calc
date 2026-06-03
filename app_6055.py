@@ -3255,13 +3255,16 @@ class App:
 
         # Auto-fit height after all widgets are created
         dialog.update_idletasks()
-        _dw = 800
+        _dw = min(860, max(760, dialog.winfo_reqwidth() + 20))
         _dh = max(dialog.winfo_reqheight() + 30, 480)
         _sx = dialog.winfo_screenwidth()
         _sy = dialog.winfo_screenheight()
+        _dh = min(_dh, max(420, _sy - 80))
+        _dw = min(_dw, max(720, _sx - 40))
         _px = max(0, (_sx - _dw) // 2)
         _py = max(0, (_sy - _dh) // 2)
         dialog.geometry(f"{_dw}x{_dh}+{_px}+{_py}")
+        dialog.resizable(True, True)
 
     def _run_template_diagnosis(self, parent_dialog=None) -> None:
         """Open the contract template, inspect its structure and show a report."""
@@ -3686,6 +3689,23 @@ class App:
             val = str(state.get(cell, "")).strip()
             if val:
                 updates[cell] = val
+
+        # Keep client name consistent across generated docs.
+        # If C15 is empty in UI, inherit it from downloaded/source 6055.
+        fio_state = str(state.get("C15", "")).strip()
+        if not fio_state:
+            try:
+                fio_src = str(read_xls_cell(work_6055, "Worksheet", "C15")).strip()
+            except Exception:
+                fio_src = ""
+            if fio_src:
+                try:
+                    self.state_vars["C15"].set(fio_src)
+                    self.state_vars["E15"].set(short_name(fio_src))
+                except Exception:
+                    pass
+                self.write_log(f"Macro COM: C15 взято з 6055 -> {fio_src}")
+
         write_xls_cells(
             work_6055,
             "Worksheet",
@@ -3709,7 +3729,18 @@ class App:
         try:
             import win32com.client as win32  # type: ignore
 
-            excel = win32.DispatchEx("Excel.Application")
+            try:
+                excel = win32.DispatchEx("Excel.Application")
+            except Exception as exc_dispatch_ex:
+                self.write_log(f"Macro COM: DispatchEx(Excel.Application) не вдався: {exc_dispatch_ex}")
+                try:
+                    excel = win32.Dispatch("Excel.Application")
+                    self.write_log("Macro COM: fallback на Dispatch(Excel.Application) успішний")
+                except Exception as exc_dispatch:
+                    raise RuntimeError(
+                        "Macro COM: Excel COM недоступний. Перевірте встановлення Microsoft Excel/Office."
+                    ) from exc_dispatch
+
             excel.Visible = False
             excel.DisplayAlerts = False
             wb_moto = excel.Workbooks.Open(str(work_moto.resolve()))
@@ -4078,11 +4109,19 @@ class App:
 
             if use_macro_mode:
                 self.write_log("Режим генерації: 6055_MOTO VBA макроси (Windows COM)")
-                self._generate_via_moto_macros(
-                    case_dir,
-                    use_timestamp=False,
-                    allow_incomplete=allow_incomplete,
-                )
+                try:
+                    self._generate_via_moto_macros(
+                        case_dir,
+                        use_timestamp=False,
+                        allow_incomplete=allow_incomplete,
+                    )
+                except Exception as exc:
+                    self.write_log(f"Macro COM помилка: {exc}")
+                    self.write_log("Fallback: перемикаюсь на Python генерацію договору та акту МОТО")
+                    self.save_draft("contract", open_after=False, output_dir=case_dir,
+                                    use_timestamp=False, allow_incomplete=allow_incomplete)
+                    self.save_draft("moto_act", open_after=False, output_dir=case_dir,
+                                    use_timestamp=False, allow_incomplete=allow_incomplete)
                 self.save_draft("vidatkova", open_after=False, output_dir=case_dir,
                                 use_timestamp=False, allow_incomplete=allow_incomplete)
             else:
@@ -4504,11 +4543,19 @@ if tk is not None:
                                         use_timestamp=False, allow_incomplete=True)
                 if self.app.use_moto_macro_com_var.get() and IS_WINDOWS:
                     self.app.write_log("Wizard: режим 6055_MOTO VBA макросів (Windows COM)")
-                    self.app._generate_via_moto_macros(
-                        src_dir,
-                        use_timestamp=False,
-                        allow_incomplete=True,
-                    )
+                    try:
+                        self.app._generate_via_moto_macros(
+                            src_dir,
+                            use_timestamp=False,
+                            allow_incomplete=True,
+                        )
+                    except Exception as exc:
+                        self.app.write_log(f"Wizard Macro COM помилка: {exc}")
+                        self.app.write_log("Wizard fallback: Python генерація договору та акту МОТО")
+                        self.app.save_draft("contract", open_after=False, output_dir=src_dir,
+                                            use_timestamp=False, allow_incomplete=True)
+                        self.app.save_draft("moto_act", open_after=False, output_dir=src_dir,
+                                            use_timestamp=False, allow_incomplete=True)
                     self.app.save_draft("vidatkova", open_after=False, output_dir=src_dir,
                                         use_timestamp=False, allow_incomplete=True)
                 else:
