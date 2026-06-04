@@ -14,7 +14,7 @@ import time
 import traceback
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Any, Dict, Mapping, Tuple, cast
 
 import xlrd
 import xlwt
@@ -24,10 +24,10 @@ try:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 except Exception:  # pragma: no cover
-    tk = None
-    filedialog = None
-    messagebox = None
-    ttk = None
+    tk = cast(Any, None)
+    filedialog = cast(Any, None)
+    messagebox = cast(Any, None)
+    ttk = cast(Any, None)
 
 IS_WINDOWS = platform.system().lower().startswith("win")
 APP_LOGGER = logging.getLogger("japan_moto")
@@ -610,7 +610,7 @@ def read_xls_cell(path: Path, sheet_name: str, addr: str):
     return sh.cell_value(r, c)
 
 
-def write_xls_cells(path: Path, sheet_name: str, updates: Dict[str, object], backup: bool = True, force_a3_tnr10: bool = False, preserve_xf: bool = False) -> None:
+def write_xls_cells(path: Path, sheet_name: str, updates: Mapping[str, object], backup: bool = True, force_a3_tnr10: bool = False, preserve_xf: bool = False) -> None:
     if backup:
         ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_path = path.with_name(f"{path.stem}_backup_{ts}{path.suffix}")
@@ -1199,8 +1199,9 @@ def preview_blocks(kind: str, payload: Dict[str, str]) -> list[tuple[str, list[t
     return preview_blocks_for_vidatkova(payload)
 
 
-def validate_state(state: Dict[str, str]) -> Tuple[Dict[str, str], list[str], list[str]]:
-    payload = parse_state(state)
+def validate_state(state: Dict[str, str]) -> Tuple[Dict[str, object], list[str], list[str]]:
+    payload_src = parse_state(state)
+    payload: Dict[str, object] = dict(payload_src)
     errors: list[str] = []
     warnings: list[str] = []
     invalid_cells: set[str] = set()
@@ -1213,10 +1214,10 @@ def validate_state(state: Dict[str, str]) -> Tuple[Dict[str, str], list[str], li
             errors.append(f"«{label}» порожнє")
             invalid_cells.add(cell)
 
-    if not payload["Number"] or not payload["Data"]:
+    if not str(payload_src["Number"]).strip() or not str(payload_src["Data"]).strip():
         errors.append("Номер і дата документа (A3) не розпізнані")
         invalid_cells.add("A3")
-    elif not re.fullmatch(r"\d{4}/\d{2}/\d{6}", payload["Number"]):
+    elif not re.fullmatch(r"\d{4}/\d{2}/\d{6}", str(payload_src["Number"])):
         warnings.append("Номер документа в A3 має незвичний формат")
         warning_cells.add("A3")
 
@@ -1233,8 +1234,8 @@ def validate_state(state: Dict[str, str]) -> Tuple[Dict[str, str], list[str], li
         warnings.append("VIN / шасі не збігаються")
         warning_cells.update({"C39", "C42"})
 
-    if payload.get("cuzov"):
-        vin_token = normalize_token(payload["cuzov"])
+    if payload_src.get("cuzov"):
+        vin_token = normalize_token(payload_src["cuzov"])
         if len(vin_token) < 8:
             errors.append("VIN / рама занадто короткий")
             invalid_cells.add("C39")
@@ -1242,28 +1243,28 @@ def validate_state(state: Dict[str, str]) -> Tuple[Dict[str, str], list[str], li
             warnings.append("VIN / рама має незвичну довжину")
             warning_cells.add("C39")
 
-    if payload.get("C41"):
-        engine_token = normalize_token(payload["C41"])
+    if payload_src.get("C41"):
+        engine_token = normalize_token(payload_src["C41"])
         if len(engine_token) < 5:
             warnings.append("Номер двигуна схожий на короткий або неповний")
             warning_cells.add("C41")
-        if payload.get("cuzov") and engine_token == normalize_token(payload["cuzov"]):
+        if payload_src.get("cuzov") and engine_token == normalize_token(payload_src["cuzov"]):
             warnings.append("Номер двигуна збігається з VIN / рамою, перевірте дані")
             warning_cells.add("C41")
 
-    if payload.get("C28") and payload["C28"].strip().isdigit():
+    if payload_src.get("C28") and payload_src["C28"].strip().isdigit():
         warnings.append("Колір виглядає як число")
         warning_cells.add("C28")
 
-    if payload.get("C18"):
-        tax = re.sub(r"\D", "", payload["C18"])
+    if payload_src.get("C18"):
+        tax = re.sub(r"\D", "", payload_src["C18"])
         if len(tax) not in (8, 10):
             warnings.append("ІПН / код має незвичну довжину")
             warning_cells.add("C18")
 
-    if payload.get("C29"):
+    if payload_src.get("C29"):
         try:
-            year = int(str(payload["C29"]).strip())
+            year = int(str(payload_src["C29"]).strip())
             if year < 1900 or year > dt.datetime.now().year + 1:
                 warnings.append("Рік випуску поза нормальним діапазоном")
                 warning_cells.add("C29")
@@ -1271,16 +1272,16 @@ def validate_state(state: Dict[str, str]) -> Tuple[Dict[str, str], list[str], li
             warnings.append("Рік випуску не є числом")
             warning_cells.add("C29")
 
-    if payload.get("C46"):
+    if payload_src.get("C46"):
         try:
-            float(str(payload["C46"]).replace(",", "."))
+            float(str(payload_src["C46"]).replace(",", "."))
         except Exception:
             errors.append("Ціна з ПДВ — не є числом")
             invalid_cells.add("C46")
 
-    price_no_vat = parse_decimal(payload.get("C44", ""))
-    vat = parse_decimal(payload.get("C45", ""))
-    price_total = parse_decimal(payload.get("C46", ""))
+    price_no_vat = parse_decimal(payload_src.get("C44", ""))
+    vat = parse_decimal(payload_src.get("C45", ""))
+    price_total = parse_decimal(payload_src.get("C46", ""))
     if price_no_vat is not None and vat is not None and price_total is not None:
         if abs((price_no_vat + vat) - price_total) > 0.01:
             errors.append("Ціна без ПДВ + ПДВ ≠ Ціна з ПДВ")
@@ -1315,7 +1316,7 @@ def preview_text_for_act(payload: Dict[str, str]) -> str:
     ])
 
 
-def preview_text_for_contract(payload: Dict[str, str]) -> str:
+def preview_text_for_contract(payload: Mapping[str, object]) -> str:
     lines = ["ЧОРНОВИК ДОГОВОРУ", ""]
     for key in [
         ("Number", "Number"),
@@ -1356,7 +1357,7 @@ def preview_text_for_vidatkova(payload: Dict[str, str]) -> str:
     ])
 
 
-def transit_summary_text(payload: Dict[str, str]) -> str:
+def transit_summary_text(payload: Mapping[str, object]) -> str:
     return "\n".join([
         "НОМЕРИ ТРАНЗИТУ",
         "",
@@ -1471,8 +1472,9 @@ def generate_contract_docx_fallback(state: Dict[str, str], out_path: Path) -> "P
 
     doc = Document()
     # Use Times New Roman 12pt throughout for legal document appearance
-    doc.styles["Normal"].font.name = "Times New Roman"
-    doc.styles["Normal"].font.size = Pt(12)
+    _normal_style = cast(Any, doc.styles["Normal"])
+    _normal_style.font.name = "Times New Roman"
+    _normal_style.font.size = Pt(12)
     for sec in doc.sections:
         sec.top_margin = Cm(2)
         sec.bottom_margin = Cm(2)
@@ -1954,7 +1956,7 @@ def _config_path() -> Path:
     return runtime_app_dir() / _CONFIG_FILENAME
 
 
-def load_app_config() -> dict:
+def load_app_config() -> dict[str, object]:
     """Load persisted settings from JSON, returning empty dict on any error."""
     try:
         p = _config_path()
@@ -1965,7 +1967,7 @@ def load_app_config() -> dict:
     return {}
 
 
-def save_app_config(cfg: dict) -> None:
+def save_app_config(cfg: dict[str, object]) -> None:
     """Persist settings dict to JSON file next to the app."""
     try:
         _config_path().write_text(
@@ -2146,10 +2148,15 @@ _BUILTIN_SUGGESTIONS: Dict[str, list] = {
 }
 
 
-class SmartEntry(tk.Frame if tk is not None else object):
+_TkFrameBase: type = tk.Frame if tk is not None else object
+_TkEntryBase: type = tk.Entry if tk is not None else object
+_TkToplevelBase: type = tk.Toplevel if tk is not None else object
+
+
+class SmartEntry(_TkFrameBase):
     """Auto-expanding multiline entry (tk.Text, wrap=word, 1-4 lines) with StringVar sync and autocomplete."""
 
-    def __init__(self, master, cell: str, textvariable: "tk.StringVar", **kwargs):
+    def __init__(self, master, cell: str, textvariable: Any, **kwargs):
         kwargs.pop("relief", None)
         kwargs.pop("highlightthickness", None)
         kwargs.pop("bd", None)
@@ -2164,8 +2171,8 @@ class SmartEntry(tk.Frame if tk is not None else object):
         self._cell = cell
         self._var = textvariable
         self._syncing = False
-        self._popup: "tk.Toplevel | None" = None
-        self._lb: "tk.Listbox | None" = None
+        self._popup: Any = None
+        self._lb: Any = None
         self._popup_select_bg = popup_select_bg
         self._popup_select_fg = popup_select_fg
         self._fg = fg
@@ -2391,7 +2398,7 @@ class SmartEntry(tk.Frame if tk is not None else object):
         self._text.focus_set()
 
 
-class AutocompleteEntry(tk.Entry if tk is not None else object):
+class AutocompleteEntry(_TkEntryBase):
     """tk.Entry with a dropdown autocomplete popup powered by a JSON history file."""
 
     _suggestions: Dict[str, list] = {}
@@ -2443,12 +2450,12 @@ class AutocompleteEntry(tk.Entry if tk is not None else object):
         if len(lst) > 50:
             del lst[50:]
 
-    def __init__(self, master, cell: str, textvariable: tk.StringVar, **kwargs):
+    def __init__(self, master, cell: str, textvariable: Any, **kwargs):
         super().__init__(master, textvariable=textvariable, **kwargs)
         self._cell = cell
         self._var = textvariable
-        self._popup: "tk.Toplevel | None" = None
-        self._lb: "tk.Listbox | None" = None
+        self._popup: Any = None
+        self._lb: Any = None
         self._selecting = False
 
         self.bind("<KeyRelease>", self._on_key)
@@ -2574,7 +2581,7 @@ class AutocompleteEntry(tk.Entry if tk is not None else object):
 
 
 class App:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: Any):
         self.root = root
         self.app_dir = runtime_app_dir()
         self.resource_dir = runtime_resource_dir()
@@ -2622,8 +2629,8 @@ class App:
         self.preserve_cell_xf_var = tk.BooleanVar(value=True)
         self.use_moto_macro_com_var = tk.BooleanVar(value=False)
 
-        self.state_vars: Dict[str, tk.StringVar] = {}
-        self.widgets: Dict[str, tk.Entry] = {}
+        self.state_vars: Dict[str, Any] = {}
+        self.widgets: Dict[str, Any] = {}
         self.summary_var = tk.StringVar(value="")
         self.error_var = tk.StringVar(value="")
         self.warning_var = tk.StringVar(value="")
@@ -2638,44 +2645,46 @@ class App:
         # Load persisted settings (overrides defaults set above)
         _cfg = load_app_config()
         if _cfg.get("source_path"):
-            self.source_path.set(_cfg["source_path"])
+            self.source_path.set(str(_cfg["source_path"]))
         if _cfg.get("moto_path"):
-            self.moto_path.set(_cfg["moto_path"])
+            self.moto_path.set(str(_cfg["moto_path"]))
         if _cfg.get("dogovir_path"):
-            self.dogovir_path.set(_cfg["dogovir_path"])
+            self.dogovir_path.set(str(_cfg["dogovir_path"]))
         if _cfg.get("vidatkova_path"):
-            self.vidatkova_path.set(_cfg["vidatkova_path"])
+            self.vidatkova_path.set(str(_cfg["vidatkova_path"]))
         if _cfg.get("moto_act_path"):
-            self.moto_act_path.set(_cfg["moto_act_path"])
+            self.moto_act_path.set(str(_cfg["moto_act_path"]))
         if _cfg.get("output_dir"):
-            self.output_dir_var.set(_cfg["output_dir"])
+            self.output_dir_var.set(str(_cfg["output_dir"]))
         if _cfg.get("editor_path"):
-            self.editor_path.set(_cfg["editor_path"])
+            self.editor_path.set(str(_cfg["editor_path"]))
         if _cfg.get("theme_pref"):
-            self.theme_pref.set(_cfg["theme_pref"])
-            _pref = _cfg["theme_pref"]
+            self.theme_pref.set(str(_cfg["theme_pref"]))
+            _pref = str(_cfg["theme_pref"])
             if _pref in ("light", "dark"):
                 self.theme_mode = _pref
                 self.theme = build_theme_palette(_pref)
-        self.open_after_save.set(_cfg.get("open_after_save", True))
-        self.use_word_com.set(_cfg.get("use_word_com", True))
-        self.remove_field_shading.set(_cfg.get("remove_field_shading", _cfg.get("fill_white_bg", True)))
+        self.open_after_save.set(bool(_cfg.get("open_after_save", True)))
+        self.use_word_com.set(bool(_cfg.get("use_word_com", True)))
+        self.remove_field_shading.set(bool(_cfg.get("remove_field_shading", _cfg.get("fill_white_bg", True))))
         if _cfg.get("contract_out_format") in ("doc", "docx"):
-            self.contract_out_format.set(_cfg["contract_out_format"])
+            self.contract_out_format.set(str(_cfg["contract_out_format"]))
         if _cfg.get("act_out_format") in ("xls", "xlsx"):
-            self.act_out_format.set(_cfg["act_out_format"])
+            self.act_out_format.set(str(_cfg["act_out_format"]))
         if _cfg.get("vidatkova_out_format") in ("xls", "xlsx"):
-            self.vidatkova_out_format.set(_cfg["vidatkova_out_format"])
+            self.vidatkova_out_format.set(str(_cfg["vidatkova_out_format"]))
         _ui_scale_cfg = str(_cfg.get("ui_scale", "1.0"))
         if _ui_scale_cfg in ("0.85", "1.0", "1.15", "1.3", "1.4", "1.5"):
             self.ui_scale_var.set(_ui_scale_cfg)
         if _cfg.get("start_folder"):
-            self.start_folder_var.set(_cfg["start_folder"])
+            self.start_folder_var.set(str(_cfg["start_folder"]))
         self.generate_new_act_var.set(bool(_cfg.get("generate_new_act", False)))
         self.use_case_subfolder_var.set(bool(_cfg.get("use_case_subfolder", False)))
         self.ask_output_dir_var.set(bool(_cfg.get("ask_output_dir", False)))
         self.preserve_cell_xf_var.set(bool(_cfg.get("preserve_cell_xf", True)))
         self.use_moto_macro_com_var.set(bool(_cfg.get("use_moto_macro_com", False)))
+        if self.use_moto_macro_com_var.get() and not IS_WINDOWS:
+            self.use_moto_macro_com_var.set(False)
 
         try:
             self.app_log_path = configure_app_logging(self.app_dir / "logs")
@@ -2778,6 +2787,7 @@ class App:
                 self.write_log("Microsoft Word COM: недоступний")
         if not IS_WINDOWS:
             self.write_log("Демо-режим поза Windows: формування договору через Word-шаблон недоступне.")
+            self.write_log("Macro COM (VBA-кнопки) доступний тільки на Windows + Microsoft Office, тому тут вимкнено.")
 
     def _make_toolbar_button(self, parent, text: str, command, column: int) -> None:
         button = tk.Button(
@@ -2805,7 +2815,7 @@ class App:
                 target.tag_add("sel", "1.0", "end")
                 target.focus_set()
 
-            def _select_all(event: "tk.Event") -> str:
+            def _select_all(event: Any) -> str:
                 target.tag_add("sel", "1.0", "end")
                 return "break"
 
@@ -2848,7 +2858,7 @@ class App:
                 target.select_range(0, "end")
                 target.focus_set()
 
-            def _select_all(event: "tk.Event") -> str:
+            def _select_all(event: Any) -> str:
                 event.widget.select_range(0, "end")
                 event.widget.icursor("end")
                 return "break"
@@ -2891,7 +2901,7 @@ class App:
         menu.add_separator()
         menu.add_command(label="Виділити все", command=_select_all_fn)
 
-        def _show_menu(event: "tk.Event") -> None:
+        def _show_menu(event: Any) -> None:
             menu.tk_popup(event.x_root, event.y_root)
 
         target.bind("<Button-3>", _show_menu)
@@ -2903,7 +2913,7 @@ class App:
         target.bind("<Control-v>", _paste_fn)
         target.bind("<Control-V>", _paste_fn)
 
-    def _build_data_tab(self, parent: tk.Frame) -> None:
+    def _build_data_tab(self, parent: Any) -> None:
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(0, weight=1)
 
@@ -3007,7 +3017,7 @@ class App:
             if cell != "E15":
                 var.trace_add("write", self._on_state_change)
 
-    def browse_path(self, var: tk.StringVar) -> None:
+    def browse_path(self, var: Any) -> None:
         if var is self.output_dir_var or var is self.start_folder_var:
             cur_dir = var.get() or str(self.out_dir)
             value = filedialog.askdirectory(initialdir=cur_dir) if filedialog else ""
@@ -3501,8 +3511,10 @@ class App:
         state = self.collect_state()
         payload, errors, warnings = validate_state(state)
 
-        invalid_cells: set[str] = payload.pop("_invalid_cells", set())
-        warning_cells: set[str] = payload.pop("_warning_cells", set())
+        invalid_raw = payload.pop("_invalid_cells", set())
+        warning_raw = payload.pop("_warning_cells", set())
+        invalid_cells: set[str] = invalid_raw if isinstance(invalid_raw, set) else set()
+        warning_cells: set[str] = warning_raw if isinstance(warning_raw, set) else set()
 
         for cell, entry in self.widgets.items():
             if cell == "E15":
@@ -3522,7 +3534,10 @@ class App:
                 else:
                     entry.configure(fg=self.theme["entry_fg"])
 
-        self.summary_var.set(f"Заповнено: {sum(1 for v in state.values() if v)} полів. Номер: {payload.get('Number', '')} | Дата: {payload.get('Data', '')}")
+        self.summary_var.set(
+            f"Заповнено: {sum(1 for v in state.values() if v)} полів. "
+            f"Номер: {str(payload.get('Number', ''))} | Дата: {str(payload.get('Data', ''))}"
+        )
         self.error_var.set("Помилки: " + ("; ".join(errors) if errors else "немає"))
         self.warning_var.set("Попередження: " + ("; ".join(warnings) if warnings else "немає"))
 
@@ -3573,9 +3588,10 @@ class App:
             APP_LOGGER.info(text)
         except Exception:
             pass
-        if hasattr(self, "log"):
-            self.log.insert("end", line + "\n")
-            self.log.see("end")
+        log_widget = getattr(self, "log", None)
+        if log_widget is not None:
+            log_widget.insert("end", line + "\n")
+            log_widget.see("end")
 
     def save_source_changes(self) -> None:
         source = Path(self.source_path.get())
@@ -3691,7 +3707,7 @@ class App:
         if errors and not allow_incomplete:
             raise ValueError("Потрібно виправити помилки перед генерацією: " + "; ".join(errors))
 
-        doc_num = contract_number_for_filename(payload.get("Number", ""))
+        doc_num = contract_number_for_filename(str(payload.get("Number", "")))
         num_part = f" №{doc_num}" if doc_num else ""
         ts = f"_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}" if use_timestamp else ""
 
@@ -3834,8 +3850,8 @@ class App:
 
         return out_act, out_contract
 
-    def current_payload(self) -> Dict[str, str]:
-        payload, errors, warnings = validate_state(self.collect_state())
+    def current_payload(self) -> Dict[str, object]:
+        payload, _errors, _warnings = validate_state(self.collect_state())
         return payload
 
     def open_draft(self, kind: str) -> None:
@@ -3860,7 +3876,7 @@ class App:
 
         out_dir = output_dir or self._ensure_output_dir()
         ts = f"_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}" if use_timestamp else ""
-        doc_num = contract_number_for_filename(payload.get("Number", ""))
+        doc_num = contract_number_for_filename(str(payload.get("Number", "")))
         num_part = f" №{doc_num}" if doc_num else ""
 
         def _remove_if_exists(p: Path) -> None:
@@ -4162,7 +4178,7 @@ class App:
                 self.save_draft("contract", open_after=False, output_dir=case_dir, use_timestamp=False, allow_incomplete=allow_incomplete)
                 self.save_draft("vidatkova", open_after=False, output_dir=case_dir, use_timestamp=False, allow_incomplete=allow_incomplete)
                 self.save_draft("moto_act", open_after=False, output_dir=case_dir, use_timestamp=False, allow_incomplete=allow_incomplete)
-            transit_num = contract_number_for_filename(payload.get("Number", ""))
+            transit_num = contract_number_for_filename(str(payload.get("Number", "")))
             transit_name = f"Номери транзиту №{transit_num}.txt" if transit_num else "Номери транзиту.txt"
             transit_dir = runtime_app_dir() / "Транзит"
             transit_dir.mkdir(parents=True, exist_ok=True)
@@ -4190,7 +4206,7 @@ class App:
 
 
 if tk is not None:
-    class DraftWindow(tk.Toplevel):
+    class DraftWindow(_TkToplevelBase):
         _DEST_STEMS = {"act": "6055_akt", "contract": "dogovir", "vidatkova": "vidatkova"}
 
         def __init__(self, app: App, kind: str):
@@ -4278,10 +4294,10 @@ if tk is not None:
             self.app.write_log(f"Збережено: {dest}")
             self.app.status_var.set(f"Збережено {dest.name}")
 
-    class WizardWindow(tk.Toplevel):
+    class WizardWindow(_TkToplevelBase):
         """Startup wizard: Step 1 = select source act, Step 2 = quick 3-field form."""
 
-        def __init__(self, master: tk.Tk, app: "App") -> None:
+        def __init__(self, master: Any, app: "App") -> None:
             super().__init__(master)
             self.app = app
             self.title("Japan moto")
@@ -4433,7 +4449,7 @@ if tk is not None:
 
             self._generate_prompted = False
             _required_cells = ("A3", "C50", "C15", "PHONE")
-            _entry_widgets: dict[str, tk.Entry] = {}
+            _entry_widgets: dict[str, Any] = {}
 
             def _valid_like(cell: str, value: str) -> bool:
                 v = value.strip()
@@ -4597,7 +4613,7 @@ if tk is not None:
                                         use_timestamp=False, allow_incomplete=True)
                     self.app.save_draft("moto_act", open_after=False, output_dir=src_dir,
                                         use_timestamp=False, allow_incomplete=True)
-                doc_num = contract_number_for_filename(payload.get("Number", ""))
+                doc_num = contract_number_for_filename(str(payload.get("Number", "")))
                 transit_name = (f"Номери транзиту №{doc_num}.txt" if doc_num
                                 else "Номери транзиту.txt")
                 transit_dir = runtime_app_dir() / "Транзит"
@@ -4620,9 +4636,7 @@ if tk is not None:
             self.master.quit()
 
 else:
-    class DraftWindow:
-        def __init__(self, *args, **kwargs):
-            raise RuntimeError("Tkinter is unavailable in this environment")
+    DraftWindow = cast(Any, None)
 
 
 def run_demo(app_dir: Path, resource_dir: Path) -> None:

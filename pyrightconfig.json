@@ -1,0 +1,11 @@
+{
+  "typeCheckingMode": "basic",
+  "reportMissingTypeStubs": "none",
+  "reportUnknownMemberType": "none",
+  "reportUnknownArgumentType": "none",
+  "reportUnknownVariableType": "none",
+  "reportUnknownParameterType": "none",
+  "reportMissingParameterType": "none",
+  "reportOptionalMemberAccess": "warning",
+  "reportPrivateUsage": "none"
+}
