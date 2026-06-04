@@ -3024,8 +3024,42 @@ class App:
         dialog.configure(bg=self.theme["card_bg"])
         dialog.transient(self.root)
         dialog.grab_set()
+        dialog.rowconfigure(0, weight=1)
+        dialog.columnconfigure(0, weight=1)
 
-        dialog.columnconfigure(1, weight=1)
+        outer = tk.Frame(dialog, bg=self.theme["card_bg"])
+        outer.grid(row=0, column=0, sticky="nsew")
+        outer.rowconfigure(0, weight=1)
+        outer.columnconfigure(0, weight=1)
+
+        canvas = tk.Canvas(outer, bg=self.theme["card_bg"], highlightthickness=0, bd=0)
+        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+        content = tk.Frame(canvas, bg=self.theme["card_bg"])
+        content.columnconfigure(1, weight=1)
+        content_window = canvas.create_window((0, 0), window=content, anchor="nw")
+
+        def _sync_scrollregion(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _fit_content_width(event):
+            canvas.itemconfigure(content_window, width=event.width)
+
+        def _wheel(event):
+            if getattr(event, "delta", 0):
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            return "break"
+
+        content.bind("<Configure>", _sync_scrollregion)
+        canvas.bind("<Configure>", _fit_content_width)
+        for widget in (canvas, content):
+            widget.bind("<MouseWheel>", _wheel)
+            widget.bind("<Button-4>", lambda e: (canvas.yview_scroll(-1, "units"), "break")[1])
+            widget.bind("<Button-5>", lambda e: (canvas.yview_scroll(1, "units"), "break")[1])
+
         fields = [
             ("Шаблон акту", self.moto_path),
             ("Шаблон договору", self.dogovir_path),
@@ -3037,17 +3071,17 @@ class App:
         ]
 
         tk.Label(
-            dialog,
+            content,
             text="Параметри шаблонів",
             font=("Segoe UI", _fs(16), "bold"),
             bg=self.theme["card_bg"],
             fg=self.theme["label_fg"],
         ).grid(row=0, column=0, columnspan=3, sticky="w", padx=16, pady=(14, 8))
         for row, (label, var) in enumerate(fields, start=1):
-            tk.Label(dialog, text=label, bg=self.theme["card_bg"], fg=self.theme["label_fg"]).grid(row=row, column=0, sticky="w", padx=16, pady=6)
-            tk.Entry(dialog, textvariable=var, bg=self.theme["entry_bg"], fg=self.theme["entry_fg"], insertbackground=self.theme["entry_insert"]).grid(row=row, column=1, sticky="ew", pady=6)
+            tk.Label(content, text=label, bg=self.theme["card_bg"], fg=self.theme["label_fg"]).grid(row=row, column=0, sticky="w", padx=16, pady=6)
+            tk.Entry(content, textvariable=var, bg=self.theme["entry_bg"], fg=self.theme["entry_fg"], insertbackground=self.theme["entry_insert"]).grid(row=row, column=1, sticky="ew", pady=6)
             tk.Button(
-                dialog,
+                content,
                 text="📂 Огляд",
                 command=lambda v=var: self.browse_path(v),
                 bg="#0f766e",
@@ -3059,8 +3093,8 @@ class App:
             ).grid(row=row, column=2, padx=12)
 
         theme_row = len(fields) + 1
-        tk.Label(dialog, text="Тема", bg=self.theme["card_bg"], fg=self.theme["label_fg"]).grid(row=theme_row, column=0, sticky="w", padx=16, pady=6)
-        theme_box = tk.Frame(dialog, bg=self.theme["card_bg"])
+        tk.Label(content, text="Тема", bg=self.theme["card_bg"], fg=self.theme["label_fg"]).grid(row=theme_row, column=0, sticky="w", padx=16, pady=6)
+        theme_box = tk.Frame(content, bg=self.theme["card_bg"])
         theme_box.grid(row=theme_row, column=1, columnspan=2, sticky="w", pady=6)
         for idx, (label, value) in enumerate((("Авто", "auto"), ("Світла", "light"), ("Темна", "dark"))):
             tk.Radiobutton(
@@ -3077,7 +3111,7 @@ class App:
             ).grid(row=0, column=idx, sticky="w", padx=(0, 12))
 
         tk.Checkbutton(
-            dialog,
+            content,
             text="Відкривати файл після генерації",
             variable=self.open_after_save,
             bg=self.theme["card_bg"],
@@ -3085,7 +3119,7 @@ class App:
             selectcolor=self.theme["entry_bg"],
         ).grid(row=theme_row + 1, column=0, columnspan=3, sticky="w", padx=16, pady=(10, 4))
         tk.Checkbutton(
-            dialog,
+            content,
             text="Інтеграція з Microsoft Office (Word COM)",
             variable=self.use_word_com,
             bg=self.theme["card_bg"],
@@ -3093,7 +3127,7 @@ class App:
             selectcolor=self.theme["entry_bg"],
         ).grid(row=theme_row + 2, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 6))
         tk.Checkbutton(
-            dialog,
+            content,
             text="Прибрати затінення полів у договорі",
             variable=self.remove_field_shading,
             bg=self.theme["card_bg"],
@@ -3101,12 +3135,12 @@ class App:
             selectcolor=self.theme["entry_bg"],
         ).grid(row=theme_row + 3, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 6))
         tk.Label(
-            dialog,
+            content,
             text="Формат договору",
             bg=self.theme["card_bg"],
             fg=self.theme["label_fg"],
         ).grid(row=theme_row + 4, column=0, sticky="w", padx=16, pady=(0, 6))
-        fmt_menu = tk.OptionMenu(dialog, self.contract_out_format, "doc", "docx")
+        fmt_menu = tk.OptionMenu(content, self.contract_out_format, "doc", "docx")
         fmt_menu.configure(bg=self.theme["btn_bg"], fg=self.theme["btn_fg"],
                            activebackground=self.theme["header_active_bg"],
                            activeforeground=self.theme["header_fg"],
@@ -3114,12 +3148,12 @@ class App:
         fmt_menu["menu"].configure(bg=self.theme["entry_bg"], fg=self.theme["entry_fg"])
         fmt_menu.grid(row=theme_row + 4, column=1, sticky="w", pady=(0, 6))
         tk.Label(
-            dialog,
+            content,
             text="Формат акта",
             bg=self.theme["card_bg"],
             fg=self.theme["label_fg"],
         ).grid(row=theme_row + 5, column=0, sticky="w", padx=16, pady=(0, 6))
-        act_fmt_menu = tk.OptionMenu(dialog, self.act_out_format, "xls", "xlsx")
+        act_fmt_menu = tk.OptionMenu(content, self.act_out_format, "xls", "xlsx")
         act_fmt_menu.configure(bg=self.theme["btn_bg"], fg=self.theme["btn_fg"],
                                activebackground=self.theme["header_active_bg"],
                                activeforeground=self.theme["header_fg"],
@@ -3127,12 +3161,12 @@ class App:
         act_fmt_menu["menu"].configure(bg=self.theme["entry_bg"], fg=self.theme["entry_fg"])
         act_fmt_menu.grid(row=theme_row + 5, column=1, sticky="w", pady=(0, 6))
         tk.Label(
-            dialog,
+            content,
             text="Формат видаткової",
             bg=self.theme["card_bg"],
             fg=self.theme["label_fg"],
         ).grid(row=theme_row + 6, column=0, sticky="w", padx=16, pady=(0, 6))
-        vid_fmt_menu = tk.OptionMenu(dialog, self.vidatkova_out_format, "xls", "xlsx")
+        vid_fmt_menu = tk.OptionMenu(content, self.vidatkova_out_format, "xls", "xlsx")
         vid_fmt_menu.configure(bg=self.theme["btn_bg"], fg=self.theme["btn_fg"],
                                activebackground=self.theme["header_active_bg"],
                                activeforeground=self.theme["header_fg"],
@@ -3140,13 +3174,13 @@ class App:
         vid_fmt_menu["menu"].configure(bg=self.theme["entry_bg"], fg=self.theme["entry_fg"])
         vid_fmt_menu.grid(row=theme_row + 6, column=1, sticky="w", pady=(0, 6))
         tk.Label(
-            dialog,
+            content,
             text="Масштаб інтерфейсу",
             bg=self.theme["card_bg"],
             fg=self.theme["label_fg"],
         ).grid(row=theme_row + 7, column=0, sticky="w", padx=16, pady=(0, 6))
         _scale_labels = {"0.85": "85%", "1.0": "100%", "1.15": "115%", "1.3": "130%", "1.4": "140%", "1.5": "150%"}
-        scale_frame = tk.Frame(dialog, bg=self.theme["card_bg"])
+        scale_frame = tk.Frame(content, bg=self.theme["card_bg"])
         scale_frame.grid(row=theme_row + 7, column=1, columnspan=2, sticky="w", pady=(0, 6))
         scale_menu = tk.OptionMenu(scale_frame, self.ui_scale_var,
                                    *_scale_labels.keys(),
@@ -3167,7 +3201,7 @@ class App:
                  bg=self.theme["card_bg"], fg="#f59e0b").pack(side="left", padx=8)
         # ── New workflow toggles ──────────────────────────────────────────────
         tk.Checkbutton(
-            dialog,
+            content,
             text="Генерувати новий акт (копія файлу)",
             variable=self.generate_new_act_var,
             bg=self.theme["card_bg"],
@@ -3175,7 +3209,7 @@ class App:
             selectcolor=self.theme["entry_bg"],
         ).grid(row=theme_row + 8, column=0, columnspan=3, sticky="w", padx=16, pady=(8, 2))
         tk.Checkbutton(
-            dialog,
+            content,
             text="Запитувати папку при генерації",
             variable=self.ask_output_dir_var,
             bg=self.theme["card_bg"],
@@ -3183,7 +3217,7 @@ class App:
             selectcolor=self.theme["entry_bg"],
         ).grid(row=theme_row + 9, column=0, columnspan=3, sticky="w", padx=16, pady=2)
         tk.Checkbutton(
-            dialog,
+            content,
             text="Підтека для кожного клієнта",
             variable=self.use_case_subfolder_var,
             bg=self.theme["card_bg"],
@@ -3191,7 +3225,7 @@ class App:
             selectcolor=self.theme["entry_bg"],
         ).grid(row=theme_row + 10, column=0, columnspan=3, sticky="w", padx=16, pady=2)
         tk.Checkbutton(
-            dialog,
+            content,
             text="Зберегти форматування клітинок акту (центрування)",
             variable=self.preserve_cell_xf_var,
             bg=self.theme["card_bg"],
@@ -3199,7 +3233,7 @@ class App:
             selectcolor=self.theme["entry_bg"],
         ).grid(row=theme_row + 11, column=0, columnspan=3, sticky="w", padx=16, pady=(2, 8))
         tk.Checkbutton(
-            dialog,
+            content,
             text="Windows COM: запускати макроси 6055_MOTO (кнопки переносу в акт/договір)",
             variable=self.use_moto_macro_com_var,
             bg=self.theme["card_bg"],
@@ -3207,7 +3241,7 @@ class App:
             selectcolor=self.theme["entry_bg"],
         ).grid(row=theme_row + 12, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 8))
         tk.Button(
-            dialog,
+            content,
             text="🔍 Аналізувати шаблон договору",
             command=lambda: self._run_template_diagnosis(dialog),
             bg=self.theme["btn_bg"],
@@ -3216,7 +3250,7 @@ class App:
             activeforeground=self.theme["header_fg"],
         ).grid(row=theme_row + 13, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 8))
         tk.Button(
-            dialog,
+            content,
             text="📋 Журнал генерації",
             command=lambda: self._show_generation_log(dialog),
             bg=self.theme["btn_bg"],
@@ -3225,7 +3259,7 @@ class App:
             activeforeground=self.theme["header_fg"],
         ).grid(row=theme_row + 13, column=2, sticky="e", padx=16, pady=(0, 8))
         tk.Button(
-            dialog,
+            content,
             text="↺ Перезавантажити шаблон",
             command=lambda: [self.reload_source(), dialog.destroy()],
             bg=self.theme["btn_bg"],
@@ -3234,7 +3268,7 @@ class App:
             activeforeground=self.theme["header_fg"],
         ).grid(row=theme_row + 14, column=0, sticky="w", padx=16, pady=8)
         tk.Button(
-            dialog,
+            content,
             text="Зберегти налаштування",
             command=lambda: [self._save_settings(), dialog.destroy()],
             bg=self.theme["btn_bg"],
@@ -3243,7 +3277,7 @@ class App:
             activeforeground=self.theme["header_fg"],
         ).grid(row=theme_row + 14, column=1, sticky="w", pady=8)
         tk.Button(
-            dialog,
+            content,
             text="Закрити",
             command=lambda: [self._save_settings(), dialog.destroy()],
             bg=self.theme["btn_bg"],
@@ -3253,18 +3287,16 @@ class App:
         ).grid(row=theme_row + 14, column=2, sticky="e", padx=12, pady=12)
         dialog.protocol("WM_DELETE_WINDOW", lambda: [self._save_settings(), dialog.destroy()])
 
-        # Auto-fit height after all widgets are created
         dialog.update_idletasks()
-        _dw = min(860, max(760, dialog.winfo_reqwidth() + 20))
-        _dh = max(dialog.winfo_reqheight() + 30, 480)
+        _dw = min(860, max(760, content.winfo_reqwidth() + 40))
+        _dh = min(max(520, int(dialog.winfo_screenheight() * 0.78)), max(480, content.winfo_reqheight() + 20))
         _sx = dialog.winfo_screenwidth()
         _sy = dialog.winfo_screenheight()
-        _dh = min(_dh, max(420, _sy - 80))
-        _dw = min(_dw, max(720, _sx - 40))
         _px = max(0, (_sx - _dw) // 2)
         _py = max(0, (_sy - _dh) // 2)
         dialog.geometry(f"{_dw}x{_dh}+{_px}+{_py}")
         dialog.resizable(True, True)
+        canvas.focus_set()
 
     def _run_template_diagnosis(self, parent_dialog=None) -> None:
         """Open the contract template, inspect its structure and show a report."""
