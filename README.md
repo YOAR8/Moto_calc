@@ -89,11 +89,8 @@ dist\JapanMoto.exe
 
 Якщо на машині є Python, можна працювати без EXE. Додаток сам відкриває результат у системному редакторі або у вибраному софті, якщо ви вкажете його шлях у налаштуваннях.
 
-## GitHub Actions
 
-У репозиторії є workflow [build.yml](.github/workflows/build.yml), який збирає `JapanMoto.exe` на `windows-latest` і публікує артефакт.
-
-## GitHub репозиторій
+## GitHub репозиторій щоб поділитись із працівниками
 
 Цільовий репозиторій:
 https://github.com/YOAR8/Moto_calc
