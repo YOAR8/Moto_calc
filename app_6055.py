@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import copy
 import datetime as dt
 import logging
 import os
@@ -19,6 +20,7 @@ from typing import Any, Dict, Mapping, Tuple, cast
 import xlrd
 import xlwt
 from xlutils.copy import copy as xl_copy
+from xlutils.filter import XLRDReader, XLWTWriter, process
 
 try:
     import tkinter as tk
@@ -132,6 +134,13 @@ def build_theme_palette(mode: str) -> Dict[str, str]:
         "scrollbar_trough": "#e5e7eb",
         "scrollbar_arrow": "#374151",
     }
+
+
+# Placeholders used in DOGOVIR_6055_template.doc for the seller/company block.
+# In the binary .doc they are padded with spaces inside the braces
+# ("{{SELLER_FULL      }}") so the template text keeps its original length.
+CONTRACT_SELLER_TOKENS = ("SELLER_FULL", "CODE", "SELLER_ADDR", "DIRECTOR_GEN", "DIRECTOR_UPPER", "SELLER_ABBR")
+_PADDED_TOKEN_RE = re.compile(r"\{\{([A-Za-z0-9_]+) +\}\}")
 
 
 def contract_sumtext_plain(text: str) -> str:
@@ -299,18 +308,21 @@ def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out
         "price": str(payload.get("price", "")),
         "sumtext": contract_sumtext_plain(payload.get("sumtext", "")),
         "FIO2": str(payload.get("FIO2", "")),
-        # Seller (company) fields — filled only when the template has placeholders;
-        # if the template already contains literal text these keys won't match.
-        "SELLER_NAME": str(payload.get("C5", "")),
-        "SELLER_CODE": str(payload.get("C6", "")),
-        "C5": str(payload.get("C5", "")),
-        "C6": str(payload.get("C6", "")),
     }
+    # Seller (company) placeholders {{SELLER_FULL}}, {{CODE}}, ... (see CONTRACT_SELLER_TOKENS)
+    for key in CONTRACT_SELLER_TOKENS:
+        values[key] = str(payload.get(key, ""))
     _XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
 
     # Copy template byte-for-byte (preserves all styles, images, layout)
     shutil.copy2(template_docx, out_docx)
     doc = Document(str(out_docx))
+
+    # Normalise padded placeholders "{{KEY     }}" -> "{{KEY}}" (the .doc template
+    # pads tokens with spaces to keep the binary layout of the original text).
+    for t_el in doc.element.body.iter(_qn("w:t")):
+        if t_el.text and "{{" in t_el.text:
+            t_el.text = _PADDED_TOKEN_RE.sub(r"{{\1}}", t_el.text)
 
     # Strip Word-level editing protection so python-docx can fill fields.
     try:
@@ -357,7 +369,7 @@ def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out
     # Covers both top-level paragraphs AND paragraphs nested inside content
     # controls (w:sdt) and table cells that doc.paragraphs / doc.tables miss.
     # Keys that need bold + underline applied when filled (seller identity fields)
-    _SELLER_BOLD_KEYS = {"SELLER_NAME", "SELLER_CODE", "C5", "C6"}
+    _SELLER_BOLD_KEYS: set[str] = set()
 
     def _apply_bold_underline(run_elem) -> None:
         """Apply bold+underline formatting to a w:r element."""
@@ -380,6 +392,18 @@ def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out
         runs = list(para_elem.iter(_qn("w:r")))
         if not runs:
             return
+        # A padded seller token split across several runs ("{{SELLER_FULL" | "   " | "}}")
+        # → merge the paragraph text into the first run and normalise the token.
+        para_text0 = "".join((r.findtext(_qn("w:t")) or "") for r in runs)
+        if _PADDED_TOKEN_RE.search(para_text0):
+            first_t0 = runs[0].find(_qn("w:t"))
+            if first_t0 is not None:
+                first_t0.text = _PADDED_TOKEN_RE.sub(r"{{\1}}", para_text0)
+                first_t0.set(_XML_SPACE, "preserve")
+                for run in runs[1:]:
+                    t0 = run.find(_qn("w:t"))
+                    if t0 is not None:
+                        t0.text = ""
         for key, val in values.items():
             for ph in (f"{{{{{key}}}}}", f"<<{key}>>", f"[{key}]", f"${{{key}}}"):
                 para_text = "".join((r.findtext(_qn("w:t")) or "") for r in runs)
@@ -610,7 +634,53 @@ def read_xls_cell(path: Path, sheet_name: str, addr: str):
     return sh.cell_value(r, c)
 
 
-def write_xls_cells(path: Path, sheet_name: str, updates: Mapping[str, object], backup: bool = True, force_a3_tnr10: bool = False, preserve_xf: bool = False) -> None:
+class _StyleKeepingXLWTWriter(XLWTWriter):
+    """xlutils writer that keeps the xlrd-XF -> xlwt-XFStyle mapping after processing.
+
+    xlutils builds ``style_list`` (one XFStyle per xlrd XF index) while copying a
+    workbook, but deletes it in ``close()``.  xlwt then de-duplicates styles on
+    save (style_compression=2), so raw XF indexes of the source book are NOT
+    valid in the written book.  Keeping the style objects lets us re-apply the
+    exact original style (alignment, wrap, font, borders) to overwritten cells.
+    """
+
+    saved_style_list: list = []
+
+    def close(self):  # type: ignore[override]
+        style_list = getattr(self, "style_list", None)
+        if style_list is not None:
+            self.saved_style_list = list(style_list)
+        super().close()
+
+
+def _copy_xls_with_styles(rb) -> Tuple[Any, list]:
+    """Copy an xlrd Book into an xlwt Workbook and return (wtbook, style_list)."""
+    writer = _StyleKeepingXLWTWriter()
+    process(XLRDReader(rb, "unknown.xls"), writer)
+    wtbook = writer.output[0][1]
+    return wtbook, list(writer.saved_style_list)
+
+
+def _style_with_font(style, font_name: str, height_twips: int):
+    """Return a copy of an xlwt XFStyle with a different font name/size (alignment kept)."""
+    try:
+        new_style = copy.deepcopy(style)
+        new_style.font.name = font_name
+        new_style.font.height = height_twips
+        return new_style
+    except Exception:
+        return xlwt.easyxf(f"font: name {font_name}, height {height_twips};")
+
+
+def write_xls_cells(path: Path, sheet_name: str, updates: Mapping[str, object], backup: bool = True, force_a3_tnr10: bool = False, preserve_xf: bool = True) -> None:
+    """Write cell values into an existing .xls via xlrd/xlutils/xlwt.
+
+    With ``preserve_xf`` (default) every overwritten cell keeps the exact style
+    of the template cell (horizontal/vertical alignment, wrap text, font,
+    borders), so merged/centered template cells stay centered.
+    NOTE: this path re-serialises the workbook and therefore drops VBA projects;
+    on Windows prefer :func:`write_xls_cells_excel_com`.
+    """
     if backup:
         ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         backup_path = path.with_name(f"{path.stem}_backup_{ts}{path.suffix}")
@@ -628,12 +698,16 @@ def write_xls_cells(path: Path, sheet_name: str, updates: Mapping[str, object], 
                 except IndexError:
                     return _xf_fallback
         rb.xf_list = _SafeXFList(rb.xf_list)
+    styles: list = []
     try:
-        wb = xl_copy(rb)
+        wb, styles = _copy_xls_with_styles(rb)
     except Exception:
-        # Last-resort fallback: reopen without formatting (loses styles but won't crash)
-        rb = xlrd.open_workbook(str(path), formatting_info=False)
-        wb = xl_copy(rb)
+        try:
+            wb = xl_copy(rb)
+        except Exception:
+            # Last-resort fallback: reopen without formatting (loses styles but won't crash)
+            rb = xlrd.open_workbook(str(path), formatting_info=False)
+            wb = xl_copy(rb)
 
     sheet_idx = None
     for i, name in enumerate(rb.sheet_names()):
@@ -648,29 +722,114 @@ def write_xls_cells(path: Path, sheet_name: str, updates: Mapping[str, object], 
     a3_style = xlwt.easyxf("font: name Times New Roman, height 200;") if force_a3_tnr10 else None
     for addr, value in updates.items():
         r, c = a1_to_rc(addr)
-        try:
-            orig_xf = rs.cell_xf_index(r, c)
-        except Exception:
-            orig_xf = 0
-        if force_a3_tnr10 and addr.upper() == "A3" and a3_style is not None:
-            # Explicitly enforce Times New Roman 10 for Act number/date in A3.
-            ws.write(r, c, value, a3_style)
+        style = None
+        if preserve_xf and styles:
+            try:
+                style = styles[rs.cell_xf_index(r, c)]
+            except Exception:
+                style = None
+        if force_a3_tnr10 and addr.upper() == "A3":
+            # Explicitly enforce Times New Roman 10 for Act number/date in A3
+            # while keeping the template alignment when available.
+            ws.write(r, c, value, _style_with_font(style, "Times New Roman", 200) if style is not None else a3_style)
             continue
-        ws.write(r, c, value)
-        # Optionally restore original XF index (preserves template cell formatting).
-        # When preserve_xf=False (default), xlwt left-aligns with default style.
-        if preserve_xf:
-            row_obj = ws._Worksheet__rows.get(r)
-            if row_obj is not None:
-                cell_obj = row_obj._Row__cells.get(c)
-                if cell_obj is not None:
-                    cell_obj.xf_idx = orig_xf
+        if style is not None:
+            ws.write(r, c, value, style)
+        else:
+            ws.write(r, c, value)
 
     wb.save(str(path))
 
 
+def _com_value_needs_text_format(value: object) -> bool:
+    """True when a string would be misinterpreted by Excel (formula/number/date)."""
+    if not isinstance(value, str):
+        return False
+    s = value.strip()
+    if not s:
+        return False
+    if s[0] in "+=-'@":
+        return True
+    return bool(re.fullmatch(r"[\d\s.,/:-]+", s))
+
+
+def write_xls_cells_excel_com(path: Path, sheet_name: str, updates: Mapping[str, object], log_fn=None) -> None:
+    """Write cell values into an .xls through Microsoft Excel (COM, Windows only).
+
+    Preserves everything in the workbook (VBA project, formatting, merged
+    cells, external links) because Excel itself saves the file.
+    """
+    if not IS_WINDOWS:
+        raise RuntimeError("Excel COM доступний лише на Windows")
+    import win32com.client as win32  # type: ignore
+
+    excel = None
+    wb = None
+    try:
+        try:
+            excel = win32.DispatchEx("Excel.Application")
+        except Exception:
+            excel = win32.Dispatch("Excel.Application")
+        excel.Visible = False
+        excel.DisplayAlerts = False
+        try:
+            excel.AutomationSecurity = 3  # msoAutomationSecurityForceDisable: never run template macros
+        except Exception:
+            pass
+        wb = excel.Workbooks.Open(str(path.resolve()), UpdateLinks=0)
+        ws = wb.Worksheets(sheet_name)
+        for addr, value in updates.items():
+            rng = ws.Range(addr)
+            if _com_value_needs_text_format(value):
+                rng.NumberFormat = "@"
+            rng.Value = value
+        wb.Save()
+        wb.Close(SaveChanges=False)
+        wb = None
+        if log_fn:
+            try:
+                log_fn(f"Excel COM: записано {len(updates)} клітинок у {path.name}")
+            except Exception:
+                pass
+    finally:
+        try:
+            if wb is not None:
+                wb.Close(SaveChanges=False)
+        except Exception:
+            pass
+        try:
+            if excel is not None:
+                excel.Quit()
+        except Exception:
+            pass
+
+
+def write_xls_cells_auto(
+    path: Path,
+    sheet_name: str,
+    updates: Mapping[str, object],
+    prefer_com: bool = False,
+    log_fn=None,
+    force_a3_tnr10: bool = False,
+    preserve_xf: bool = True,
+) -> str:
+    """Write cells using Excel COM when requested/available, else xlutils. Returns the used engine."""
+    if prefer_com and IS_WINDOWS:
+        try:
+            write_xls_cells_excel_com(path, sheet_name, updates, log_fn=log_fn)
+            return "com"
+        except Exception as exc:
+            if log_fn:
+                try:
+                    log_fn(f"Excel COM недоступний ({exc}) → запис через xlutils")
+                except Exception:
+                    pass
+    write_xls_cells(path, sheet_name, updates, backup=False, force_a3_tnr10=force_a3_tnr10, preserve_xf=preserve_xf)
+    return "xlutils"
+
+
 def split_number_date(text: str) -> Tuple[str, str]:
-    # Example: "№ 8424/26/000308 від 15 травня 2026 року"
+    # Example: "№ 0000/26/000001 від 15 травня 2026 року"
     parts = str(text).split()
     if len(parts) >= 7 and parts[0] == "№" and "від" in parts:
         number = parts[1]
@@ -693,6 +852,62 @@ def short_name(full_name: str) -> str:
     if len(tokens) < 3:
         return str(full_name).strip()
     return f"{tokens[0]} {tokens[1][0]}. {tokens[2][0]}."
+
+
+def normalize_phone_digits(raw: object) -> str:
+    """Return a Ukrainian phone as 10 digits ``0XXXXXXXXX`` or '' when not recognisable."""
+    digits = re.sub(r"\D", "", str(raw or ""))
+    if digits.startswith("380") and len(digits) == 12:
+        digits = "0" + digits[3:]
+    elif digits.startswith("80") and len(digits) == 11:
+        digits = "0" + digits[2:]
+    if re.fullmatch(r"0\d{9}", digits):
+        return digits
+    return ""
+
+
+def format_phone_ua(raw: object) -> str:
+    """Format a phone like the client's invoice example: ``+380 00 000 00 00``."""
+    digits = normalize_phone_digits(raw)
+    if not digits:
+        return str(raw or "").strip().lstrip(".")
+    return f"+380 {digits[1:3]} {digits[3:6]} {digits[6:8]} {digits[8:10]}"
+
+
+def looks_like_phone(raw: object) -> bool:
+    return bool(normalize_phone_digits(raw))
+
+
+def excel_serial_to_date_text(value: object, datemode: int = 0) -> str:
+    """Convert an Excel date serial (e.g. 37466.0) into ``DD.MM.YYYY``; '' if not a date serial."""
+    try:
+        number = float(str(value).replace(",", "."))
+    except Exception:
+        return ""
+    if not (1000.0 < number < 100000.0):
+        return ""
+    try:
+        return xlrd.xldate_as_datetime(number, 1 if datemode else 0).strftime("%d.%m.%Y")
+    except Exception:
+        return ""
+
+
+def capitalize_first(text: str) -> str:
+    text = str(text or "")
+    return text[:1].upper() + text[1:] if text else text
+
+
+def to_guillemets(text: str) -> str:
+    """Convert straight double quotes to Ukrainian «» pairs (contract style)."""
+    out = []
+    open_q = True
+    for ch in str(text or ""):
+        if ch == '"':
+            out.append("«" if open_q else "»")
+            open_q = not open_q
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 def contract_number_for_filename(number: str) -> str:
@@ -953,6 +1168,73 @@ FIELD_SECTIONS = [
 ]
 
 
+# Seller (company) details.  They are NOT part of the git templates (which
+# contain neutral example values) — the real values live in jm_config.json
+# ("seller" section, editable in the settings dialog) and are written into the
+# act, the contract and the invoice at generation time.
+# (config key, label, default/example value)
+SELLER_FIELDS: list[tuple[str, str, str]] = [
+    ("seller_name", "Назва (скорочено, як в акті/видатковій)", 'ПП "ПРИКЛАД"'),
+    ("seller_name_full", "Назва (повна, для договору)", "Приватне Підприємство «ПРИКЛАД»"),
+    ("seller_code", "Код ЄДРПОУ", "00000000"),
+    ("seller_address", "Юридична адреса (договір, видаткова)", "м. Місто, вул. Прикладна, 1"),
+    ("seller_postal_address", "Поштова адреса (видаткова, рядок «Адреса»)", "м. Місто, вул. Прикладна, 1, кв. 1"),
+    ("seller_bank", "Банківські реквізити (рядок «Р/р …»)", 'Р/р UA000000000000000000000000000 м. МІСТО, АТ "БАНК" МФО 000000'),
+    ("seller_ipn", "ІПН", "000000000000"),
+    ("seller_certificate", "Номер свідоцтва", "000000000"),
+    ("seller_reg_number", "Реєстраційний номер у МВС", "0000"),
+    ("seller_reg_date", "Дата реєстрації у МВС", "01.01.2000"),
+    ("director_short", "Відповідальна особа для акту (ініціали, прізвище)", "І.І. ПРИКЛАД"),
+    ("director_upper", "Директор (ПІБ повністю, підпис у договорі)", "ПРИКЛАД ІВАН ІВАНОВИЧ"),
+    ("director_gen", "Директор у родовому відмінку («в особі директора …»)", "Приклада Івана Івановича"),
+]
+SELLER_KEYS = [key for key, _, _ in SELLER_FIELDS]
+SELLER_DEFAULTS: Dict[str, str] = {key: default for key, _, default in SELLER_FIELDS}
+# state keys under which seller values travel together with the form state
+SELLER_STATE_PREFIX = "SELLER::"
+
+
+def seller_from_config(cfg: Mapping[str, object]) -> Dict[str, str]:
+    raw = cfg.get("seller") if isinstance(cfg, Mapping) else None
+    out: Dict[str, str] = {}
+    if isinstance(raw, Mapping):
+        for key in SELLER_KEYS:
+            out[key] = str(raw.get(key, "") or "").strip()
+    return out
+
+
+def seller_values(state: Mapping[str, object]) -> Dict[str, str]:
+    """Resolve seller details from state (settings), falling back to the source act (C5/C6/C8)."""
+    seller: Dict[str, str] = {}
+    for key in SELLER_KEYS:
+        seller[key] = str(state.get(SELLER_STATE_PREFIX + key, "") or "").strip()
+    if not seller["seller_name"]:
+        seller["seller_name"] = str(state.get("C5", "") or "").strip() or SELLER_DEFAULTS["seller_name"]
+    if not seller["seller_code"]:
+        seller["seller_code"] = str(state.get("C6", "") or "").strip() or SELLER_DEFAULTS["seller_code"]
+    if not seller["seller_reg_number"]:
+        seller["seller_reg_number"] = str(state.get("C8", "") or "").strip() or SELLER_DEFAULTS["seller_reg_number"]
+    if not seller["seller_name_full"]:
+        name = to_guillemets(seller["seller_name"])
+        if re.match(r"^ПП\s", name):
+            name = "Приватне Підприємство " + name[3:].strip()
+        seller["seller_name_full"] = name
+    for key in SELLER_KEYS:
+        if not seller[key]:
+            seller[key] = SELLER_DEFAULTS[key]
+    # derived, ready-to-insert strings
+    seller["SELLER_NAME"] = seller["seller_name"]
+    seller["SELLER_FULL"] = seller["seller_name_full"]
+    seller["SELLER_ABBR"] = to_guillemets(seller["seller_name"])
+    seller["CODE"] = seller["seller_code"]
+    seller["SELLER_CODE"] = seller["seller_code"]
+    seller["SELLER_ADDR"] = seller["seller_address"]
+    seller["DIRECTOR_GEN"] = seller["director_gen"]
+    seller["DIRECTOR_UPPER"] = seller["director_upper"]
+    seller["DIRECTOR_SHORT"] = seller["director_short"]
+    return seller
+
+
 def iter_field_specs():
     for group_name, fields in FIELD_SECTIONS:
         for cell, label, required in fields:
@@ -976,14 +1258,27 @@ def safe_read_cell(sheet, addr: str):
         return ""
 
 
+_DATE_CELLS = ("C12", "C51")
+
+
 def load_form_state(source_path: Path) -> Dict[str, str]:
     wb = xlrd.open_workbook(str(source_path), formatting_info=False)
     sh = wb.sheet_by_name("Worksheet")
     state: Dict[str, str] = {}
     for cell in FORM_CELLS:
-        state[cell] = str(safe_read_cell(sh, cell)).strip()
+        raw = safe_read_cell(sh, cell)
+        if cell in _DATE_CELLS and isinstance(raw, (int, float)):
+            # The MVS act stores dates (birthday C12, ownership date C51) as
+            # Excel serials, e.g. 37466 -> 29.07.2002.
+            state[cell] = excel_serial_to_date_text(raw, wb.datemode) or str(raw).strip()
+        else:
+            state[cell] = str(raw).strip()
     if not state.get("E15"):
         state["E15"] = short_name(state.get("C15", ""))
+    # Some acts carry the buyer phone in C49 ("Свідоцтво про реєстрацію");
+    # use it as the default for the invoice "Платник" field.
+    if not state.get("PHONE") and looks_like_phone(state.get("C49", "")):
+        state["PHONE"] = format_phone_ua(state.get("C49", ""))
     return state
 
 
@@ -1007,10 +1302,14 @@ def parse_state(state: Dict[str, str]) -> Dict[str, str]:
     payload["cub"] = payload.get("C36", "")
     payload["znak"] = payload.get("C50", "")
     payload["price"] = payload.get("C46", "")
-    payload["SELLER_NAME"] = payload.get("C5", "")
-    payload["SELLER_CODE"] = payload.get("C6", "")
     payload["sumtext"] = amount_to_words_uah(payload.get("C46", ""))
     payload["fio_short"] = short_name(payload.get("C15", ""))
+    payload["PHONE_FMT"] = format_phone_ua(payload.get("PHONE", "")) if str(payload.get("PHONE", "")).strip() else ""
+    # Seller details (settings) → contract tokens / act / invoice header
+    seller = seller_values(state)
+    for key in ("SELLER_NAME", "SELLER_FULL", "SELLER_ABBR", "CODE", "SELLER_CODE",
+                "SELLER_ADDR", "DIRECTOR_GEN", "DIRECTOR_UPPER", "DIRECTOR_SHORT"):
+        payload[key] = seller[key]
     return payload
 
 
@@ -1169,7 +1468,7 @@ def preview_blocks_for_contract(payload: Dict[str, str]) -> list[tuple[str, list
 
 def preview_blocks_for_vidatkova(payload: Dict[str, str]) -> list[tuple[str, list[tuple[str, str]]]]:
     return [
-        ("Видаткова накладна", [("Дата / номер", payload.get("A3", "")), ("Одержувач", payload.get("C15", ""))]),
+        ("Видаткова накладна", [("Дата / номер", payload.get("A3", "")), ("Одержувач", payload.get("C15", "")), ("Платник (телефон)", payload.get("PHONE_FMT", ""))]),
         (
             "Позиція",
             [
@@ -1372,7 +1671,8 @@ def transit_summary_text(payload: Mapping[str, object]) -> str:
 _XLS_CELL_RE = re.compile(r"^[A-Z]+\d+$")
 
 
-def generate_act_xls_from_state(state: Dict[str, str], source_6055: Path, out_path: Path, preserve_xf: bool = False) -> Path:
+def generate_act_xls_from_state(state: Dict[str, str], source_6055: Path, out_path: Path, preserve_xf: bool = True,
+                                prefer_com: bool = False, log_fn=None) -> Path:
     shutil.copy2(source_6055, out_path)
     updates = {cell: state.get(cell, "") for cell in FORM_CELLS if _XLS_CELL_RE.match(cell)}
     full_fio = str(state.get("C15", "")).strip()
@@ -1382,14 +1682,34 @@ def generate_act_xls_from_state(state: Dict[str, str], source_6055: Path, out_pa
     updates["D56"] = short_fio or short_name(full_fio)
     updates.pop("E15", None)  # E15 is app-internal; short name used only in D56
     updates["C43"] = updates.get("C39", "")  # C43 (Номер рами) деривується з VIN
-    write_xls_cells(out_path, "Worksheet", updates, backup=False, force_a3_tnr10=True, preserve_xf=preserve_xf)
+    write_xls_cells_auto(out_path, "Worksheet", updates, prefer_com=prefer_com, log_fn=log_fn,
+                         force_a3_tnr10=True, preserve_xf=preserve_xf)
     return out_path
 
 
-def generate_moto_act_xls_from_state(state: Dict[str, str], template_path: Path, out_path: Path, preserve_xf: bool = True) -> Path:
-    """Fill 6055_MOTO_template.xls from state (акт прийому-передачі)."""
+def _year_cell_value(year: object) -> object:
+    text = str(year or "").strip()
+    return int(text) if text.isdigit() else text
+
+
+def act_seller_updates(seller: Mapping[str, str]) -> Dict[str, object]:
+    """Seller block of the act template (6055_MOTO_template.xls), laid out like the client's example.
+
+    D14 — company name + ЄДРПОУ (left-aligned cell padded with spaces, as in the original),
+    A16 — MVS registration number/date line, A33 — responsible person (signature).
+    """
+    inner = f"{seller['seller_name']} код ЄДРПОУ {seller['seller_code']}"
+    d14_line = " " * 30 + inner + " " * 9 + "\n"
+    return {
+        "D14": d14_line * 2,
+        "A16": " " * 54 + f"реєстраційний номер {seller['seller_reg_number']} від {seller['seller_reg_date']}",
+        "A33": " " * 32 + f"{seller['director_short']} ",
+    }
+
+
+def moto_act_updates(state: Dict[str, str]) -> Dict[str, object]:
+    """Cell map for the act (акт приймання-передачі) — shared by xlutils, Excel COM and macro paths."""
     payload = parse_state(state)
-    shutil.copy2(template_path, out_path)
     number, date_txt = split_number_date(state.get("A3", ""))
     fio = payload.get("FIO", "")
     fio_short = str(state.get("E15", "")).strip() or short_name(fio)
@@ -1398,17 +1718,40 @@ def generate_moto_act_xls_from_state(state: Dict[str, str], template_path: Path,
         "L12": date_txt,
         "H18": fio,
         "C24": payload.get("model", ""),
-        "E24": payload.get("year", ""),
+        "E24": _year_cell_value(payload.get("year", "")),
         "H24": payload.get("cuzov", ""),
         "K24": payload.get("color", ""),
         "N33": fio_short,
     }
-    write_xls_cells(out_path, "Worksheet", updates, backup=False, preserve_xf=preserve_xf)
+    vehicle_type = str(state.get("C21", "")).strip()
+    if vehicle_type:
+        updates["A24"] = vehicle_type  # МОТОЦИКЛ / МОПЕД … (template default kept when empty)
+    updates.update(act_seller_updates(seller_values(state)))
+    return updates
+
+
+def generate_moto_act_xls_from_state(state: Dict[str, str], template_path: Path, out_path: Path, preserve_xf: bool = True,
+                                     prefer_com: bool = False, log_fn=None) -> Path:
+    """Fill 6055_MOTO_template.xls from state (акт прийому-передачі)."""
+    shutil.copy2(template_path, out_path)
+    write_xls_cells_auto(out_path, "Worksheet", moto_act_updates(state), prefer_com=prefer_com, log_fn=log_fn,
+                         preserve_xf=preserve_xf)
     return out_path
 
 
-def generate_vidatkova_xls_from_state(state: Dict[str, str], template_path: Path, out_path: Path, preserve_xf: bool = True) -> Path:
+def invoice_document_ref(payload: Mapping[str, object]) -> str:
+    """'№ 0000/26/000001 від 3 вересня 2026 року' (single spaces) for the invoice header rows."""
+    number = str(payload.get("Number", "")).strip()
+    date_txt = str(payload.get("Data", "")).strip()
+    if number and date_txt:
+        return f"№ {number} від {date_txt}"
+    return " ".join(str(payload.get("A3", "")).split())
+
+
+def generate_vidatkova_xls_from_state(state: Dict[str, str], template_path: Path, out_path: Path, preserve_xf: bool = True,
+                                      prefer_com: bool = False, log_fn=None) -> Path:
     payload = parse_state(state)
+    seller = seller_values(state)
     shutil.copy2(template_path, out_path)
 
     discount = parse_decimal(state.get("DISC", "")) or 0.0
@@ -1427,13 +1770,19 @@ def generate_vidatkova_xls_from_state(state: Dict[str, str], template_path: Path
         price_total_d = price_total
         sumtext = payload.get("sumtext", "")
 
+    # Phone appears ONLY here (row "Платник"), formatted like "+380 00 000 00 00".
     phone = str(state.get("PHONE", "")).strip()
+    doc_ref = invoice_document_ref(payload)
     updates: Dict[str, object] = {
+        # Supplier block (settings → real company details; git template has example data)
+        "C1": f"{seller['seller_name']} Код ЄДРПОУ {seller['seller_code']}, {seller['seller_address']}",
+        "C2": seller["seller_bank"],
+        "C3": f"ІПН {seller['seller_ipn']}, номер свідоцтва {seller['seller_certificate']} ",
+        "C5": f"Адреса  {seller['seller_postal_address']}",
         "C6": payload["FIO"],
-        "C7": f"той самий  тел. {phone}" if phone else "той самий",
-        "G9": payload["A3"],
-        "D10": payload["A3"],
-        "B13": payload.get("C21", "МОПЕД"),
+        "C7": format_phone_ua(phone) if phone else "той самий",
+        "G9": doc_ref,
+        "D10": doc_ref,
         "C13": payload["model"],
         "D13": payload["cuzov"],
         "E13": "шт",
@@ -1443,13 +1792,16 @@ def generate_vidatkova_xls_from_state(state: Dict[str, str], template_path: Path
         "H15": price_no_vat_d if price_no_vat_d else payload.get("C44", ""),
         "H16": vat_d if vat_d else payload.get("C45", ""),
         "H17": price_total_d if price_total_d else payload.get("C46", ""),
-        "A19": sumtext,
+        "A19": capitalize_first(sumtext),
         "B20": vat_d if vat_d else payload.get("C45", ""),
         "F23": payload["FIO"],
     }
+    vehicle_type = str(payload.get("C21", "")).strip()
+    if vehicle_type:
+        updates["B13"] = vehicle_type
     if discount > 0:
         updates["H14"] = discount
-    write_xls_cells(out_path, "Лист1", updates, backup=False, preserve_xf=True)
+    write_xls_cells_auto(out_path, "Лист1", updates, prefer_com=prefer_com, log_fn=log_fn, preserve_xf=preserve_xf)
     return out_path
 
 
@@ -1463,6 +1815,7 @@ def generate_contract_docx_fallback(state: Dict[str, str], out_path: Path) -> "P
         return None
 
     payload = parse_state(state)
+    seller = seller_values(state)
 
     def v(key: str) -> str:
         val = str(payload.get(key, "")).strip()
@@ -1507,8 +1860,8 @@ def generate_contract_docx_fallback(state: Dict[str, str], out_path: Path) -> "P
     # Parties
     add_para(
         "Ми, які підписалися нижче:\n"
-        "Приватне Підприємство ВКФ МОСТ, код ЄДРПОУ 20112221, м. Вінниця, вул. Івана Богуна, 1/13 "
-        "(надалі «Продавець»), в особі директора Колійчука Ігора Миколайовича, який діє на підставі "
+        f"{seller['SELLER_FULL']}, код ЄДРПОУ {seller['CODE']}, {seller['SELLER_ADDR']} "
+        f"(надалі «Продавець»), в особі директора {seller['DIRECTOR_GEN']}, який діє на підставі "
         f"Статуту підприємства з однієї сторони та {v('FIO')}, {v('BirthDay')} року народження, "
         f"паспорт серія {v('pasport')}, реєстраційний номер облікової картки платника податків "
         f"{v('TaxNumber')}, який зареєстрований за адресою: {v('adres')}, (надалі «Покупець»), "
@@ -1583,9 +1936,9 @@ def generate_contract_docx_fallback(state: Dict[str, str], out_path: Path) -> "P
     tbl = doc.add_table(rows=3, cols=2)
     tbl.cell(0, 0).text = "ПРОДАВЕЦЬ:"
     tbl.cell(0, 1).text = "ПОКУПЕЦЬ:"
-    tbl.cell(1, 0).text = "Директор КОЛІЙЧУК ІГОР МИКОЛАЙОВИЧ"
+    tbl.cell(1, 0).text = f"Директор {seller['DIRECTOR_UPPER']}"
     tbl.cell(1, 1).text = f"{v('FIO2')}"
-    tbl.cell(2, 0).text = "ПП ВКФ МОСТ:  (підпис) ________________________"
+    tbl.cell(2, 0).text = f"{seller['SELLER_ABBR']}:  (підпис) ________________________"
     tbl.cell(2, 1).text = "(підпис) ________________________"
 
     out_docx = out_path.with_suffix(".docx")
@@ -1748,6 +2101,50 @@ def diagnose_word_template(template_path: Path, allow_com: bool = True) -> str:
     return "\n".join(lines)
 
 
+def word_replace_seller_tokens(doc, values: Mapping[str, object], log_fn=None) -> int:
+    """Replace {{SELLER_*}} placeholders in an open Word COM document.
+
+    Handles both exact tokens ("{{CODE}}") and space-padded tokens
+    ("{{SELLER_FULL      }}") that the binary .doc template uses.
+    Returns the number of successful replacements.
+    """
+    replaced = 0
+    for key in CONTRACT_SELLER_TOKENS:
+        value = str(values.get(key, "") or "")
+        if not value:
+            continue
+        patterns = [
+            (f"{{{{{key}}}}}", False),
+            (f"\\{{\\{{{key}[ ]@\\}}\\}}", True),
+        ]
+        for text, wildcards in patterns:
+            try:
+                find = doc.Content.Find
+                find.ClearFormatting()
+                find.Replacement.ClearFormatting()
+                ok = find.Execute(
+                    FindText=text, MatchCase=True, MatchWholeWord=False,
+                    MatchWildcards=wildcards, MatchSoundsLike=False,
+                    MatchAllWordForms=False, Forward=True,
+                    Wrap=1, Format=False,
+                    ReplaceWith=value, Replace=2,
+                )
+                if ok:
+                    replaced += 1
+            except Exception as exc:
+                if log_fn:
+                    try:
+                        log_fn(f"Заміна {text!r}: {exc}")
+                    except Exception:
+                        pass
+    if log_fn:
+        try:
+            log_fn(f"Реквізити продавця у договорі: {replaced} замін")
+        except Exception:
+            pass
+    return replaced
+
+
 def generate_contract_doc_windows_from_state(
     state: Dict[str, str],
     dogovir_template: Path,
@@ -1876,6 +2273,9 @@ def generate_contract_doc_windows_from_state(
         except Exception as _e:
             _log(f"FormFields: помилка — {_e}")
 
+        # Seller/company block ({{SELLER_FULL}}, {{CODE}}, ... from settings)
+        word_replace_seller_tokens(doc, payload, log_fn=_log)
+
         # Also fill via Find & Replace for {{placeholder}} / <<placeholder>> / [placeholder]
         fr_filled = 0
         try:
@@ -1995,16 +2395,19 @@ def _parse_clipboard_to_fields(text: str) -> Dict[str, str]:
         result["A3"] = act_num_m.group(1).strip()
 
     # Номер транзитного знаку (український формат): 2 кирилиці + 4-5 цифр + 2 кирилиці [+ 1 цифра]
+    # (Latin letters are accepted too — transit plates from the MVS act, e.g. 00AA0000, use them.)
     transit_m = re.search(
-        r'\b([А-ЯІЇЄҐ]{2}\d{4,5}[А-ЯІЇЄҐ]{2}\d?)\b',
+        r'\b([А-ЯІЇЄҐA-Z]{2}\d{4,5}[А-ЯІЇЄҐA-Z]{2}\d?|\d{2}[А-ЯІЇЄҐA-Z]{2}\d{4})\b',
         clean, re.IGNORECASE,
     )
     if transit_m and "C50" not in result:
-        result["C50"] = transit_m.group(1)
+        result["C50"] = transit_m.group(1).upper()
 
     # Телефон: +380XXXXXXXXX / 0XXXXXXXXX / with separators
     phone_m = re.search(r'(?<!\d)(\+?380\s*\(?\d{2}\)?\s*\d{3}[\s-]*\d{2}[\s-]*\d{2}|0\d{2}\s*\d{3}[\s-]*\d{2}[\s-]*\d{2})(?!\d)', clean)
     if phone_m:
+        # Do not let the phone digits be mistaken for ІПН / passport number below.
+        clean = clean[:phone_m.start(1)] + " " + clean[phone_m.end(1):]
         phone_raw = re.sub(r'[^\d+]', '', phone_m.group(1))
         if phone_raw.startswith("+380"):
             phone_digits = "0" + phone_raw[4:]
@@ -2013,7 +2416,7 @@ def _parse_clipboard_to_fields(text: str) -> Dict[str, str]:
         else:
             phone_digits = phone_raw
         if re.fullmatch(r'0\d{9}', phone_digits):
-            result["PHONE"] = phone_digits
+            result["PHONE"] = format_phone_ua(phone_digits)
 
     # ПІБ: Ukrainian person name = exactly 3 uppercase Cyrillic words where
     # the LAST word (patronymic) ends with a known Ukrainian/Russian suffix.
@@ -2040,10 +2443,11 @@ def _parse_clipboard_to_fields(text: str) -> Dict[str, str]:
     tax_m = re.search(r'(?<!\d)(\d{10})(?!\d)', clean)
     if tax_m:
         result["C18"] = tax_m.group(1)
+        clean = clean[:tax_m.start(1)] + " " + clean[tax_m.end(1):]
 
     # Паспорт: серія (2 кирилічні літери) + 6 цифр [+ дата + видавник]
     ps_m = re.search(
-        r'(?:паспорт\s*)?([А-ЯІЇЄҐ]{2})\s*(\d{6})'
+        r'(?:паспорт\s*)?(?<![А-ЯІЇЄҐA-Za-z])([А-ЯІЇЄҐ]{2})\s*(\d{6})'
         r'(?:\s*,?\s*від\s*(\d{1,2}[./]\d{1,2}[./]\d{2,4})\s*(?:р\.?)?)?'
         r'(?:[,;]?\s*вида(?:ний|ним|но)\s+([^,;\n]+))?',
         clean, re.IGNORECASE,
@@ -2628,6 +3032,10 @@ class App:
         self.ask_output_dir_var = tk.BooleanVar(value=False)
         self.preserve_cell_xf_var = tk.BooleanVar(value=True)
         self.use_moto_macro_com_var = tk.BooleanVar(value=False)
+        # Excel COM writer for .xls (keeps VBA + formatting 1:1); xlutils is the fallback.
+        self.use_excel_com_var = tk.BooleanVar(value=True)
+        # Seller/company details (persisted in jm_config.json, never in the repo templates)
+        self.seller_vars: Dict[str, Any] = {key: tk.StringVar(value="") for key in SELLER_KEYS}
 
         self.state_vars: Dict[str, Any] = {}
         self.widgets: Dict[str, Any] = {}
@@ -2685,6 +3093,9 @@ class App:
         self.use_moto_macro_com_var.set(bool(_cfg.get("use_moto_macro_com", False)))
         if self.use_moto_macro_com_var.get() and not IS_WINDOWS:
             self.use_moto_macro_com_var.set(False)
+        self.use_excel_com_var.set(bool(_cfg.get("use_excel_com", True)))
+        for key, value in seller_from_config(_cfg).items():
+            self.seller_vars[key].set(value)
 
         try:
             self.app_log_path = configure_app_logging(self.app_dir / "logs")
@@ -3249,7 +3660,45 @@ class App:
             bg=self.theme["card_bg"],
             fg=self.theme["label_fg"],
             selectcolor=self.theme["entry_bg"],
-        ).grid(row=theme_row + 12, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 8))
+        ).grid(row=theme_row + 12, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 2))
+        tk.Checkbutton(
+            content,
+            text="Windows COM: записувати акт/видаткову через Excel (зберігає макроси та форматування 1:1)",
+            variable=self.use_excel_com_var,
+            bg=self.theme["card_bg"],
+            fg=self.theme["label_fg"],
+            selectcolor=self.theme["entry_bg"],
+        ).grid(row=theme_row + 13, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 8))
+
+        # ── Seller / company details (stored only in jm_config.json) ──────────
+        seller_row = theme_row + 14
+        tk.Label(
+            content,
+            text="Реквізити продавця (підставляються в акт, договір і видаткову)",
+            font=("Segoe UI", _fs(12), "bold"),
+            bg=self.theme["card_bg"],
+            fg=self.theme["section_fg"],
+        ).grid(row=seller_row, column=0, columnspan=3, sticky="w", padx=16, pady=(10, 4))
+        tk.Label(
+            content,
+            text="Порожні поля беруться з акта МВС (назва, ЄДРПОУ, реєстр. номер) або лишаються прикладом із шаблону.",
+            bg=self.theme["card_bg"],
+            fg=self.theme["label_fg"],
+            font=("Segoe UI", _fs(9)),
+            wraplength=680,
+            justify="left",
+        ).grid(row=seller_row + 1, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 6))
+        for idx, (key, label, default) in enumerate(SELLER_FIELDS):
+            r = seller_row + 2 + idx
+            tk.Label(content, text=f"{label}\nнапр.: {default}", bg=self.theme["card_bg"], fg=self.theme["label_fg"],
+                     font=("Segoe UI", _fs(9)), wraplength=320, justify="left", anchor="w").grid(
+                row=r, column=0, sticky="w", padx=16, pady=3)
+            _se = tk.Entry(content, textvariable=self.seller_vars[key], bg=self.theme["entry_bg"],
+                           fg=self.theme["entry_fg"], insertbackground=self.theme["entry_insert"])
+            _se.grid(row=r, column=1, columnspan=2, sticky="ew", padx=(0, 16), pady=3)
+            self._add_copy_paste_menu(_se)
+
+        actions_row = seller_row + 2 + len(SELLER_FIELDS)
         tk.Button(
             content,
             text="🔍 Аналізувати шаблон договору",
@@ -3258,7 +3707,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 13, column=0, columnspan=2, sticky="w", padx=16, pady=(0, 8))
+        ).grid(row=actions_row, column=0, columnspan=2, sticky="w", padx=16, pady=(10, 8))
         tk.Button(
             content,
             text="📋 Журнал генерації",
@@ -3267,7 +3716,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 13, column=2, sticky="e", padx=16, pady=(0, 8))
+        ).grid(row=actions_row, column=2, sticky="e", padx=16, pady=(10, 8))
         tk.Button(
             content,
             text="↺ Перезавантажити шаблон",
@@ -3276,7 +3725,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 14, column=0, sticky="w", padx=16, pady=8)
+        ).grid(row=actions_row + 1, column=0, sticky="w", padx=16, pady=8)
         tk.Button(
             content,
             text="Зберегти налаштування",
@@ -3285,7 +3734,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 14, column=1, sticky="w", pady=8)
+        ).grid(row=actions_row + 1, column=1, sticky="w", pady=8)
         tk.Button(
             content,
             text="Закрити",
@@ -3294,7 +3743,7 @@ class App:
             fg=self.theme["btn_fg"],
             activebackground=self.theme["header_active_bg"],
             activeforeground=self.theme["header_fg"],
-        ).grid(row=theme_row + 14, column=2, sticky="e", padx=12, pady=12)
+        ).grid(row=actions_row + 1, column=2, sticky="e", padx=12, pady=12)
         dialog.protocol("WM_DELETE_WINDOW", lambda: [self._save_settings(), dialog.destroy()])
 
         dialog.update_idletasks()
@@ -3505,7 +3954,15 @@ class App:
     def collect_state(self) -> Dict[str, str]:
         state = {cell: var.get().strip() for cell, var in self.state_vars.items()}
         state["E15"] = short_name(state.get("C15", ""))
+        state.update(self.collect_seller())
         return state
+
+    def collect_seller(self) -> Dict[str, str]:
+        """Seller details from settings as state keys (SELLER::<key>)."""
+        return {SELLER_STATE_PREFIX + key: var.get().strip() for key, var in self.seller_vars.items()}
+
+    def _prefer_excel_com(self) -> bool:
+        return bool(IS_WINDOWS and self.use_excel_com_var.get())
 
     def refresh_validation(self, silent: bool = False):
         state = self.collect_state()
@@ -3601,7 +4058,9 @@ class App:
         updates = {cell: state.get(cell, "") for cell in FORM_CELLS
                    if cell not in ("E15", "DISC") and _XLS_CELL_RE.match(cell)}
         updates["C43"] = state.get("C39", "")  # C43 (Номер рами) = VIN
-        write_xls_cells(source, "Worksheet", updates, backup=False)  # no backup files in user folders
+        # no backup files in user folders
+        write_xls_cells_auto(source, "Worksheet", updates, prefer_com=self._prefer_excel_com(),
+                             log_fn=self.write_log, preserve_xf=self.preserve_cell_xf_var.get())
         self.write_log(f"Збережено 6055 у {source}")
         self.status_var.set(f"Збережено у {source.name}")
         self.reload_source()
@@ -3633,6 +4092,8 @@ class App:
             "ask_output_dir": self.ask_output_dir_var.get(),
             "preserve_cell_xf": self.preserve_cell_xf_var.get(),
             "use_moto_macro_com": self.use_moto_macro_com_var.get(),
+            "use_excel_com": self.use_excel_com_var.get(),
+            "seller": {key: var.get().strip() for key, var in self.seller_vars.items()},
         })
 
     def paste_from_clipboard(self) -> None:
@@ -3754,11 +4215,12 @@ class App:
                     pass
                 self.write_log(f"Macro COM: C15 взято з 6055 -> {fio_src}")
 
-        write_xls_cells(
+        write_xls_cells_auto(
             work_6055,
             "Worksheet",
             updates,
-            backup=False,
+            prefer_com=self._prefer_excel_com(),
+            log_fn=self.write_log,
             force_a3_tnr10=("A3" in updates),
             preserve_xf=self.preserve_cell_xf_var.get(),
         )
@@ -3796,6 +4258,19 @@ class App:
 
             excel.Run(f"'{wb_moto.Name}'!Кнопка1_Щелчок")
             self.write_log("Macro COM: виконано Кнопка1_Щелчок (акт)")
+            # The VBA button fills only the buyer/vehicle cells; the seller block
+            # (D14/A16/A33) and the vehicle type (A24) come from the app settings/state.
+            try:
+                ws_moto = wb_moto.Worksheets("Worksheet")
+                extra_updates = act_seller_updates(seller_values(state))
+                vehicle_type = str(state.get("C21", "")).strip()
+                if vehicle_type:
+                    extra_updates["A24"] = vehicle_type
+                for addr, value in extra_updates.items():
+                    ws_moto.Range(addr).Value = value
+                self.write_log("Macro COM: дописано реквізити продавця в акт")
+            except Exception as exc_seller:
+                self.write_log(f"Macro COM: не вдалося дописати реквізити продавця: {exc_seller}")
             if out_act.exists():
                 out_act.unlink()
             wb_moto.SaveAs(str(out_act.resolve()), FileFormat=56)
@@ -3819,6 +4294,7 @@ class App:
             if out_contract.exists():
                 out_contract.unlink()
             doc = word.ActiveDocument
+            word_replace_seller_tokens(doc, payload, log_fn=self.write_log)
             if out_contract_ext == "docx":
                 doc.SaveAs(str(out_contract.resolve()), FileFormat=16)
             else:
@@ -3894,7 +4370,8 @@ class App:
             out_xls = out_dir / f"Акт{num_part}{ts}.xls"
             _remove_if_exists(out_xls)
             generate_act_xls_from_state(state, Path(self.source_path.get()), out_xls,
-                                        preserve_xf=self.preserve_cell_xf_var.get())
+                                        preserve_xf=self.preserve_cell_xf_var.get(),
+                                        prefer_com=self._prefer_excel_com(), log_fn=self.write_log)
             if act_ext == "xls":
                 out_path = out_xls
             else:
@@ -3977,7 +4454,8 @@ class App:
             out_xls = out_dir / f"Видаткова{num_part}{ts}.xls"
             _remove_if_exists(out_xls)
             generate_vidatkova_xls_from_state(state, tpl, out_xls,
-                                              preserve_xf=self.preserve_cell_xf_var.get())
+                                              preserve_xf=self.preserve_cell_xf_var.get(),
+                                              prefer_com=self._prefer_excel_com(), log_fn=self.write_log)
             if vid_ext == "xls":
                 out_path = out_xls
             else:
@@ -3998,7 +4476,8 @@ class App:
             out_xls = out_dir / f"Акт МОТО{num_part}{ts}.xls"
             _remove_if_exists(out_xls)
             generate_moto_act_xls_from_state(state, tpl, out_xls,
-                                             preserve_xf=self.preserve_cell_xf_var.get())
+                                             preserve_xf=self.preserve_cell_xf_var.get(),
+                                             prefer_com=self._prefer_excel_com(), log_fn=self.write_log)
             out_path = out_xls
         else:
             raise ValueError(f"Невідомий тип чорновика: {kind}")
@@ -4006,6 +4485,8 @@ class App:
         self.write_log(f"Згенеровано: {out_path}")
         self.status_var.set(f"Створено {out_path.name}")
         for cell, value in state.items():
+            if cell.startswith(SELLER_STATE_PREFIX):
+                continue
             AutocompleteEntry.record(cell, value)
         AutocompleteEntry.save_db()
         if open_after and self.open_after_save.get():
@@ -4406,11 +4887,11 @@ if tk is not None:
                 return
             self._show_step2()
             self.update_idletasks()
-            w, h = int(660 * _FONT_SCALE), int(500 * _FONT_SCALE)
+            w, h = int(660 * _FONT_SCALE), int(560 * _FONT_SCALE)
             sx = self.winfo_screenwidth()
             sy = self.winfo_screenheight()
             self.geometry(f"{w}x{h}+{(sx - w) // 2}+{(sy - h) // 2}")
-            self.minsize(int(540 * _FONT_SCALE), int(420 * _FONT_SCALE))
+            self.minsize(int(540 * _FONT_SCALE), int(470 * _FONT_SCALE))
 
         def _show_step2(self) -> None:
             self._clear()
@@ -4448,7 +4929,7 @@ if tk is not None:
                 row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
             self._generate_prompted = False
-            _required_cells = ("A3", "C50", "C15", "PHONE")
+            _required_cells = ("A3", "C50", "C15", "C12", "PHONE")
             _entry_widgets: dict[str, Any] = {}
 
             def _valid_like(cell: str, value: str) -> bool:
@@ -4458,12 +4939,11 @@ if tk is not None:
                 if cell == "A3":
                     return "№" in v and "від" in v.lower()
                 if cell == "C50":
-                    return re.fullmatch(r"[А-ЯІЇЄҐ]{2}\d{4,5}[А-ЯІЇЄҐ]{2}\d?", v, re.IGNORECASE) is not None
+                    return re.fullmatch(r"[А-ЯІЇЄҐA-Z]{2}\d{4,5}[А-ЯІЇЄҐA-Z]{2}\d?", v, re.IGNORECASE) is not None
                 if cell == "PHONE":
-                    digits = re.sub(r"\D", "", v)
-                    if digits.startswith("380"):
-                        digits = "0" + digits[3:]
-                    return re.fullmatch(r"0\d{9}", digits) is not None
+                    return looks_like_phone(v)
+                if cell == "C12":
+                    return valid_date_text(v)
                 if cell == "C15":
                     return len([t for t in v.split() if t]) >= 2
                 return True
@@ -4497,7 +4977,8 @@ if tk is not None:
                 ("A3", "Номер акта *"),
                 ("C50", "Номер транзиту"),
                 ("C15", "ПІБ покупця"),
-                ("PHONE", "Телефон покупця"),
+                ("C12", "Дата народження (у договір)"),
+                ("PHONE", "Телефон покупця (у видаткову)"),
             ]):
                 tk.Label(body, text=label, bg=t["card_bg"], fg=t["label_fg"],
                          anchor="w", font=("Segoe UI", _fs(10))).grid(
@@ -4579,9 +5060,10 @@ if tk is not None:
                         if val:
                             wizard_updates[cell] = val
                     if wizard_updates:
-                        write_xls_cells(
+                        write_xls_cells_auto(
                             src_path, "Worksheet", wizard_updates,
-                            backup=False,
+                            prefer_com=self.app._prefer_excel_com(),
+                            log_fn=self.app.write_log,
                             force_a3_tnr10=("A3" in wizard_updates),
                             preserve_xf=self.app.preserve_cell_xf_var.get(),
                         )

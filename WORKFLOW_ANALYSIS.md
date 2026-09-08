@@ -440,3 +440,31 @@ That is the main architectural simplification:
 - source data in one place
 - generation logic in one place
 - outputs as derived artifacts
+
+## 9. v1.0.6 Re-verification Against the Client's Final Examples (September 2026)
+
+The client supplied a fresh MVS source act (`ActInspectSale(...).xls`) and final examples of the three
+generated documents. Findings:
+
+- **VBA is unchanged.** `olevba` output of the client's act and invoice examples is byte-for-byte identical
+  to the macros documented above (`СУММАПРОПИСЬЮ`, `MyCopy*`, `GetNumber/GetDate`, `Кнопка1_Щелчок`,
+  `Кнопка2_Щелчок`). The contract `.doc` carries only an empty `ThisDocument` module. No app-logic change
+  was required for the macro flow.
+- **Source act layout is unchanged** (sheet `Worksheet`, A3 number/date line, C12 birthday as an Excel date
+  serial, C15–C18 buyer, C20/C21 model/type, C28/C29 colour/year, C36 cc, C39/C41 VIN/engine, C44–C47 prices
+  and customs declaration, C49 phone, C50 transit plate). The app now converts date serials in C12/C51 to
+  `DD.MM.YYYY` and pre-fills the wizard phone from C49 when it looks like a phone number.
+- **Data that lives outside the source act** and must come from the wizard/settings:
+  - buyer phone → invoice `C7` only (`+380 98 000 00 00` format), never act/contract;
+  - birthday → contract bookmark `BirthDay` (wizard field, used when the act has no C12);
+  - seller/company block → act `D14`/`A16`/`A33`, invoice `C1`/`C2`/`C3`/`C5`, contract tokens
+    `{{SELLER_FULL}}`, `{{CODE}}`, `{{SELLER_ADDR}}`, `{{DIRECTOR_GEN}}`, `{{DIRECTOR_UPPER}}`,
+    `{{SELLER_ABBR}}` — all configured in app settings (`jm_config.json`, not committed).
+- **Templates in git are privacy-neutral.** Variable strings were replaced in place inside the BIFF shared
+  string table / Word text stream with same-length placeholders, so the VBA project, cell XF records,
+  merged ranges and bookmarks are intact. Never round-trip these files through xlwt/xlutils or "Save As" —
+  that drops the VBA project.
+- **Writing path.** On Windows the app writes `.xls` cells through Excel COM (macros + formatting kept
+  1:1); elsewhere it uses xlrd/xlwt/xlutils with the original XF (alignment, wrap, font) re-applied per
+  cell, which was verified cell-by-cell (values, styles, merged ranges) against `акт пр перед 1181.xls`
+  and `vidatkova 1181.xls`.

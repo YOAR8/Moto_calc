@@ -1,23 +1,32 @@
-## JapanMoto Release Notes
+## JapanMoto v1.0.6 — фінальні виправлення за зауваженнями клієнта
 
-### What is included
-- Windows-only contract generation through original DOGOVIR_6055_template.doc (Word COM) for 1:1 formatting.
-- Contract fallback pipeline when Word COM is unavailable:
-  - Try LibreOffice/Office CLI to generate legacy .doc from template.
-  - If .doc is unavailable, generate template-preserving .docx.
-  - Last resort: text-built .docx fallback.
-- Contract clause 2.1 now writes amount in words in brackets without currency text, then adds "гривень 00 копійок" outside brackets.
-- Improved desktop shortcut creation in build script with fallback to Public Desktop.
-- Optional custom app icon support in build script:
-  - assets/japanmoto.ico
-  - japanmoto.ico
-- Autocomplete in empty fields now shows last 4 recent values.
-- XLS writing preserves original cell formatting (fonts/styles).
-- Automatic UI theme mode based on Windows app theme (light/dark).
-- Settings window improvements:
-  - Opens centered on screen.
-  - Increased height by 5% to avoid clipped bottom actions.
-  - Theme switch in settings: Auto / Light / Dark.
+### Видаткова накладна
+- Телефон покупця (поле «Телефон покупця» у майстрі / повній формі) пишеться **лише** у видаткову, рядок «Платник» (C7), у форматі `+380 98 000 00 00` (як у прикладі клієнта). В акт і договір телефон не потрапляє.
+- «Одержувач» (C6) та «Отримав(ла)» (F23) — повне ПІБ покупця.
+- Рядки «Умова продажу» / «Видаткова накладна» отримують `№ … від … року` з одиничними пробілами; сума прописом починається з великої літери.
+- Блок «Постачальник» (рядки 1–5) заповнюється реквізитами з налаштувань.
+
+### Договір
+- Дата народження (закладка `BirthDay`) тепер завжди заповнюється: у майстер додано поле «Дата народження», значення передається у всі шляхи генерації (Word COM, LibreOffice/.docx fallback, текстовий fallback). Якщо в акті МВС дата є як Excel-дата, вона коректно перетворюється у `ДД.ММ.РРРР`.
+- Реквізити продавця (повна назва, ЄДРПОУ, адреса, директор) підставляються з налаштувань замість жорстко зашитого тексту.
+- Перевірено відповідність усіх полів (паспорт, РНОКПП, адреса, декларація, номер двигуна, об'єм, транзит, ціна цифрами та прописом) прикладу клієнта.
+
+### Акт приймання-передачі
+- Виправлено «не по центру і не влазить»: запис у XLS зберігає вихідний стиль клітинок (вирівнювання по центру, перенос тексту, шрифт, об'єднані діапазони) — і через xlutils, і через Excel COM. Модель у C24 переноситься в межах об'єднаної клітинки, ПІБ у H18 по центру.
+- Тип ТЗ (МОТОЦИКЛ / МОПЕД …) береться з акта МВС (C21).
+- Блок продавця (назва + ЄДРПОУ, «реєстраційний номер … від …», підпис відповідальної особи) — з налаштувань.
+
+### Реквізити компанії в налаштуваннях
+- Новий розділ «Реквізити продавця» у вікні ⚙ Налаштування: назва (коротка/повна), ЄДРПОУ, юридична та поштова адреса, банківські реквізити, ІПН, номер свідоцтва, реєстраційний номер і дата реєстрації у МВС, відповідальна особа для акта, директор (ПІБ та родовий відмінок).
+- Зберігаються локально у `jm_config.json` (не потрапляють у git/реліз). У репозиторії та збірці — тільки нейтральні приклади.
+
+### Шаблони та макроси
+- Шаблони `6055_MOTO_template.xls`, `vidatkova.xls`, `6055.xls`, `DOGOVIR_6055_template.doc` оновлено за новими прикладами клієнта; усі персональні/корпоративні дані замінено нейтральними прикладами без втрати VBA-макросів і форматування (правки в бінарному потоці, а не пере-збереження).
+- Windows: запис у .xls типово йде через Excel COM (зберігає макроси і форматування 1:1), xlutils — резервний шлях. Перемикач у налаштуваннях.
+
+### Інше
+- Майстер приймає латинські та кириличні літери у номері транзиту; «Вставити» з буфера розпізнає телефон і одразу форматує його.
+- Автопідказки не запам'ятовують реквізити продавця.
 
 ### Build info
 This release is built automatically by GitHub Actions.
