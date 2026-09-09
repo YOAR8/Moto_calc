@@ -627,8 +627,174 @@ def rc_to_a1(row: int, col: int) -> str:
     return f"{out}{row + 1}"
 
 
+class _NullLog:
+    """Sink for xlrd warnings (the windowed exe has no stdout)."""
+
+    def write(self, *_args, **_kwargs) -> None:
+        return None
+
+    def flush(self) -> None:
+        return None
+
+
+def _xls_read_error_text(path: Path, exc: BaseException) -> str:
+    return (
+        f"Не вдалося прочитати файл Excel:\n{path}\n\n"
+        f"Помилка: {exc}\n\n"
+        "Порада: відкрийте файл у Excel і збережіть його як «Книга Excel 97-2003 (*.xls)», "
+        "після чого оберіть збережений файл."
+    )
+
+
+def _xls_stream_via_olefile(path: Path) -> bytes:
+    """Extract the raw BIFF 'Workbook' stream with olefile (lenient OLE2 parser).
+
+    xlrd accepts a bare BIFF stream via ``file_contents``; all cell values,
+    XF/font/format records and merged ranges live inside this stream, so
+    formatting is preserved 1:1.
+    """
+    import olefile  # type: ignore
+
+    ole = olefile.OleFileIO(str(path))
+    try:
+        for name in ("Workbook", "Book"):
+            if ole.exists(name):
+                return ole.openstream(name).read()
+    finally:
+        ole.close()
+    raise ValueError("У файлі немає потоку Workbook (це не книга Excel 97-2003)")
+
+
+def _xls_resave_via_excel_com(path: Path) -> Path:
+    """Windows only: let Excel open the file and re-save a *copy* as .xls (FileFormat 56).
+
+    The original file is never modified. Returns the temp copy path.
+    """
+    if not IS_WINDOWS:
+        raise RuntimeError("Excel COM доступний лише на Windows")
+    import win32com.client as win32  # type: ignore
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="jm_xls_fix_"))
+    out = tmp_dir / f"{path.stem}_fixed.xls"
+    excel = None
+    wb = None
+    try:
+        try:
+            excel = win32.DispatchEx("Excel.Application")
+        except Exception:
+            excel = win32.Dispatch("Excel.Application")
+        excel.Visible = False
+        excel.DisplayAlerts = False
+        try:
+            excel.AutomationSecurity = 3
+        except Exception:
+            pass
+        wb = excel.Workbooks.Open(str(path.resolve()), UpdateLinks=0, ReadOnly=True)
+        wb.SaveAs(str(out), FileFormat=56)  # xlExcel8
+        wb.Close(SaveChanges=False)
+        wb = None
+    finally:
+        try:
+            if wb is not None:
+                wb.Close(SaveChanges=False)
+        except Exception:
+            pass
+        try:
+            if excel is not None:
+                excel.Quit()
+        except Exception:
+            pass
+    if not out.is_file():
+        raise RuntimeError("Excel не зберіг тимчасову копію файлу")
+    return out
+
+
+def open_xls_workbook(path: Path, formatting_info: bool = False, log_fn=None):
+    """Open an .xls with xlrd, tolerating structurally odd BIFF8/OLE2 files.
+
+    MVS ``ActInspectSale`` exports often have OLE2 sector-chain quirks
+    (root/mini-stream overlapping the Workbook stream) which make plain
+    ``xlrd.open_workbook`` fail with ``CompDocError: Workbook corruption:
+    seen[N] == M``.  Strategy (the same for value and formatting reads, because
+    the check lives in xlrd's compound-document layer, not in BIFF parsing):
+
+    1. plain ``xlrd.open_workbook``;
+    2. ``ignore_workbook_corruption=True`` (xlrd 2.0.x);
+    3. raw ``Workbook`` stream extracted with olefile → ``file_contents``;
+    4. Windows: Excel COM re-saves a temp copy as .xls (original untouched).
+
+    Raises ``ValueError``/``FileNotFoundError`` with a Ukrainian message for
+    directories / missing files / non-.xls input, ``RuntimeError`` otherwise.
+    """
+    p = Path(path)
+
+    def _log(text: str) -> None:
+        try:
+            APP_LOGGER.info(text)
+        except Exception:
+            pass
+        if log_fn:
+            try:
+                log_fn(text)
+            except Exception:
+                pass
+
+    if p.is_dir():
+        raise ValueError(f"Вказано папку, а не файл акта:\n{p}\n\nОберіть файл .xls (акт МВС).")
+    if not p.is_file():
+        raise FileNotFoundError(f"Файл не знайдено:\n{p}")
+    suffix = p.suffix.lower()
+    if suffix == ".xlsx" or suffix == ".xlsm":
+        raise ValueError(
+            f"Файл {p.name} має формат {suffix}, який не підтримується.\n\n"
+            "Відкрийте його в Excel і збережіть як «Книга Excel 97-2003 (*.xls)»."
+        )
+    if suffix != ".xls":
+        raise ValueError(f"Очікується файл Excel 97-2003 (.xls), а обрано:\n{p.name}")
+
+    null_log = _NullLog()
+    errors: list = []
+
+    try:
+        return xlrd.open_workbook(str(p), formatting_info=formatting_info, logfile=null_log)
+    except Exception as exc:  # CompDocError / XLRDError / AssertionError …
+        errors.append(exc)
+        _log(f"xlrd: {p.name}: {type(exc).__name__}: {exc} → повторна спроба з ignore_workbook_corruption")
+
+    try:
+        wb = xlrd.open_workbook(str(p), formatting_info=formatting_info, logfile=null_log,
+                                ignore_workbook_corruption=True)
+        _log(f"xlrd: {p.name} відкрито з ignore_workbook_corruption=True")
+        return wb
+    except Exception as exc:
+        errors.append(exc)
+        _log(f"xlrd(ignore_workbook_corruption): {type(exc).__name__}: {exc} → спроба через olefile")
+
+    try:
+        raw = _xls_stream_via_olefile(p)
+        wb = xlrd.open_workbook(file_contents=raw, formatting_info=formatting_info, logfile=null_log)
+        _log(f"xlrd: {p.name} відкрито з потоку Workbook (olefile)")
+        return wb
+    except Exception as exc:
+        errors.append(exc)
+        _log(f"olefile: {type(exc).__name__}: {exc}")
+
+    if IS_WINDOWS:
+        try:
+            fixed = _xls_resave_via_excel_com(p)
+            wb = xlrd.open_workbook(str(fixed), formatting_info=formatting_info, logfile=null_log,
+                                    ignore_workbook_corruption=True)
+            _log(f"xlrd: {p.name} відкрито через копію, пересбережену Excel ({fixed})")
+            return wb
+        except Exception as exc:
+            errors.append(exc)
+            _log(f"Excel COM re-save: {type(exc).__name__}: {exc}")
+
+    raise RuntimeError(_xls_read_error_text(p, errors[0])) from errors[-1]
+
+
 def read_xls_cell(path: Path, sheet_name: str, addr: str):
-    wb = xlrd.open_workbook(str(path), formatting_info=False)
+    wb = open_xls_workbook(path, formatting_info=False)
     sh = wb.sheet_by_name(sheet_name)
     r, c = a1_to_rc(addr)
     return sh.cell_value(r, c)
@@ -686,7 +852,7 @@ def write_xls_cells(path: Path, sheet_name: str, updates: Mapping[str, object], 
         backup_path = path.with_name(f"{path.stem}_backup_{ts}{path.suffix}")
         shutil.copy2(path, backup_path)
 
-    rb = xlrd.open_workbook(str(path), formatting_info=True)
+    rb = open_xls_workbook(path, formatting_info=True)
     # Wrap xf_list with a safe fallback accessor to prevent xl_copy from
     # crashing on XLS files that reference out-of-range XF style indices.
     if rb.xf_list:
@@ -706,7 +872,7 @@ def write_xls_cells(path: Path, sheet_name: str, updates: Mapping[str, object], 
             wb = xl_copy(rb)
         except Exception:
             # Last-resort fallback: reopen without formatting (loses styles but won't crash)
-            rb = xlrd.open_workbook(str(path), formatting_info=False)
+            rb = open_xls_workbook(path, formatting_info=False)
             wb = xl_copy(rb)
 
     sheet_idx = None
@@ -923,7 +1089,7 @@ def contract_number_for_filename(number: str) -> str:
 
 
 def load_source_values(source_6055: Path) -> Dict[str, object]:
-    wb = xlrd.open_workbook(str(source_6055), formatting_info=False)
+    wb = open_xls_workbook(source_6055, formatting_info=False)
     sh = wb.sheet_by_name("Worksheet")
 
     def g(addr: str):
@@ -1262,7 +1428,7 @@ _DATE_CELLS = ("C12", "C51")
 
 
 def load_form_state(source_path: Path) -> Dict[str, str]:
-    wb = xlrd.open_workbook(str(source_path), formatting_info=False)
+    wb = open_xls_workbook(source_path, formatting_info=False)
     sh = wb.sheet_by_name("Worksheet")
     state: Dict[str, str] = {}
     for cell in FORM_CELLS:
