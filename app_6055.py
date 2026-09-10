@@ -2443,8 +2443,46 @@ def word_replace_contract_tokens(doc, values: Mapping[str, object], log_fn=None)
 
 
 def word_replace_seller_tokens(doc, values: Mapping[str, object], log_fn=None) -> int:
-    """Backward-compatible alias — seller tokens are part of CONTRACT_FIELD_TOKENS."""
-    return word_replace_contract_tokens(doc, values, log_fn=log_fn)
+    """Replace {{SELLER_*}} placeholders in the FORMTEXT Word template.
+
+    The shipped DOGOVIR_6055_template.doc pads tokens with spaces inside the
+    braces (e.g. "{{SELLER_FULL                  }}") so layout stays stable.
+    """
+    replaced = 0
+    for key in CONTRACT_SELLER_TOKENS:
+        value = str(values.get(key, "") or "")
+        if not value:
+            continue
+        patterns = [
+            (f"{{{{{key}}}}}", False),
+            ("\\{\\{{" + key + "[ ]@\\}\\}", True),
+        ]
+        for text, wildcards in patterns:
+            try:
+                find = doc.Content.Find
+                find.ClearFormatting()
+                find.Replacement.ClearFormatting()
+                ok = find.Execute(
+                    FindText=text, MatchCase=True, MatchWholeWord=False,
+                    MatchWildcards=wildcards, MatchSoundsLike=False,
+                    MatchAllWordForms=False, Forward=True,
+                    Wrap=1, Format=False,
+                    ReplaceWith=value, Replace=2,
+                )
+                if ok:
+                    replaced += 1
+            except Exception as exc:
+                if log_fn:
+                    try:
+                        log_fn(f"Заміна продавця {key}: {exc}")
+                    except Exception:
+                        pass
+    if log_fn:
+        try:
+            log_fn(f"Реквізити продавця у договорі: {replaced} замін")
+        except Exception:
+            pass
+    return replaced
 
 
 
@@ -2520,31 +2558,27 @@ def generate_contract_doc_windows_from_state(
         except Exception:
             pass
 
-        # Primary path: exact-length token Find/Replace (keeps 1:1 layout, red transit).
-        tok_filled = word_replace_contract_tokens(doc, payload, log_fn=_log)
-
-        # Secondary: bookmarks / FormFields / Content Controls if the template still has them.
-        bookmark_map = {
-            "Number": "Number", "Data": "Data", "FIO": "FIO", "pasport": "pasport",
-            "TaxNumber": "TaxNumber", "BirthDay": "BirthDay", "adres": "adres",
-            "decl": "decl", "model": "model", "year": "year", "color": "color",
-            "numberdv": "numberdv", "cuzov": "cuzov", "cub": "cub", "znak": "znak",
-            "price": "price", "sumtext": "sumtext", "FIO2": "FIO2",
+        # Primary: Word FORMTEXT FormFields + bookmarks (shipped template layout 1:1).
+        field_keys = {
+            "Number", "Data", "FIO", "pasport", "TaxNumber", "BirthDay", "adres",
+            "decl", "model", "year", "color", "numberdv", "cuzov", "cub", "znak",
+            "price", "sumtext", "FIO2",
         }
-        bm_filled = 0
-        try:
-            for key, bookmark_name in bookmark_map.items():
-                value = payload.get(key, "")
-                if key == "sumtext":
-                    value = contract_sumtext_plain(str(value))
-                elif key == "znak":
-                    value = transit_plate_cyrillic(str(value))
-                if doc.Bookmarks.Exists(bookmark_name):
-                    doc.Bookmarks(bookmark_name).Range.Text = str(value)
-                    bm_filled += 1
-            _log(f"Закладки: знайдено {doc.Bookmarks.Count}, заповнено {bm_filled}")
-        except Exception as _e:
-            _log(f"Закладки: {_e}")
+
+        def _field_value(key: str) -> str:
+            val = payload.get(key, "")
+            if key == "sumtext":
+                return contract_sumtext_plain(str(val))
+            if key == "znak":
+                return transit_plate_cyrillic(str(val))
+            if key == "price":
+                try:
+                    return str(int(float(str(val).replace(",", ".").replace(" ", "") or 0)))
+                except Exception:
+                    return str(val or "").strip()
+            if key in ("year", "cub"):
+                return re.sub(r"\.0$", "", str(val or "").strip())
+            return str(val or "").strip()
 
         ff_filled = 0
         try:
@@ -2552,20 +2586,31 @@ def generate_contract_doc_windows_from_state(
             for i in range(1, _ffc + 1):
                 ff = doc.FormFields(i)
                 ff_name = str(ff.Name or "")
-                if ff_name and ff_name in payload:
-                    val = payload[ff_name]
-                    if ff_name == "sumtext":
-                        val = contract_sumtext_plain(str(val))
-                    elif ff_name == "znak":
-                        val = transit_plate_cyrillic(str(val))
+                if ff_name in field_keys:
                     try:
-                        ff.Result = str(val)
+                        ff.Result = _field_value(ff_name)
                         ff_filled += 1
-                    except Exception:
-                        pass
+                    except Exception as _fe:
+                        _log(f"FormField {ff_name}: {_fe}")
             _log(f"FormFields: {_ffc} знайдено, {ff_filled} заповнено")
         except Exception as _e:
             _log(f"FormFields: {_e}")
+
+        bm_filled = 0
+        try:
+            for key in field_keys:
+                if doc.Bookmarks.Exists(key):
+                    doc.Bookmarks(key).Range.Text = _field_value(key)
+                    bm_filled += 1
+            _log(f"Закладки: знайдено {doc.Bookmarks.Count}, заповнено {bm_filled}")
+        except Exception as _e:
+            _log(f"Закладки: {_e}")
+
+        # Seller block tokens {{SELLER_FULL   }}, {{CODE}}, ...
+        seller_filled = word_replace_seller_tokens(doc, payload, log_fn=_log)
+
+        # Optional: underscore tokens from older experimental template (no-op if absent)
+        tok_filled = word_replace_contract_tokens(doc, payload, log_fn=_log)
 
         if remove_shading:
             try:
@@ -2578,7 +2623,7 @@ def generate_contract_doc_windows_from_state(
                 pass
             _log("Застосовано режим: без затінення полів")
 
-        _log(f"Всього: токени={tok_filled}/{len(CONTRACT_FIELD_TOKENS)}, закладки={bm_filled}, FormFields={ff_filled}")
+        _log(f"Всього: FormFields={ff_filled}, закладки={bm_filled}, продавець={seller_filled}, токени={tok_filled}")
         # wdFormatDocument = 0 → keep classic .doc (no reflow to docx)
         try:
             doc.SaveAs2(str(out_path.resolve()), FileFormat=0)
