@@ -136,12 +136,103 @@ def build_theme_palette(mode: str) -> Dict[str, str]:
     }
 
 
-# Placeholders used in DOGOVIR_6055_template.doc for the seller/company block.
-# In the binary .doc they are padded with spaces inside the braces
-# ("{{SELLER_FULL      }}") so the template text keeps its original length.
+# Placeholders used in DOGOVIR_6055_template.doc (built from the client's
+# one-page example). Each token has the SAME character length as the example
+# value it replaced, so Find/Replace keeps fonts, bold runs, red transit, and
+# pagination 1:1. Replace longest tokens first (see word_replace_contract_tokens).
+CONTRACT_FIELD_TOKENS: Dict[str, str] = {
+    'adres': '{{ADRES________________________________________________________}}',
+    'decl': '{{DECL__________________________________________________________}}',
+    'pasport': '{{PASPORT__________________________________}}',
+    'sumtext': '{{SUMTEXT_______________________________}}',
+    'SELLER_FULL': '{{SELLER_FULL__________________}}',
+    'SELLER_ADDR': '{{SELLER_ADDR____________________}}',
+    'FIO': '{{FIO_____________________}}',
+    'DIRECTOR_GEN': '{{DIRECTOR_GEN____________}}',
+    'DIRECTOR_UPPER': '{{DIRECTOR_UPPER_______}}',
+    'Data': '{{DATA___________}}',
+    'model': '{{MODEL______}}',
+    'SELLER_ABBR': '{{ABBR______}}',
+    'Number': '{{NUMBER____}}',
+    'numberdv': '{{NUMBERDV}}',
+    'cuzov': '{{CUZOV__}}',
+    'BirthDay': '{{BDAY__}}',
+    'TaxNumber': '{{TAX___}}',
+    'CODE': '{{CODE}}',
+    'znak': '{{ZNAK}}',
+    'color': '{{CO}}',
+    'price': '{{PR}}',
+    'year': '#YR_',
+    'cub': '#CU',
+}
 CONTRACT_SELLER_TOKENS = ("SELLER_FULL", "CODE", "SELLER_ADDR", "DIRECTOR_GEN", "DIRECTOR_UPPER", "SELLER_ABBR")
 _PADDED_TOKEN_RE = re.compile(r"\{\{([A-Za-z0-9_]+) +\}\}")
 
+# Latin lookalikes → Cyrillic for Ukrainian transit plates (client example uses Cyrillic А/С).
+_LATIN_TO_CYR_PLATE = str.maketrans({
+    "A": "А", "B": "В", "C": "С", "E": "Е", "H": "Н", "I": "І", "K": "К",
+    "M": "М", "O": "О", "P": "Р", "T": "Т", "X": "Х",
+    "a": "А", "b": "В", "c": "С", "e": "Е", "h": "Н", "i": "І", "k": "К",
+    "m": "М", "o": "О", "p": "Р", "t": "Т", "x": "Х",
+})
+
+
+def transit_plate_cyrillic(value: str) -> str:
+    """Normalize a transit plate to Cyrillic lookalikes (keeps digits)."""
+    return str(value or "").strip().translate(_LATIN_TO_CYR_PLATE)
+
+
+def fit_contract_token_value(value: object, token: str) -> str:
+    """Pad/truncate a value to the exact length of its template token (no reflow)."""
+    text = str(value or "")
+    n = len(token)
+    if len(text) > n:
+        return text[:n]
+    return text + (" " * (n - len(text)))
+
+
+def contract_token_values(payload: Mapping[str, object]) -> Dict[str, str]:
+    """Build the key→replacement map for CONTRACT_FIELD_TOKENS (already length-fitted)."""
+    out: Dict[str, str] = {}
+    for key, token in CONTRACT_FIELD_TOKENS.items():
+        raw = payload.get(key, "")
+        if key == "sumtext":
+            raw = contract_sumtext_plain(str(raw))
+            # Example has a trailing space before the closing parenthesis.
+            if raw and not str(raw).endswith(" "):
+                raw = str(raw) + " "
+        elif key == "znak":
+            raw = transit_plate_cyrillic(str(raw))
+        elif key == "price":
+            try:
+                raw = str(int(float(str(raw).replace(",", ".").replace(" ", "") or 0)))
+            except Exception:
+                raw = str(raw or "").strip()
+        elif key in ("year", "cub", "Number", "CODE", "TaxNumber", "BirthDay"):
+            raw = str(raw or "").strip()
+            if key == "year":
+                raw = re.sub(r"\.0$", "", raw)
+            if key == "cub":
+                raw = re.sub(r"\.0$", "", raw)
+        else:
+            raw = str(raw or "").strip()
+        out[key] = fit_contract_token_value(raw, token)
+    return out
+
+
+def seller_is_configured(state: Mapping[str, object]) -> bool:
+    """True when the user filled the required seller block (not just defaults)."""
+    required = (
+        "seller_name", "seller_name_full", "seller_code", "seller_address",
+        "director_gen", "director_upper",
+    )
+    for key in required:
+        val = str(state.get(SELLER_STATE_PREFIX + key, "") or "").strip()
+        if not val:
+            return False
+        if val == SELLER_DEFAULTS.get(key, ""):
+            return False
+    return True
 
 def contract_sumtext_plain(text: str) -> str:
     """Return amount-in-words without trailing currency phrase."""
@@ -309,17 +400,36 @@ def _fill_docx_contract_template(state: Dict[str, str], template_docx: Path, out
         "sumtext": contract_sumtext_plain(payload.get("sumtext", "")),
         "FIO2": str(payload.get("FIO2", "")),
     }
-    # Seller (company) placeholders {{SELLER_FULL}}, {{CODE}}, ... (see CONTRACT_SELLER_TOKENS)
-    for key in CONTRACT_SELLER_TOKENS:
-        values[key] = str(payload.get(key, ""))
+    # All contract tokens (buyer + seller), length-fitted for the .doc template.
+    fitted = contract_token_values(payload)
+    values.update(fitted)
+    # Also expose unpadded keys for SDT / FORMTEXT name matching.
+    for key in CONTRACT_FIELD_TOKENS:
+        if key not in values or not str(values.get(key, "")).strip():
+            values[key] = str(payload.get(key, ""))
     _XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
 
     # Copy template byte-for-byte (preserves all styles, images, layout)
     shutil.copy2(template_docx, out_docx)
     doc = Document(str(out_docx))
 
-    # Normalise padded placeholders "{{KEY     }}" -> "{{KEY}}" (the .doc template
-    # pads tokens with spaces to keep the binary layout of the original text).
+    # Exact-length tokens from the .doc template ({{NUMBER____}}, #YR_, …).
+    # Longest first so short tokens like {{CO}}/{{PR}} cannot match inside others.
+    _token_items = sorted(CONTRACT_FIELD_TOKENS.items(), key=lambda kv: -len(kv[1]))
+    for t_el in doc.element.body.iter(_qn("w:t")):
+        if not t_el.text:
+            continue
+        txt = t_el.text
+        changed = False
+        for key, token in _token_items:
+            if token in txt:
+                txt = txt.replace(token, fitted.get(key, ""))
+                changed = True
+        if changed:
+            t_el.text = txt
+            t_el.set(_XML_SPACE, "preserve")
+
+    # Normalise padded placeholders "{{KEY     }}" -> "{{KEY}}" (legacy templates).
     for t_el in doc.element.body.iter(_qn("w:t")):
         if t_el.text and "{{" in t_el.text:
             t_el.text = _PADDED_TOKEN_RE.sub(r"{{\1}}", t_el.text)
@@ -1466,7 +1576,7 @@ def parse_state(state: Dict[str, str]) -> Dict[str, str]:
     payload["numberdv"] = payload.get("C41", "")
     payload["cuzov"] = payload.get("C39", "") or payload.get("C42", "") or payload.get("C43", "")
     payload["cub"] = payload.get("C36", "")
-    payload["znak"] = payload.get("C50", "")
+    payload["znak"] = transit_plate_cyrillic(payload.get("C50", ""))
     payload["price"] = payload.get("C46", "")
     payload["sumtext"] = amount_to_words_uah(payload.get("C46", ""))
     payload["fio_short"] = short_name(payload.get("C15", ""))
@@ -2016,11 +2126,13 @@ def generate_contract_docx_fallback(state: Dict[str, str], out_path: Path) -> "P
         p = doc.add_paragraph()
         p.add_run(text).bold = True
 
-    # Title
-    add_centered_bold("ДОГОВІР КУПІВЛІ-ПРОДАЖУ ТРАНСПОРТНОГО ЗАСОБУ", size=14)
-    add_centered_bold(
-        f"№ {v('Number')}    місто Вінниця, Україна,    {v('Data')}"
-    )
+    # Title — two centered lines like the client's one-page example
+    add_centered_bold("ДОГОВІР КУПІВЛІ-ПРОДАЖУ", size=12)
+    add_centered_bold(f"ТРАНСПОРТНОГО ЗАСОБУ № {v('Number')}", size=12)
+    p = doc.add_paragraph()
+    p.add_run("місто Вінниця, Україна,")
+    tab = p.add_run("\t" * 8)
+    p.add_run(v("Data"))
     doc.add_paragraph()
 
     # Parties
@@ -2036,15 +2148,24 @@ def generate_contract_docx_fallback(state: Dict[str, str], out_path: Path) -> "P
 
     # Section 1
     add_bold_para("1. ПРЕДМЕТ ДОГОВОРУ")
-    add_para(
+    p11 = doc.add_paragraph()
+    p11.paragraph_format.first_line_indent = Pt(36)
+    r = p11.add_run(
         f"1.1. За цим Договором Продавець продає Покупцю, та зобов'язується передати у власність "
         f"Покупця, а Покупець зобов'язується прийняти у власність транспортний засіб, ввезений на "
         f"територію України на підставі митної декларації {v('decl')}, б/використані мотоцикл, "
         f"який має такі характеристики: марка {v('model')}, {v('year')} року випуску, "
         f"колір {v('color')}, номер кузова (шасі, рама) {v('cuzov')}, номер двигуна {v('numberdv')}, "
-        f"об'єм двигуна {v('cub')} см\u00b3, транзитний номерний знак виданий торг. орг. {v('znak')}.",
-        indent=True,
+        f"об'єм двигуна {v('cub')} см\u00b3, транзитний номерний знак виданий торг. орг. "
     )
+    r.font.name = "Times New Roman"
+    r.font.size = Pt(12)
+    rz = p11.add_run(transit_plate_cyrillic(v('znak')))
+    rz.font.name = "Times New Roman"
+    rz.font.size = Pt(12)
+    rz.font.color.rgb = __import__('docx.shared', fromlist=['RGBColor']).RGBColor(0xFF, 0x00, 0x00)
+    p11.add_run(".")
+
     add_para(
         "1.2. Транспортний засіб оглянутий Покупцем. Покупець стверджує, що володіє достатньою "
         "інформацією про Транспортний засіб, що набувається, задоволений його технічним станом та "
@@ -2267,48 +2388,64 @@ def diagnose_word_template(template_path: Path, allow_com: bool = True) -> str:
     return "\n".join(lines)
 
 
-def word_replace_seller_tokens(doc, values: Mapping[str, object], log_fn=None) -> int:
-    """Replace {{SELLER_*}} placeholders in an open Word COM document.
+def word_replace_contract_tokens(doc, values: Mapping[str, object], log_fn=None) -> int:
+    """Replace every CONTRACT_FIELD_TOKENS placeholder in an open Word COM document.
 
-    Handles both exact tokens ("{{CODE}}") and space-padded tokens
-    ("{{SELLER_FULL      }}") that the binary .doc template uses.
-    Returns the number of successful replacements.
+    Tokens are matched exactly (no wildcards), longest first, so short tokens like
+    ``{{CO}}`` / ``{{PR}}`` cannot eat parts of longer ones. Replacement strings are
+    pre-padded to the token length, so pagination and the red transit run stay put.
+    Returns the number of successful Find/Replace operations.
     """
+    fitted = contract_token_values(values)
+    # Longest token first
+    items = sorted(
+        ((key, CONTRACT_FIELD_TOKENS[key], fitted[key]) for key in CONTRACT_FIELD_TOKENS),
+        key=lambda x: -len(x[1]),
+    )
     replaced = 0
-    for key in CONTRACT_SELLER_TOKENS:
-        value = str(values.get(key, "") or "")
-        if not value:
-            continue
-        patterns = [
-            (f"{{{{{key}}}}}", False),
-            (f"\\{{\\{{{key}[ ]@\\}}\\}}", True),
-        ]
-        for text, wildcards in patterns:
-            try:
-                find = doc.Content.Find
-                find.ClearFormatting()
-                find.Replacement.ClearFormatting()
-                ok = find.Execute(
-                    FindText=text, MatchCase=True, MatchWholeWord=False,
-                    MatchWildcards=wildcards, MatchSoundsLike=False,
-                    MatchAllWordForms=False, Forward=True,
-                    Wrap=1, Format=False,
-                    ReplaceWith=value, Replace=2,
-                )
-                if ok:
-                    replaced += 1
-            except Exception as exc:
+    for key, token, value in items:
+        try:
+            find = doc.Content.Find
+            find.ClearFormatting()
+            find.Replacement.ClearFormatting()
+            ok = find.Execute(
+                FindText=token, MatchCase=True, MatchWholeWord=False,
+                MatchWildcards=False, MatchSoundsLike=False,
+                MatchAllWordForms=False, Forward=True,
+                Wrap=1, Format=False,
+                ReplaceWith=value, Replace=2,  # wdReplaceAll
+            )
+            if ok:
+                replaced += 1
                 if log_fn:
                     try:
-                        log_fn(f"Заміна {text!r}: {exc}")
+                        log_fn(f"Токен {key}: замінено")
                     except Exception:
                         pass
+            else:
+                if log_fn:
+                    try:
+                        log_fn(f"Токен {key}: НЕ знайдено ({token[:20]}…)")
+                    except Exception:
+                        pass
+        except Exception as exc:
+            if log_fn:
+                try:
+                    log_fn(f"Токен {key}: помилка — {exc}")
+                except Exception:
+                    pass
     if log_fn:
         try:
-            log_fn(f"Реквізити продавця у договорі: {replaced} замін")
+            log_fn(f"Договір: {replaced}/{len(CONTRACT_FIELD_TOKENS)} токенів замінено")
         except Exception:
             pass
     return replaced
+
+
+def word_replace_seller_tokens(doc, values: Mapping[str, object], log_fn=None) -> int:
+    """Backward-compatible alias — seller tokens are part of CONTRACT_FIELD_TOKENS."""
+    return word_replace_contract_tokens(doc, values, log_fn=log_fn)
+
 
 
 def generate_contract_doc_windows_from_state(
@@ -2349,16 +2486,24 @@ def generate_contract_doc_windows_from_state(
     if not dogovir_template.exists():
         raise FileNotFoundError(f"Шаблон договору не знайдено: {dogovir_template}")
 
+    # Work on a copy so the bundled template stays pristine.
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if out_path.resolve() != dogovir_template.resolve():
+        shutil.copy2(dogovir_template, out_path)
+
     word = None
+    doc = None
     try:
         import win32com.client as win32  # type: ignore
 
         word = win32.Dispatch("Word.Application")
         word.Visible = False
+        word.DisplayAlerts = 0
         # Disable macros BEFORE opening: prevents AutoOpen/AutoNew from running
         # and potentially overriding our fill or hanging on UI prompts.
         word.Application.AutomationSecurity = 3  # msoAutomationSecurityForceDisable
-        doc = word.Documents.Open(str(dogovir_template.resolve()))
+        doc = word.Documents.Open(str(out_path.resolve()))
 
         # Remove document protection (protected-for-forms blocks text replacements).
         try:
@@ -2375,54 +2520,32 @@ def generate_contract_doc_windows_from_state(
         except Exception:
             pass
 
+        # Primary path: exact-length token Find/Replace (keeps 1:1 layout, red transit).
+        tok_filled = word_replace_contract_tokens(doc, payload, log_fn=_log)
+
+        # Secondary: bookmarks / FormFields / Content Controls if the template still has them.
         bookmark_map = {
-            "Number": "Number",
-            "Data": "Data",
-            "FIO": "FIO",
-            "pasport": "pasport",
-            "TaxNumber": "TaxNumber",
-            "BirthDay": "BirthDay",
-            "adres": "adres",
-            "decl": "decl",
-            "model": "model",
-            "year": "year",
-            "color": "color",
-            "numberdv": "numberdv",
-            "cuzov": "cuzov",
-            "cub": "cub",
-            "znak": "znak",
-            "price": "price",
-            "sumtext": "sumtext",
-            "FIO2": "FIO2",
+            "Number": "Number", "Data": "Data", "FIO": "FIO", "pasport": "pasport",
+            "TaxNumber": "TaxNumber", "BirthDay": "BirthDay", "adres": "adres",
+            "decl": "decl", "model": "model", "year": "year", "color": "color",
+            "numberdv": "numberdv", "cuzov": "cuzov", "cub": "cub", "znak": "znak",
+            "price": "price", "sumtext": "sumtext", "FIO2": "FIO2",
         }
         bm_filled = 0
-        for key, bookmark_name in bookmark_map.items():
-            value = payload.get(key, "")
-            if key == "sumtext":
-                value = contract_sumtext_plain(str(value))
-            if doc.Bookmarks.Exists(bookmark_name):
-                doc.Bookmarks(bookmark_name).Range.Text = str(value)
-                bm_filled += 1
-        _log(f"Закладки: знайдено {doc.Bookmarks.Count}, заповнено за картою {bm_filled}/{len(bookmark_map)}")
-
-        # Also fill via Content Controls (tag or title match)
-        cc_filled = 0
         try:
-            _ccc = doc.ContentControls.Count
-            for i in range(1, _ccc + 1):
-                cc = doc.ContentControls(i)
-                cc_name = str(cc.Tag or cc.Title or "")
-                if cc_name and cc_name in payload:
-                    try:
-                        cc.Range.Text = str(payload[cc_name])
-                        cc_filled += 1
-                    except Exception:
-                        pass
-            _log(f"Content Controls: {_ccc} знайдено, {cc_filled} заповнено")
+            for key, bookmark_name in bookmark_map.items():
+                value = payload.get(key, "")
+                if key == "sumtext":
+                    value = contract_sumtext_plain(str(value))
+                elif key == "znak":
+                    value = transit_plate_cyrillic(str(value))
+                if doc.Bookmarks.Exists(bookmark_name):
+                    doc.Bookmarks(bookmark_name).Range.Text = str(value)
+                    bm_filled += 1
+            _log(f"Закладки: знайдено {doc.Bookmarks.Count}, заповнено {bm_filled}")
         except Exception as _e:
-            _log(f"Content Controls: помилка — {_e}")
+            _log(f"Закладки: {_e}")
 
-        # Also fill legacy FormFields (Name match)
         ff_filled = 0
         try:
             _ffc = doc.FormFields.Count
@@ -2430,42 +2553,20 @@ def generate_contract_doc_windows_from_state(
                 ff = doc.FormFields(i)
                 ff_name = str(ff.Name or "")
                 if ff_name and ff_name in payload:
+                    val = payload[ff_name]
+                    if ff_name == "sumtext":
+                        val = contract_sumtext_plain(str(val))
+                    elif ff_name == "znak":
+                        val = transit_plate_cyrillic(str(val))
                     try:
-                        ff.Result = str(payload[ff_name])
+                        ff.Result = str(val)
                         ff_filled += 1
                     except Exception:
                         pass
             _log(f"FormFields: {_ffc} знайдено, {ff_filled} заповнено")
         except Exception as _e:
-            _log(f"FormFields: помилка — {_e}")
+            _log(f"FormFields: {_e}")
 
-        # Seller/company block ({{SELLER_FULL}}, {{CODE}}, ... from settings)
-        word_replace_seller_tokens(doc, payload, log_fn=_log)
-
-        # Also fill via Find & Replace for {{placeholder}} / <<placeholder>> / [placeholder]
-        fr_filled = 0
-        try:
-            find = doc.Content.Find
-            find.ClearFormatting()
-            for key, value in payload.items():
-                val_str = str(value)
-                if key == "sumtext":
-                    val_str = contract_sumtext_plain(val_str)
-                for ph in (f"{{{{{key}}}}}", f"<<{key}>>", f"[{key}]"):
-                    ok = find.Execute(
-                        FindText=ph, MatchCase=False, MatchWholeWord=False,
-                        MatchWildcards=False, MatchSoundsLike=False,
-                        MatchAllWordForms=False, Forward=True,
-                        Wrap=1, Format=False,
-                        ReplaceWith=val_str, Replace=2,
-                    )
-                    if ok:
-                        fr_filled += 1
-            _log(f"Find & Replace: {fr_filled} замін")
-        except Exception as _e:
-            _log(f"Find & Replace: помилка — {_e}")
-
-        # Optional: forcefully remove field shading in COM mode too.
         if remove_shading:
             try:
                 word.Options.FieldShading = 0
@@ -2475,24 +2576,20 @@ def generate_contract_doc_windows_from_state(
                 _clear_com_range_shading(doc.Content)
             except Exception:
                 pass
-            try:
-                for i in range(1, doc.FormFields.Count + 1):
-                    _clear_com_range_shading(doc.FormFields(i).Range)
-            except Exception:
-                pass
-            try:
-                for i in range(1, doc.ContentControls.Count + 1):
-                    _clear_com_range_shading(doc.ContentControls(i).Range)
-            except Exception:
-                pass
             _log("Застосовано режим: без затінення полів")
-        else:
-            _log("Застосовано режим: із затіненням полів")
 
-        _log(f"Всього заповнено: закладки={bm_filled}, CC={cc_filled}, FormFields={ff_filled}, F&R={fr_filled}")
-        doc.SaveAs(str(out_path.resolve()))
+        _log(f"Всього: токени={tok_filled}/{len(CONTRACT_FIELD_TOKENS)}, закладки={bm_filled}, FormFields={ff_filled}")
+        # wdFormatDocument = 0 → keep classic .doc (no reflow to docx)
+        try:
+            doc.SaveAs2(str(out_path.resolve()), FileFormat=0)
+        except Exception:
+            doc.SaveAs(str(out_path.resolve()), FileFormat=0)
         doc.Close(SaveChanges=False)
-        word.Application.AutomationSecurity = 1  # restore
+        doc = None
+        try:
+            word.Application.AutomationSecurity = 1  # restore
+        except Exception:
+            pass
         return out_path
     except Exception as exc:
         raise RuntimeError(
@@ -4574,6 +4671,14 @@ class App:
                     )
                 except Exception as exc:
                     self.write_log(f"Word COM помилка: {exc} → перемикаюсь на режим без COM")
+                    self.write_log(traceback.format_exc())
+                    if messagebox:
+                        messagebox.showwarning(
+                            "Word COM",
+                            f"Не вдалося заповнити договір через Microsoft Word:\n{exc}\n\n"
+                            "Спробую запасний шлях. Формат 1:1 (одна сторінка, червоний "
+                            "транзит) гарантується лише через Word.",
+                        )
                     _com_enabled = False
             if not _com_enabled:
                 reason = "вимкнено в налаштуваннях" if not self.use_word_com.get() else "не Windows"
@@ -4597,6 +4702,14 @@ class App:
                 else:
                     # Last resort: full text docx generator (different appearance)
                     self.write_log("Шаблонне заповнення не вдалось → генерую резервний текстовий договір")
+                    if messagebox:
+                        messagebox.showwarning(
+                            "Договір — резервний режим",
+                            "Microsoft Word недоступний або шаблон не вдалося заповнити.\n\n"
+                            "Договір буде зібрано резервним генератором — форматування "
+                            "може відрізнятися від оригіналу (кількість сторінок, червоний "
+                            "номер транзиту).\n\nДеталі в japan_moto.log.",
+                        )
                     out_docx = out_doc.with_suffix(".docx")
                     result = generate_contract_docx_fallback(state, out_docx)
                     if result:
@@ -4755,8 +4868,36 @@ class App:
         dlg.wait_window()
         return result[0]
 
+    def _ensure_seller_configured(self) -> bool:
+        """Block generation when seller details are still the example defaults."""
+        state = self.collect_state()
+        if seller_is_configured(state):
+            return True
+        if not messagebox:
+            return False
+        go = messagebox.askyesno(
+            "Реквізити продавця",
+            "Не заповнені реквізити продавця (назва, ЄДРПОУ, адреса, директор).\n\n"
+            "Без них договір вийде з текстом «ПРИКЛАД».\n\n"
+            "Відкрити налаштування зараз?",
+            default=messagebox.YES,
+        )
+        if go:
+            self.open_settings_dialog()
+            state = self.collect_state()
+            if seller_is_configured(state):
+                return True
+            messagebox.showwarning(
+                "Реквізити продавця",
+                "Реквізити все ще не заповнені. Заповніть поля в ⚙ Налаштування → «Реквізити продавця».",
+            )
+            return False
+        return False
+
     def generate_all(self, allow_incomplete: bool = False) -> None:
         try:
+            if not self._ensure_seller_configured():
+                return
             if not allow_incomplete:
                 if not messagebox.askyesno(
                     "Генерація документів",
