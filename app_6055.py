@@ -221,18 +221,13 @@ def contract_token_values(payload: Mapping[str, object]) -> Dict[str, str]:
 
 
 def seller_is_configured(state: Mapping[str, object]) -> bool:
-    """True when the user filled the required seller block (not just defaults)."""
+    """True when seller block is available (built-in defaults or user overrides)."""
+    seller = seller_values(state)
     required = (
         "seller_name", "seller_name_full", "seller_code", "seller_address",
         "director_gen", "director_upper",
     )
-    for key in required:
-        val = str(state.get(SELLER_STATE_PREFIX + key, "") or "").strip()
-        if not val:
-            return False
-        if val == SELLER_DEFAULTS.get(key, ""):
-            return False
-    return True
+    return all(str(seller.get(key, "") or "").strip() for key in required)
 
 def contract_sumtext_plain(text: str) -> str:
     """Return amount-in-words without trailing currency phrase."""
@@ -1450,19 +1445,20 @@ FIELD_SECTIONS = [
 # act, the contract and the invoice at generation time.
 # (config key, label, default/example value)
 SELLER_FIELDS: list[tuple[str, str, str]] = [
-    ("seller_name", "Назва (скорочено, як в акті/видатковій)", 'ПП "ПРИКЛАД"'),
-    ("seller_name_full", "Назва (повна, для договору)", "Приватне Підприємство «ПРИКЛАД»"),
-    ("seller_code", "Код ЄДРПОУ", "00000000"),
-    ("seller_address", "Юридична адреса (договір, видаткова)", "м. Місто, вул. Прикладна, 1"),
-    ("seller_postal_address", "Поштова адреса (видаткова, рядок «Адреса»)", "м. Місто, вул. Прикладна, 1, кв. 1"),
-    ("seller_bank", "Банківські реквізити (рядок «Р/р …»)", 'Р/р UA000000000000000000000000000 м. МІСТО, АТ "БАНК" МФО 000000'),
-    ("seller_ipn", "ІПН", "000000000000"),
-    ("seller_certificate", "Номер свідоцтва", "000000000"),
-    ("seller_reg_number", "Реєстраційний номер у МВС", "0000"),
-    ("seller_reg_date", "Дата реєстрації у МВС", "01.01.2000"),
-    ("director_short", "Відповідальна особа для акту (ініціали, прізвище)", "І.І. ПРИКЛАД"),
-    ("director_upper", "Директор (ПІБ повністю, підпис у договорі)", "ПРИКЛАД ІВАН ІВАНОВИЧ"),
-    ("director_gen", "Директор у родовому відмінку («в особі директора …»)", "Приклада Івана Івановича"),
+    # Defaults = реквізити з робочого договору/видаткової клієнта (можна змінити в ⚙).
+    ("seller_name", "Назва (скорочено, як в акті/видатковій)", 'ПП "КАРОЛІННІ"'),
+    ("seller_name_full", "Назва (повна, для договору)", "Приватне Підприємство «КАРОЛІННІ»"),
+    ("seller_code", "Код ЄДРПОУ", "36685357"),
+    ("seller_address", "Юридична адреса (договір, видаткова)", "м. Вінниця, вул. Івана Богуна, 1/13"),
+    ("seller_postal_address", "Поштова адреса (видаткова, рядок «Адреса»)", "м. Вінниця, вул. Івана Богуна, 1, кв. 13"),
+    ("seller_bank", "Банківські реквізити (рядок «Р/р …»)", 'Р/р UA763006140000026009500684602 м. ВІННИЦЯ, АТ  "КРЕДІ АГРІКОЛЬ БАНК" МФО 300614'),
+    ("seller_ipn", "ІПН", "201122202289"),
+    ("seller_certificate", "Номер свідоцтва", "100249059"),
+    ("seller_reg_number", "Реєстраційний номер у МВС", "6450"),
+    ("seller_reg_date", "Дата реєстрації у МВС", "12.11.2013"),
+    ("director_short", "Відповідальна особа для акту (ініціали, прізвище)", "І.М. КОЛІЙЧУК"),
+    ("director_upper", "Директор (ПІБ повністю, підпис у договорі)", "КОЛІЙЧУК ІГОР МИКОЛАЙОВИЧ"),
+    ("director_gen", "Директор у родовому відмінку («в особі директора …»)", "Колійчука Ігоря Миколайовича"),
 ]
 SELLER_KEYS = [key for key, _, _ in SELLER_FIELDS]
 SELLER_DEFAULTS: Dict[str, str] = {key: default for key, _, default in SELLER_FIELDS}
@@ -3403,7 +3399,7 @@ class App:
         # Excel COM writer for .xls (keeps VBA + formatting 1:1); xlutils is the fallback.
         self.use_excel_com_var = tk.BooleanVar(value=True)
         # Seller/company details (persisted in jm_config.json, never in the repo templates)
-        self.seller_vars: Dict[str, Any] = {key: tk.StringVar(value="") for key in SELLER_KEYS}
+        self.seller_vars: Dict[str, Any] = {key: tk.StringVar(value=SELLER_DEFAULTS[key]) for key in SELLER_KEYS}
 
         self.state_vars: Dict[str, Any] = {}
         self.widgets: Dict[str, Any] = {}
@@ -3463,7 +3459,15 @@ class App:
             self.use_moto_macro_com_var.set(False)
         self.use_excel_com_var.set(bool(_cfg.get("use_excel_com", True)))
         for key, value in seller_from_config(_cfg).items():
-            self.seller_vars[key].set(value)
+            if str(value or "").strip():
+                self.seller_vars[key].set(value)
+        # Порожні поля → вбудовані дефолти з договору; старий пак «ПРИКЛАД» теж замінюємо.
+        _name_now = self.seller_vars["seller_name"].get().strip()
+        _migrate_example = _name_now in ('', 'ПП "ПРИКЛАД"', 'ПП «ПРИКЛАД»')
+        for key in SELLER_KEYS:
+            cur = self.seller_vars[key].get().strip()
+            if not cur or _migrate_example:
+                self.seller_vars[key].set(SELLER_DEFAULTS[key])
 
         try:
             self.app_log_path = configure_app_logging(self.app_dir / "logs")
@@ -4974,7 +4978,7 @@ class App:
         return result[0]
 
     def _ensure_seller_configured(self) -> bool:
-        """Block generation when seller details are still the example defaults."""
+        """Block generation only if required seller fields are empty after defaults."""
         state = self.collect_state()
         if seller_is_configured(state):
             return True
