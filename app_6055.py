@@ -2445,19 +2445,37 @@ def word_replace_contract_tokens(doc, values: Mapping[str, object], log_fn=None)
 def word_replace_seller_tokens(doc, values: Mapping[str, object], log_fn=None) -> int:
     """Replace {{SELLER_*}} placeholders in the FORMTEXT Word template.
 
-    The shipped DOGOVIR_6055_template.doc pads tokens with spaces inside the
-    braces (e.g. "{{SELLER_FULL                  }}") so layout stays stable.
+    Uses the exact space-padded tokens from DOGOVIR_6055_template.doc first,
+    then falls back to a Word wildcard match.
     """
+    # Exact strings as they appear in the shipped .doc (keep lengths stable).
+    exact_tokens = {
+        "SELLER_FULL": "{{SELLER_FULL                  }}",
+        "CODE": "{{CODE}}",
+        "SELLER_ADDR": "{{SELLER_ADDR                    }}",
+        "DIRECTOR_GEN": "{{DIRECTOR_GEN            }}",
+        "DIRECTOR_UPPER": "{{DIRECTOR_UPPER       }}",
+        "SELLER_ABBR": "{{SELLER_ABBR}}",
+    }
     replaced = 0
     for key in CONTRACT_SELLER_TOKENS:
         value = str(values.get(key, "") or "")
         if not value:
             continue
         patterns = [
+            (exact_tokens.get(key, f"{{{{{key}}}}}"), False),
             (f"{{{{{key}}}}}", False),
             ("\\{\\{{" + key + "[ ]@\\}\\}", True),
         ]
+        # dedupe while preserving order
+        seen = set()
+        uniq = []
         for text, wildcards in patterns:
+            if text in seen:
+                continue
+            seen.add(text)
+            uniq.append((text, wildcards))
+        for text, wildcards in uniq:
             try:
                 find = doc.Content.Find
                 find.ClearFormatting()
@@ -2471,6 +2489,7 @@ def word_replace_seller_tokens(doc, values: Mapping[str, object], log_fn=None) -
                 )
                 if ok:
                     replaced += 1
+                    break
             except Exception as exc:
                 if log_fn:
                     try:
@@ -2483,6 +2502,8 @@ def word_replace_seller_tokens(doc, values: Mapping[str, object], log_fn=None) -
         except Exception:
             pass
     return replaced
+
+
 
 
 
@@ -2501,8 +2522,10 @@ def generate_contract_doc_windows_from_state(
                 pass
 
     def _clear_com_range_shading(rng) -> None:
-        # Word COM constants by numeric value to avoid win32 constants dependency.
-        # wdNoHighlight = 0, wdTextureNone = 0, wdColorWhite = 16777215
+        # Remove shading/highlight entirely (do NOT paint solid white/black on the
+        # whole story — that produced a black page background in the client's Word).
+        # wdColorAutomatic = -16777216, wdNoHighlight = 0, wdTextureNone = 0
+        _AUTO = -16777216
         try:
             rng.HighlightColorIndex = 0
         except Exception:
@@ -2512,11 +2535,11 @@ def generate_contract_doc_windows_from_state(
         except Exception:
             pass
         try:
-            rng.Shading.BackgroundPatternColor = 16777215
+            rng.Shading.BackgroundPatternColor = _AUTO
         except Exception:
             pass
         try:
-            rng.Shading.ForegroundPatternColor = 0
+            rng.Shading.ForegroundPatternColor = _AUTO
         except Exception:
             pass
 
@@ -2596,15 +2619,20 @@ def generate_contract_doc_windows_from_state(
         except Exception as _e:
             _log(f"FormFields: {_e}")
 
+        # Bookmarks only when FormFields were not used — writing Bookmark.Range.Text
+        # deletes the FORMTEXT control and can leave a solid black/gray fill behind.
         bm_filled = 0
-        try:
-            for key in field_keys:
-                if doc.Bookmarks.Exists(key):
-                    doc.Bookmarks(key).Range.Text = _field_value(key)
-                    bm_filled += 1
-            _log(f"Закладки: знайдено {doc.Bookmarks.Count}, заповнено {bm_filled}")
-        except Exception as _e:
-            _log(f"Закладки: {_e}")
+        if ff_filled == 0:
+            try:
+                for key in field_keys:
+                    if doc.Bookmarks.Exists(key):
+                        doc.Bookmarks(key).Range.Text = _field_value(key)
+                        bm_filled += 1
+                _log(f"Закладки: знайдено {doc.Bookmarks.Count}, заповнено {bm_filled}")
+            except Exception as _e:
+                _log(f"Закладки: {_e}")
+        else:
+            _log(f"Закладки пропущено (FormFields вже заповнено: {ff_filled}) — щоб не зламати поля і підкладку")
 
         # Seller block tokens {{SELLER_FULL   }}, {{CODE}}, ...
         seller_filled = word_replace_seller_tokens(doc, payload, log_fn=_log)
@@ -2612,16 +2640,48 @@ def generate_contract_doc_windows_from_state(
         # Optional: underscore tokens from older experimental template (no-op if absent)
         tok_filled = word_replace_contract_tokens(doc, payload, log_fn=_log)
 
+        # Force a normal page: no field gray boxes, no document/page black fill.
+        try:
+            word.Options.FieldShading = 0  # wdFieldShadingNever
+        except Exception:
+            pass
+        try:
+            doc.Background.Visible = False
+        except Exception:
+            pass
+        try:
+            doc.Background.Fill.Visible = 0  # msoFalse
+        except Exception:
+            pass
+        # Clear paragraph shading on the body (without touching font colors — keeps red transit).
+        try:
+            _AUTO = -16777216
+            for i in range(1, doc.Paragraphs.Count + 1):
+                try:
+                    sh = doc.Paragraphs(i).Range.Shading
+                    sh.Texture = 0
+                    sh.BackgroundPatternColor = _AUTO
+                    sh.ForegroundPatternColor = _AUTO
+                except Exception:
+                    pass
+        except Exception as _e:
+            _log(f"Очищення заливки абзаців: {_e}")
         if remove_shading:
+            # Clear shading ONLY on form fields / content controls — never on doc.Content
+            # (Content-wide Shading.BackgroundPatternColor=white painted a black page).
             try:
-                word.Options.FieldShading = 0
+                for i in range(1, doc.FormFields.Count + 1):
+                    _clear_com_range_shading(doc.FormFields(i).Range)
+            except Exception as _e:
+                _log(f"Очищення затінення FormFields: {_e}")
+            try:
+                for i in range(1, doc.ContentControls.Count + 1):
+                    _clear_com_range_shading(doc.ContentControls(i).Range)
             except Exception:
                 pass
-            try:
-                _clear_com_range_shading(doc.Content)
-            except Exception:
-                pass
-            _log("Застосовано режим: без затінення полів")
+            _log("Застосовано режим: без затінення полів (без заливки сторінки)")
+        else:
+            _log("Затінення полів залишено за шаблоном")
 
         _log(f"Всього: FormFields={ff_filled}, закладки={bm_filled}, продавець={seller_filled}, токени={tok_filled}")
         # wdFormatDocument = 0 → keep classic .doc (no reflow to docx)

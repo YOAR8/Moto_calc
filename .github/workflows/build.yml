@@ -50,6 +50,7 @@ jobs:
             '--add-data', 'icon/iconwn 48.ico;icon',
             '--add-data', 'icon/iconwn 64.ico;icon',
             '--add-data', 'ІНСТРУКЦІЯ.md;.',
+            '--add-data', 'ІНСТРУКЦІЯ.txt;.',
             'app_6055.py'
           )
           if (Test-Path 'icon/iconwn.ico') {
@@ -62,6 +63,7 @@ jobs:
         run: |
           if (Test-Path "dist/JapanMoto") {
             if (Test-Path "ІНСТРУКЦІЯ.md") { Copy-Item -Force "ІНСТРУКЦІЯ.md" "dist/JapanMoto/" }
+            if (Test-Path "ІНСТРУКЦІЯ.txt") { Copy-Item -Force "ІНСТРУКЦІЯ.txt" "dist/JapanMoto/" }
             if (Test-Path "Ярлик на робочий стіл.bat") { Copy-Item -Force "Ярлик на робочий стіл.bat" "dist/JapanMoto/" }
           }
 

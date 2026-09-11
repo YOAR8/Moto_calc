@@ -33,13 +33,15 @@ pyinstaller ^
   --add-data "icon\iconwn.ico;icon" ^
   --add-data "icon\iconwn 48.ico;icon" ^
   --add-data "icon\iconwn 64.ico;icon" ^
-  --add-data "\320\206\320\235\320\241\320\242\320\240\320\243\320\232\320\246\320\206\320\257.md;." ^
+--add-data "ІНСТРУКЦІЯ.md;." ^
+  --add-data "ІНСТРУКЦІЯ.txt;." ^
   %ICON_ARG% ^
   app_6055.py
 
 :: Copy shortcut helper and readme to dist folder
 if exist "dist\JapanMoto\" (
-  copy /Y "\320\206\320\235\320\241\320\242\320\240\320\243\320\232\320\246\320\206\320\257.md" "dist\JapanMoto\" >nul 2>&1
+  copy /Y "ІНСТРУКЦІЯ.md" "dist\JapanMoto\" >nul 2>&1
+  copy /Y "ІНСТРУКЦІЯ.txt" "dist\JapanMoto\" >nul 2>&1
   copy /Y "\320\257\321\200\320\273\320\270\320\272 \320\275\320\260 \321\200\320\276\320\261\320\276\321\207\320\270\320\271 \321\201\321\202\321\226\320\273.bat" "dist\JapanMoto\" >nul 2>&1
 )
 
