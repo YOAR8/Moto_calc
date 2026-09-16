@@ -1465,6 +1465,50 @@ SELLER_DEFAULTS: Dict[str, str] = {key: default for key, _, default in SELLER_FI
 # state keys under which seller values travel together with the form state
 SELLER_STATE_PREFIX = "SELLER::"
 
+# Two firms the client switches between when batching contracts.
+# Values taken from working examples: договір/акт/видаткова 1181 (КАРОЛІННІ)
+# and Договір/Акт/vidatkova 571 (ВКФ МОСТ). Settings can still override.
+COMPANY_PROFILES: Dict[str, Dict[str, object]] = {
+    "karolinni": {
+        "label": "КАРОЛІННІ",
+        "seller": {
+            "seller_name": 'ПП "КАРОЛІННІ"',
+            "seller_name_full": "Приватне Підприємство «КАРОЛІННІ»",
+            "seller_code": "36685357",
+            "seller_address": "м. Вінниця, вул. Івана Богуна, 1/13",
+            "seller_postal_address": "м. Вінниця, вул. Івана Богуна, 1, кв. 13",
+            "seller_bank": 'Р/р UA763006140000026009500684602 м. ВІННИЦЯ, АТ  "КРЕДІ АГРІКОЛЬ БАНК" МФО 300614',
+            "seller_ipn": "201122202289",
+            "seller_certificate": "100249059",
+            "seller_reg_number": "6450",
+            "seller_reg_date": "12.11.2013",
+            "director_short": "І.М. КОЛІЙЧУК",
+            "director_upper": "КОЛІЙЧУК ІГОР МИКОЛАЙОВИЧ",
+            "director_gen": "Колійчука Ігоря Миколайовича",
+        },
+    },
+    "most": {
+        "label": "ВКФ МОСТ",
+        "seller": {
+            "seller_name": 'ПП "ВКФ "МОСТ"',
+            "seller_name_full": "Приватне Підприємство «ВКФ «МОСТ»",
+            "seller_code": "20112221",
+            "seller_address": "м. Вінниця, вул. Івана Богуна, 1/13",
+            "seller_postal_address": "м. Вінниця, вул. Івана Богуна, 1, кв. 13",
+            "seller_bank": 'Р/р UA313052990000026001046107301 м. ВІННИЦЯ, АТ КБ "ПРИВАТБАНК"',
+            "seller_ipn": "201122202289",
+            "seller_certificate": "100249059",
+            "seller_reg_number": "8424",
+            "seller_reg_date": "12.09.2022",
+            "director_short": "І.М. КОЛІЙЧУК",
+            "director_upper": "КОЛІЙЧУК ІГОР МИКОЛАЙОВИЧ",
+            "director_gen": "Колійчука Ігора Миколайовича",
+        },
+    },
+}
+DEFAULT_COMPANY_ID = "karolinni"
+
+
 
 def seller_from_config(cfg: Mapping[str, object]) -> Dict[str, str]:
     raw = cfg.get("seller") if isinstance(cfg, Mapping) else None
@@ -3400,6 +3444,9 @@ class App:
         self.use_excel_com_var = tk.BooleanVar(value=True)
         # Seller/company details (persisted in jm_config.json, never in the repo templates)
         self.seller_vars: Dict[str, Any] = {key: tk.StringVar(value=SELLER_DEFAULTS[key]) for key in SELLER_KEYS}
+        self.company_id_var = tk.StringVar(value=DEFAULT_COMPANY_ID)
+        self.always_on_top_var = tk.BooleanVar(value=True)
+        self.company_label_var = tk.StringVar(value=str(COMPANY_PROFILES[DEFAULT_COMPANY_ID]["label"]))
 
         self.state_vars: Dict[str, Any] = {}
         self.widgets: Dict[str, Any] = {}
@@ -3468,6 +3515,26 @@ class App:
             cur = self.seller_vars[key].get().strip()
             if not cur or _migrate_example:
                 self.seller_vars[key].set(SELLER_DEFAULTS[key])
+        self.always_on_top_var.set(bool(_cfg.get("always_on_top", True)))
+        _seller_cfg = _cfg.get("seller")
+        _seller_empty = (not isinstance(_seller_cfg, dict)) or (
+            not any(str(v or "").strip() for v in _seller_cfg.values())
+        )
+        _cid = str(_cfg.get("active_company", "") or "")
+        if _cid not in COMPANY_PROFILES:
+            # Infer firm from ЄДРПОУ if seller already filled
+            _code = self.seller_vars["seller_code"].get().strip()
+            if _code == "20112221":
+                _cid = "most"
+            elif _code == "36685357":
+                _cid = "karolinni"
+            else:
+                _cid = DEFAULT_COMPANY_ID
+        self.company_id_var.set(_cid)
+        if _migrate_example or _seller_empty:
+            self.apply_company_profile(_cid, persist=False)
+        else:
+            self.company_label_var.set(str(COMPANY_PROFILES[_cid]["label"]))
 
         try:
             self.app_log_path = configure_app_logging(self.app_dir / "logs")
@@ -3521,14 +3588,19 @@ class App:
         toolbar = tk.Frame(header, bg=self.theme["header_bg"])
         toolbar.grid(row=0, column=1, sticky="e")
 
-        self._make_toolbar_button(toolbar, "Акт", lambda: self.open_draft("act"), 0)
-        self._make_toolbar_button(toolbar, "Договір", lambda: self.open_draft("contract"), 1)
-        self._make_toolbar_button(toolbar, "Видаткова", lambda: self.open_draft("vidatkova"), 2)
-        self._make_toolbar_button(toolbar, "Акт МОТО", lambda: self.open_draft("moto_act"), 3)
-        self._make_toolbar_button(toolbar, "↺ Відновити з файлу", self.reload_source, 4)
-        self._make_toolbar_button(toolbar, "✖ Очистити", self.clear_form, 5)
-        self._make_toolbar_button(toolbar, "⟲ Генерувати", self.generate_all, 6)
-        self._make_toolbar_button(toolbar, "↓ Вставити", self.paste_from_clipboard, 7)
+        tk.Label(toolbar, textvariable=self.company_label_var, fg="#fde68a", bg=self.theme["header_bg"],
+                 font=("Segoe UI", _fs(10), "bold")).grid(row=0, column=0, padx=(0, 8), sticky="e")
+        self._make_toolbar_button(toolbar, "📌", lambda: self.toggle_always_on_top(self.root), 1)
+        self._make_toolbar_button(toolbar, "КАРОЛІННІ", lambda: self.apply_company_profile("karolinni"), 2)
+        self._make_toolbar_button(toolbar, "МОСТ", lambda: self.apply_company_profile("most"), 3)
+        self._make_toolbar_button(toolbar, "Акт", lambda: self.open_draft("act"), 4)
+        self._make_toolbar_button(toolbar, "Договір", lambda: self.open_draft("contract"), 5)
+        self._make_toolbar_button(toolbar, "Видаткова", lambda: self.open_draft("vidatkova"), 6)
+        self._make_toolbar_button(toolbar, "Акт МОТО", lambda: self.open_draft("moto_act"), 7)
+        self._make_toolbar_button(toolbar, "↺ Відновити з файлу", self.reload_source, 8)
+        self._make_toolbar_button(toolbar, "✖ Очистити", self.clear_form, 9)
+        self._make_toolbar_button(toolbar, "⟲ Генерувати", self.generate_all, 10)
+        self._make_toolbar_button(toolbar, "↓ Вставити", self.paste_from_clipboard, 11)
 
         gear_btn = tk.Button(
             header, text="⚙", command=self.open_settings_dialog,
@@ -3556,6 +3628,12 @@ class App:
 
         self.write_log(f"Platform: {platform.system()}")
         self.write_log(f"Output folder: {self.out_dir}")
+        self.write_log(f"Фірма: {self.company_label_var.get()}")
+        try:
+            self.root.bind_all("<Control-Shift-P>", lambda _e: self.toggle_always_on_top(self.root))
+        except Exception:
+            pass
+        self.apply_always_on_top(self.root)
         office_cli = _resolve_office_cli()
         if office_cli:
             self.write_log(f"LibreOffice CLI: {office_cli}")
@@ -3810,6 +3888,58 @@ class App:
             value = filedialog.askopenfilename(initialdir=initial) if filedialog else ""
         if value:
             var.set(value)
+
+
+    def apply_company_profile(self, company_id: str, persist: bool = True) -> None:
+        """Switch active firm requisites (КАРОЛІННІ / ВКФ МОСТ)."""
+        cid = company_id if company_id in COMPANY_PROFILES else DEFAULT_COMPANY_ID
+        profile = COMPANY_PROFILES[cid]
+        seller = profile.get("seller") if isinstance(profile.get("seller"), dict) else {}
+        self.company_id_var.set(cid)
+        self.company_label_var.set(str(profile.get("label", cid)))
+        for key in SELLER_KEYS:
+            val = str(seller.get(key, "") or "").strip()
+            if val:
+                self.seller_vars[key].set(val)
+        self.write_log(f"Фірма: {self.company_label_var.get()} (ЄДРПОУ {self.seller_vars['seller_code'].get()})")
+        self.status_var.set(f"Фірма: {self.company_label_var.get()}")
+        if persist:
+            try:
+                self._save_settings()
+            except Exception:
+                pass
+
+    def toggle_always_on_top(self, window: Any = None) -> None:
+        """Pin/unpin the given window (or root) above other apps. Hotkey: Ctrl+Shift+P."""
+        new_val = not bool(self.always_on_top_var.get())
+        self.always_on_top_var.set(new_val)
+        targets = []
+        if window is not None:
+            targets.append(window)
+        try:
+            targets.append(self.root)
+        except Exception:
+            pass
+        for w in targets:
+            try:
+                w.attributes("-topmost", new_val)
+                if new_val:
+                    w.lift()
+            except Exception:
+                pass
+        self.status_var.set("Поверх усіх: УВІМК" if new_val else "Поверх усіх: ВИМК")
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+
+    def apply_always_on_top(self, window: Any) -> None:
+        try:
+            window.attributes("-topmost", bool(self.always_on_top_var.get()))
+            if self.always_on_top_var.get():
+                window.lift()
+        except Exception:
+            pass
 
     def open_settings_dialog(self) -> None:
         dialog = tk.Toplevel(self.root)
@@ -4466,6 +4596,8 @@ class App:
             "use_moto_macro_com": self.use_moto_macro_com_var.get(),
             "use_excel_com": self.use_excel_com_var.get(),
             "seller": {key: var.get().strip() for key, var in self.seller_vars.items()},
+            "active_company": self.company_id_var.get(),
+            "always_on_top": bool(self.always_on_top_var.get()),
         })
 
     def paste_from_clipboard(self) -> None:
@@ -5200,6 +5332,7 @@ if tk is not None:
             self.title("Japan moto")
             self.resizable(True, True)
             self.protocol("WM_DELETE_WINDOW", self._on_close)
+            self._company_btns: Dict[str, Any] = {}
             # Inherit root icon explicitly (required on some Windows builds)
             if IS_WINDOWS:
                 try:
@@ -5208,12 +5341,16 @@ if tk is not None:
                     pass
             self._show_step1()
             self.update_idletasks()
-            self.after(200, self._browse)
-            w, h = int(620 * _FONT_SCALE), int(290 * _FONT_SCALE)
+            w, h = int(640 * _FONT_SCALE), int(360 * _FONT_SCALE)
             sx = self.winfo_screenwidth()
             sy = self.winfo_screenheight()
             self.geometry(f"{w}x{h}+{(sx - w) // 2}+{(sy - h) // 2}")
-            self.minsize(int(520 * _FONT_SCALE), int(220 * _FONT_SCALE))
+            self.minsize(int(540 * _FONT_SCALE), int(280 * _FONT_SCALE))
+            self.app.apply_always_on_top(self)
+            try:
+                self.bind("<Control-Shift-P>", lambda _e: self.app.toggle_always_on_top(self))
+            except Exception:
+                pass
             self.lift()
             self.focus_force()
 
@@ -5228,12 +5365,20 @@ if tk is not None:
             self._clear()
             t = self.app.theme
             self.configure(bg=t["root_bg"])
+            self._company_btns = {}
 
             hdr = tk.Frame(self, bg=t["header_bg"], padx=14, pady=12)
             hdr.pack(fill="x")
-            tk.Label(hdr, text="Japan moto", fg=t["header_fg"], bg=t["header_bg"],
-                     font=("Segoe UI", _fs(21), "bold")).pack(anchor="w")
-            tk.Label(hdr, text="Крок 1 з 2 — оберіть завантажений акт МВС",
+            top = tk.Frame(hdr, bg=t["header_bg"])
+            top.pack(fill="x")
+            tk.Label(top, text="Japan moto", fg=t["header_fg"], bg=t["header_bg"],
+                     font=("Segoe UI", _fs(21), "bold")).pack(side="left")
+            tk.Button(top, text="📌 Поверх усіх",
+                      command=lambda: self.app.toggle_always_on_top(self),
+                      bg=t["header_bg"], fg="#fde68a", bd=0, relief="flat",
+                      activebackground=t["header_active_bg"], cursor="hand2",
+                      font=("Segoe UI", _fs(10))).pack(side="right")
+            tk.Label(hdr, text="Крок 1 з 2 — фірма → акт МВС  (Ctrl+Shift+P = булавка)",
                      fg=t["header_sub_fg"], bg=t["header_bg"],
                      font=("Segoe UI", _fs(10))).pack(anchor="w")
 
@@ -5241,12 +5386,37 @@ if tk is not None:
             body.pack(fill="both", expand=True, padx=12, pady=12)
             body.columnconfigure(0, weight=1)
 
-            tk.Label(body, text="Файл акта (XLS):", bg=t["card_bg"],
-                     fg=t["label_fg"], font=("Segoe UI", _fs(10))).grid(
+            tk.Label(body, text="Фірма (реквізити в доки):", bg=t["card_bg"],
+                     fg=t["label_fg"], font=("Segoe UI", _fs(10), "bold")).grid(
                 row=0, column=0, sticky="w", pady=(0, 6))
+            firms = tk.Frame(body, bg=t["card_bg"])
+            firms.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+            for i, (cid, prof) in enumerate(COMPANY_PROFILES.items()):
+                btn = tk.Button(
+                    firms, text=str(prof["label"]),
+                    command=lambda c=cid: self._select_company(c),
+                    bg="#0f766e" if cid == self.app.company_id_var.get() else t["btn_bg"],
+                    fg="white" if cid == self.app.company_id_var.get() else t["btn_fg"],
+                    activebackground="#0d9488", activeforeground="white",
+                    relief="flat", padx=18, pady=10, cursor="hand2",
+                    font=("Segoe UI", _fs(11), "bold"),
+                )
+                btn.pack(side="left", padx=(0, 10))
+                self._company_btns[cid] = btn
+
+            tk.Button(body, text="📄 Новий документ — обрати акт МВС",
+                      command=self._new_document,
+                      bg="#0f766e", fg="white", activebackground="#0d6960",
+                      activeforeground="white", relief="flat",
+                      font=("Segoe UI", _fs(11), "bold"), padx=16, pady=10,
+                      cursor="hand2").grid(row=2, column=0, sticky="ew", pady=(0, 14))
+
+            tk.Label(body, text="Або файл акта (XLS):", bg=t["card_bg"],
+                     fg=t["label_fg"], font=("Segoe UI", _fs(10))).grid(
+                row=3, column=0, sticky="w", pady=(0, 6))
 
             fr = tk.Frame(body, bg=t["card_bg"])
-            fr.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+            fr.grid(row=4, column=0, sticky="ew", pady=(0, 12))
             fr.columnconfigure(0, weight=1)
 
             self._file_var = tk.StringVar(value=self.app.source_path.get())
@@ -5265,7 +5435,31 @@ if tk is not None:
                       bg="#0f766e", fg="white", activebackground="#0d6960",
                       activeforeground="white", relief="flat",
                       font=("Segoe UI", _fs(10), "bold"), padx=20, pady=6,
-                      cursor="hand2").grid(row=2, column=0, sticky="e")
+                      cursor="hand2").grid(row=5, column=0, sticky="e")
+
+        def _select_company(self, company_id: str) -> None:
+            self.app.apply_company_profile(company_id, persist=True)
+            t = self.app.theme
+            for cid, btn in self._company_btns.items():
+                active = cid == company_id
+                try:
+                    btn.configure(
+                        bg="#0f766e" if active else t["btn_bg"],
+                        fg="white" if active else t["btn_fg"],
+                    )
+                except Exception:
+                    pass
+
+        def _new_document(self) -> None:
+            """Quick batch flow: firm already chosen → Windows file picker → step 2."""
+            from tkinter import messagebox
+            if self.app.company_id_var.get() not in COMPANY_PROFILES:
+                messagebox.showinfo("Фірма", "Спочатку оберіть фірму (КАРОЛІННІ або МОСТ).", parent=self)
+                return
+            self._browse()
+            path_str = self._file_var.get().strip()
+            if path_str and Path(path_str).exists():
+                self._on_next()
 
         def _browse(self) -> None:
             from tkinter import filedialog
@@ -5528,6 +5722,20 @@ if tk is not None:
                     pass
                 messagebox.showinfo("Готово ✓", f"Документи збережено:\n{src_dir}",
                                     parent=self)
+                again = messagebox.askyesno(
+                    "Ще один?",
+                    "Зробити ще один документ?\n\n"
+                    f"Поточна фірма: {self.app.company_label_var.get()}\n"
+                    "(можна змінити на кроці 1)",
+                    default=messagebox.YES,
+                    parent=self,
+                )
+                if again:
+                    self._file_var = tk.StringVar(value="")
+                    self.app.source_path.set("")
+                    self._show_step1()
+                    self.app.apply_always_on_top(self)
+                    return
             except Exception as exc:
                 messagebox.showerror("Помилка генерації", str(exc), parent=self)
                 return
