@@ -57,7 +57,18 @@ def _global_excepthook(exc_type, exc_value, exc_tb) -> None:
 
 
 # ─── UI font scale (set in main() from config before UI is created) ──────────
-_FONT_SCALE: float = 1.0
+_FONT_SCALE: float = 1.1
+UI_SCALE_STEPS: tuple[str, ...] = ("0.85", "1.0", "1.1", "1.15", "1.3", "1.4", "1.5")
+UI_SCALE_LABELS: dict[str, str] = {
+    "0.85": "85%",
+    "1.0": "100%",
+    "1.1": "110%",
+    "1.15": "115%",
+    "1.3": "130%",
+    "1.4": "140%",
+    "1.5": "150%",
+}
+
 
 def _fs(n: int) -> int:
     """Return font size n scaled by _FONT_SCALE (min 8)."""
@@ -3433,7 +3444,7 @@ class App:
         self.contract_out_format = tk.StringVar(value="doc")
         self.act_out_format = tk.StringVar(value="xls")
         self.vidatkova_out_format = tk.StringVar(value="xls")
-        self.ui_scale_var = tk.StringVar(value="1.0")
+        self.ui_scale_var = tk.StringVar(value="1.1")
         self.start_folder_var = tk.StringVar(value="")
         self.generate_new_act_var = tk.BooleanVar(value=False)
         self.use_case_subfolder_var = tk.BooleanVar(value=False)
@@ -3492,8 +3503,8 @@ class App:
             self.act_out_format.set(str(_cfg["act_out_format"]))
         if _cfg.get("vidatkova_out_format") in ("xls", "xlsx"):
             self.vidatkova_out_format.set(str(_cfg["vidatkova_out_format"]))
-        _ui_scale_cfg = str(_cfg.get("ui_scale", "1.0"))
-        if _ui_scale_cfg in ("0.85", "1.0", "1.15", "1.3", "1.4", "1.5"):
+        _ui_scale_cfg = str(_cfg.get("ui_scale", "1.1"))
+        if _ui_scale_cfg in UI_SCALE_STEPS:
             self.ui_scale_var.set(_ui_scale_cfg)
         if _cfg.get("start_folder"):
             self.start_folder_var.set(str(_cfg["start_folder"]))
@@ -3590,7 +3601,7 @@ class App:
 
         tk.Label(toolbar, textvariable=self.company_label_var, fg="#fde68a", bg=self.theme["header_bg"],
                  font=("Segoe UI", _fs(10), "bold")).grid(row=0, column=0, padx=(0, 8), sticky="e")
-        self._make_toolbar_button(toolbar, "📌", lambda: self.toggle_always_on_top(self.root), 1)
+        self._make_toolbar_button(toolbar, "📌 Закріпити", lambda: self.toggle_always_on_top(self.root), 1)
         self._make_toolbar_button(toolbar, "КАРОЛІННІ", lambda: self.apply_company_profile("karolinni"), 2)
         self._make_toolbar_button(toolbar, "МОСТ", lambda: self.apply_company_profile("most"), 3)
         self._make_toolbar_button(toolbar, "Акт", lambda: self.open_draft("act"), 4)
@@ -3629,8 +3640,9 @@ class App:
         self.write_log(f"Platform: {platform.system()}")
         self.write_log(f"Output folder: {self.out_dir}")
         self.write_log(f"Фірма: {self.company_label_var.get()}")
+        self._wizard_window = None
         try:
-            self.root.bind_all("<Control-Shift-P>", lambda _e: self.toggle_always_on_top(self.root))
+            self.root.bind_all("<Control-Shift-P>", self._on_pin_hotkey)
         except Exception:
             pass
         self.apply_always_on_top(self.root)
@@ -3909,37 +3921,110 @@ class App:
             except Exception:
                 pass
 
-    def toggle_always_on_top(self, window: Any = None) -> None:
-        """Pin/unpin the given window (or root) above other apps. Hotkey: Ctrl+Shift+P."""
-        new_val = not bool(self.always_on_top_var.get())
-        self.always_on_top_var.set(new_val)
-        targets = []
-        if window is not None:
-            targets.append(window)
+    def _on_pin_hotkey(self, _event: Any = None) -> str:
+        self.toggle_always_on_top()
+        return "break"
+
+    def _topmost_targets(self, window: Any = None) -> list:
+        targets: list = []
+        seen: set[int] = set()
+
+        def _add(w: Any) -> None:
+            if w is None:
+                return
+            try:
+                if not w.winfo_exists():
+                    return
+            except Exception:
+                return
+            wid = id(w)
+            if wid in seen:
+                return
+            seen.add(wid)
+            targets.append(w)
+
+        _add(window)
         try:
-            targets.append(self.root)
+            _add(self.root)
         except Exception:
             pass
-        for w in targets:
-            try:
-                w.attributes("-topmost", new_val)
-                if new_val:
-                    w.lift()
-            except Exception:
-                pass
-        self.status_var.set("Поверх усіх: УВІМК" if new_val else "Поверх усіх: ВИМК")
+        try:
+            _add(getattr(self, "_wizard_window", None))
+        except Exception:
+            pass
+        return targets
+
+    def _set_window_topmost(self, window: Any, enabled: bool) -> None:
+        """Reliably set/clear -topmost (Windows often ignores a bare False)."""
+        try:
+            if enabled:
+                window.attributes("-topmost", True)
+                window.lift()
+            else:
+                # Force clear: True then False is more reliable on Win32/Tk.
+                window.attributes("-topmost", True)
+                window.update_idletasks()
+                window.attributes("-topmost", False)
+        except Exception:
+            pass
+
+    def toggle_always_on_top(self, window: Any = None) -> None:
+        """Pin/unpin app windows above other apps. Hotkey: Ctrl+Shift+P."""
+        new_val = not bool(self.always_on_top_var.get())
+        self.always_on_top_var.set(new_val)
+        for w in self._topmost_targets(window):
+            self._set_window_topmost(w, new_val)
+        self.status_var.set("Закріплено поверх інших" if new_val else "Вікно звичайне")
+        try:
+            wiz = getattr(self, "_wizard_window", None)
+            if wiz is not None and wiz.winfo_exists():
+                wiz._refresh_pin_button()
+        except Exception:
+            pass
         try:
             self._save_settings()
         except Exception:
             pass
 
     def apply_always_on_top(self, window: Any) -> None:
+        enabled = bool(self.always_on_top_var.get())
+        for w in self._topmost_targets(window):
+            self._set_window_topmost(w, enabled)
+
+    def set_ui_scale(self, scale: str, rebuild: bool = True) -> None:
+        """Apply UI scale immediately (fonts + window size) and persist."""
+        global _FONT_SCALE
+        scale = str(scale)
+        if scale not in UI_SCALE_STEPS:
+            return
+        self.ui_scale_var.set(scale)
+        _FONT_SCALE = float(scale)
         try:
-            window.attributes("-topmost", bool(self.always_on_top_var.get()))
-            if self.always_on_top_var.get():
-                window.lift()
+            self.root.geometry(f"{int(1320 * _FONT_SCALE)}x{int(920 * _FONT_SCALE)}")
+            self.root.minsize(int(1160 * _FONT_SCALE), int(780 * _FONT_SCALE))
         except Exception:
             pass
+        try:
+            self._save_settings()
+        except Exception:
+            pass
+        if rebuild:
+            try:
+                wiz = getattr(self, "_wizard_window", None)
+                if wiz is not None and wiz.winfo_exists():
+                    wiz._apply_scale_rebuild()
+            except Exception:
+                pass
+        self.status_var.set(f"Масштаб: {UI_SCALE_LABELS.get(scale, scale)}")
+
+    def nudge_ui_scale(self, delta: int) -> None:
+        cur = str(self.ui_scale_var.get())
+        try:
+            idx = UI_SCALE_STEPS.index(cur)
+        except ValueError:
+            idx = UI_SCALE_STEPS.index("1.1") if "1.1" in UI_SCALE_STEPS else 1
+        idx = max(0, min(len(UI_SCALE_STEPS) - 1, idx + int(delta)))
+        self.set_ui_scale(UI_SCALE_STEPS[idx], rebuild=True)
 
     def open_settings_dialog(self) -> None:
         dialog = tk.Toplevel(self.root)
@@ -4102,12 +4187,11 @@ class App:
             bg=self.theme["card_bg"],
             fg=self.theme["label_fg"],
         ).grid(row=theme_row + 7, column=0, sticky="w", padx=16, pady=(0, 6))
-        _scale_labels = {"0.85": "85%", "1.0": "100%", "1.15": "115%", "1.3": "130%", "1.4": "140%", "1.5": "150%"}
         scale_frame = tk.Frame(content, bg=self.theme["card_bg"])
         scale_frame.grid(row=theme_row + 7, column=1, columnspan=2, sticky="w", pady=(0, 6))
         scale_menu = tk.OptionMenu(scale_frame, self.ui_scale_var,
-                                   *_scale_labels.keys(),
-                                   command=lambda _: None)
+                                   *UI_SCALE_STEPS,
+                                   command=lambda v: self.set_ui_scale(v, rebuild=True))
         scale_menu.configure(bg=self.theme["btn_bg"], fg=self.theme["btn_fg"],
                              activebackground=self.theme["header_active_bg"],
                              activeforeground=self.theme["header_fg"],
@@ -4115,13 +4199,13 @@ class App:
         scale_menu["menu"].configure(bg=self.theme["entry_bg"], fg=self.theme["entry_fg"])
         # Display readable labels
         scale_menu["menu"].delete(0, "end")
-        for val, lbl in _scale_labels.items():
+        for val, lbl in UI_SCALE_LABELS.items():
             scale_menu["menu"].add_command(
                 label=lbl,
-                command=lambda v=val: self.ui_scale_var.set(v))
+                command=lambda v=val: self.set_ui_scale(v, rebuild=True))
         scale_menu.pack(side="left")
-        tk.Label(scale_frame, text="⚠ Набирає чинності після перезапуску",
-                 bg=self.theme["card_bg"], fg="#f59e0b").pack(side="left", padx=8)
+        tk.Label(scale_frame, text="або − / % / + у шапці вікна",
+                 bg=self.theme["card_bg"], fg=self.theme["label_fg"]).pack(side="left", padx=8)
         # ── New workflow toggles ──────────────────────────────────────────────
         tk.Checkbutton(
             content,
@@ -5329,10 +5413,14 @@ if tk is not None:
         def __init__(self, master: Any, app: "App") -> None:
             super().__init__(master)
             self.app = app
+            self.app._wizard_window = self
             self.title("Japan moto")
             self.resizable(True, True)
             self.protocol("WM_DELETE_WINDOW", self._on_close)
             self._company_btns: Dict[str, Any] = {}
+            self._pin_btn = None
+            self._scale_lbl = None
+            self._wizard_step = 1
             # Inherit root icon explicitly (required on some Windows builds)
             if IS_WINDOWS:
                 try:
@@ -5340,29 +5428,129 @@ if tk is not None:
                 except Exception:
                     pass
             self._show_step1()
-            self.update_idletasks()
-            w, h = int(640 * _FONT_SCALE), int(360 * _FONT_SCALE)
-            sx = self.winfo_screenwidth()
-            sy = self.winfo_screenheight()
-            self.geometry(f"{w}x{h}+{(sx - w) // 2}+{(sy - h) // 2}")
-            self.minsize(int(540 * _FONT_SCALE), int(280 * _FONT_SCALE))
+            self._fit_geometry(step=1)
             self.app.apply_always_on_top(self)
             try:
-                self.bind("<Control-Shift-P>", lambda _e: self.app.toggle_always_on_top(self))
+                self.bind("<Control-Shift-P>", self.app._on_pin_hotkey)
             except Exception:
                 pass
             self.lift()
             self.focus_force()
 
         def _on_close(self) -> None:
+            try:
+                if getattr(self.app, "_wizard_window", None) is self:
+                    self.app._wizard_window = None
+            except Exception:
+                pass
             self.master.quit()
 
         def _clear(self) -> None:
+            self._pin_btn = None
+            self._scale_lbl = None
             for child in self.winfo_children():
                 child.destroy()
 
+        def _fit_geometry(self, step: int = 1) -> None:
+            if step == 2:
+                w, h = int(720 * _FONT_SCALE), int(600 * _FONT_SCALE)
+                mw, mh = int(580 * _FONT_SCALE), int(500 * _FONT_SCALE)
+            else:
+                w, h = int(700 * _FONT_SCALE), int(400 * _FONT_SCALE)
+                mw, mh = int(580 * _FONT_SCALE), int(320 * _FONT_SCALE)
+            self.update_idletasks()
+            sx = self.winfo_screenwidth()
+            sy = self.winfo_screenheight()
+            self.geometry(f"{w}x{h}+{(sx - w) // 2}+{(sy - h) // 2}")
+            self.minsize(mw, mh)
+
+        def _pin_label(self) -> str:
+            if bool(self.app.always_on_top_var.get()):
+                return "📌 Відкріпити"
+            return "📌 Закріпити вікно поверх інших"
+
+        def _refresh_pin_button(self) -> None:
+            btn = getattr(self, "_pin_btn", None)
+            if btn is None:
+                return
+            try:
+                if btn.winfo_exists():
+                    btn.configure(text=self._pin_label())
+            except Exception:
+                pass
+
+        def _refresh_scale_label(self) -> None:
+            lbl = getattr(self, "_scale_lbl", None)
+            if lbl is None:
+                return
+            try:
+                if lbl.winfo_exists():
+                    cur = str(self.app.ui_scale_var.get())
+                    lbl.configure(text=UI_SCALE_LABELS.get(cur, cur))
+            except Exception:
+                pass
+
+        def _pack_header_controls(self, parent: Any, *, include_gear: bool = False) -> None:
+            """Right-side header: scale −/%/+ and pin (optional gear)."""
+            t = self.app.theme
+            box = tk.Frame(parent, bg=t["header_bg"])
+            box.pack(side="right")
+
+            scale = tk.Frame(box, bg=t["header_bg"])
+            scale.pack(side="left", padx=(0, 10))
+            btn_kw = dict(
+                bg=t["header_bg"], fg=t["header_fg"],
+                activebackground=t["header_active_bg"],
+                activeforeground=t["header_fg"],
+                bd=0, relief="flat", cursor="hand2",
+                font=("Segoe UI", _fs(11), "bold"), padx=6, pady=2,
+            )
+            tk.Button(scale, text="−", command=lambda: self.app.nudge_ui_scale(-1), **btn_kw).pack(side="left")
+            self._scale_lbl = tk.Label(
+                scale, text=UI_SCALE_LABELS.get(str(self.app.ui_scale_var.get()), "110%"),
+                bg=t["header_bg"], fg=t["header_fg"],
+                font=("Segoe UI", _fs(10)), padx=4,
+            )
+            self._scale_lbl.pack(side="left")
+            tk.Button(scale, text="+", command=lambda: self.app.nudge_ui_scale(1), **btn_kw).pack(side="left")
+
+            self._pin_btn = tk.Button(
+                box, text=self._pin_label(),
+                command=lambda: self.app.toggle_always_on_top(self),
+                bg=t["header_bg"], fg="#fde68a", bd=0, relief="flat",
+                activebackground=t["header_active_bg"], cursor="hand2",
+                font=("Segoe UI", _fs(10)), padx=8, pady=2,
+            )
+            self._pin_btn.pack(side="left")
+            try:
+                tip = "Ctrl+Shift+P"
+                self._pin_btn.bind("<Enter>", lambda _e: self.app.status_var.set(tip))
+            except Exception:
+                pass
+
+            if include_gear:
+                tk.Button(
+                    box, text="⚙", command=self._open_full_form,
+                    bg=t["header_bg"], fg=t["header_muted_fg"],
+                    activebackground=t["header_active_bg"],
+                    activeforeground=t["header_fg"],
+                    bd=0, relief="flat", font=("Segoe UI", _fs(16)),
+                    padx=8, pady=4, cursor="hand2",
+                ).pack(side="left", padx=(6, 0))
+
+        def _apply_scale_rebuild(self) -> None:
+            step = getattr(self, "_wizard_step", 1)
+            if step == 2:
+                self._show_step2()
+                self._fit_geometry(step=2)
+            else:
+                self._show_step1()
+                self._fit_geometry(step=1)
+            self.app.apply_always_on_top(self)
+
         def _show_step1(self) -> None:
             self._clear()
+            self._wizard_step = 1
             t = self.app.theme
             self.configure(bg=t["root_bg"])
             self._company_btns = {}
@@ -5373,12 +5561,8 @@ if tk is not None:
             top.pack(fill="x")
             tk.Label(top, text="Japan moto", fg=t["header_fg"], bg=t["header_bg"],
                      font=("Segoe UI", _fs(21), "bold")).pack(side="left")
-            tk.Button(top, text="📌 Поверх усіх",
-                      command=lambda: self.app.toggle_always_on_top(self),
-                      bg=t["header_bg"], fg="#fde68a", bd=0, relief="flat",
-                      activebackground=t["header_active_bg"], cursor="hand2",
-                      font=("Segoe UI", _fs(10))).pack(side="right")
-            tk.Label(hdr, text="Крок 1 з 2 — фірма → акт МВС  (Ctrl+Shift+P = булавка)",
+            self._pack_header_controls(top, include_gear=False)
+            tk.Label(hdr, text="Крок 1 з 2 — фірма → акт МВС",
                      fg=t["header_sub_fg"], bg=t["header_bg"],
                      font=("Segoe UI", _fs(10))).pack(anchor="w")
 
@@ -5496,39 +5680,27 @@ if tk is not None:
                 messagebox.showerror("Помилка читання", str(exc), parent=self)
                 return
             self._show_step2()
-            self.update_idletasks()
-            w, h = int(660 * _FONT_SCALE), int(560 * _FONT_SCALE)
-            sx = self.winfo_screenwidth()
-            sy = self.winfo_screenheight()
-            self.geometry(f"{w}x{h}+{(sx - w) // 2}+{(sy - h) // 2}")
-            self.minsize(int(540 * _FONT_SCALE), int(470 * _FONT_SCALE))
+            self._fit_geometry(step=2)
 
         def _show_step2(self) -> None:
             self._clear()
+            self._wizard_step = 2
             t = self.app.theme
             self.configure(bg=t["root_bg"])
 
             hdr = tk.Frame(self, bg=t["header_bg"], padx=14, pady=12)
             hdr.pack(fill="x")
-            hdr.columnconfigure(0, weight=1)
-
-            info = tk.Frame(hdr, bg=t["header_bg"])
-            info.grid(row=0, column=0, sticky="w")
+            top = tk.Frame(hdr, bg=t["header_bg"])
+            top.pack(fill="x")
+            info = tk.Frame(top, bg=t["header_bg"])
+            info.pack(side="left", fill="x", expand=True)
             tk.Label(info, text="Japan moto", fg=t["header_fg"], bg=t["header_bg"],
                      font=("Segoe UI", _fs(21), "bold")).pack(anchor="w")
             src_name = Path(self.app.source_path.get()).name
             tk.Label(info, text=f"Крок 2 з 2 — {src_name}",
                      fg=t["header_sub_fg"], bg=t["header_bg"],
                      font=("Segoe UI", _fs(10))).pack(anchor="w")
-
-            tk.Button(
-                hdr, text="⚙", command=self._open_full_form,
-                bg=t["header_bg"], fg=t["header_muted_fg"],
-                activebackground=t["header_active_bg"],
-                activeforeground=t["header_fg"],
-                bd=0, relief="flat", font=("Segoe UI", _fs(16)),
-                padx=8, pady=4, cursor="hand2",
-            ).grid(row=0, column=1, sticky="ne")
+            self._pack_header_controls(top, include_gear=True)
 
             body = tk.Frame(self, bg=t["card_bg"], padx=20, pady=18)
             body.pack(fill="both", expand=True, padx=12, pady=(12, 6))
@@ -5623,9 +5795,15 @@ if tk is not None:
 
         def _open_full_form(self) -> None:
             """Close wizard and reveal the main App window."""
+            try:
+                if getattr(self.app, "_wizard_window", None) is self:
+                    self.app._wizard_window = None
+            except Exception:
+                pass
             self.destroy()
             self.master.deiconify()
             self.master.lift()
+            self.app.apply_always_on_top(self.master)
 
         def _paste_clipboard(self) -> None:
             try:
@@ -5720,26 +5898,17 @@ if tk is not None:
                         subprocess.Popen(["xdg-open", str(src_dir)])
                 except Exception:
                     pass
-                messagebox.showinfo("Готово ✓", f"Документи збережено:\n{src_dir}",
-                                    parent=self)
-                again = messagebox.askyesno(
-                    "Ще один?",
-                    "Зробити ще один документ?\n\n"
-                    f"Поточна фірма: {self.app.company_label_var.get()}\n"
-                    "(можна змінити на кроці 1)",
-                    default=messagebox.YES,
-                    parent=self,
-                )
-                if again:
-                    self._file_var = tk.StringVar(value="")
-                    self.app.source_path.set("")
-                    self._show_step1()
-                    self.app.apply_always_on_top(self)
-                    return
+                self.app.write_log(f"Готово: документи збережено у {src_dir}")
+                self.app.status_var.set(f"Збережено: {src_dir}")
+                self._file_var = tk.StringVar(value="")
+                self.app.source_path.set("")
+                self._show_step1()
+                self._fit_geometry(step=1)
+                self.app.apply_always_on_top(self)
+                return
             except Exception as exc:
                 messagebox.showerror("Помилка генерації", str(exc), parent=self)
                 return
-            self.master.quit()
 
 else:
     DraftWindow = cast(Any, None)
@@ -5806,9 +5975,11 @@ def main() -> int:
 
     global _FONT_SCALE
     _cfg_early = load_app_config()
-    _scale_str = str(_cfg_early.get("ui_scale", "1.0"))
-    if _scale_str in ("0.85", "1.0", "1.15", "1.3", "1.4", "1.5"):
+    _scale_str = str(_cfg_early.get("ui_scale", "1.1"))
+    if _scale_str in UI_SCALE_STEPS:
         _FONT_SCALE = float(_scale_str)
+    else:
+        _FONT_SCALE = 1.1
 
     root = tk.Tk()
     root.withdraw()  # Hidden until the wizard hands control to the full form.
