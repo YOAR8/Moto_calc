@@ -252,18 +252,29 @@ def contract_sumtext_plain(text: str) -> str:
     return cleaned.strip(" ,.")
 
 
+_OFFICE_CLI_CACHE: str | None = None
+
+
 def _resolve_office_cli() -> str:
+    global _OFFICE_CLI_CACHE
+    if _OFFICE_CLI_CACHE is not None:
+        return _OFFICE_CLI_CACHE
+    found = ""
     for name in ("soffice", "libreoffice", "triooffice", "openoffice"):
-        found = shutil.which(name)
-        if found:
-            return found
-    for p in (
-        r"C:\\Program Files\\LibreOffice\\program\\soffice.exe",
-        r"C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
-    ):
-        if Path(p).exists():
-            return p
-    return ""
+        candidate = shutil.which(name)
+        if candidate:
+            found = candidate
+            break
+    if not found:
+        for p in (
+            r"C:\Program Files\LibreOffice\program\soffice.exe",
+            r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+        ):
+            if Path(p).exists():
+                found = p
+                break
+    _OFFICE_CLI_CACHE = found
+    return found
 
 
 def _office_convert(src_path: Path, out_dir: Path, to_ext: str) -> "Path | None":
@@ -284,26 +295,6 @@ def _office_convert(src_path: Path, out_dir: Path, to_ext: str) -> "Path | None"
     except Exception:
         return None
 
-
-def _fill_docx_runs(para, values: Dict[str, str]) -> None:
-    """Replace placeholders in paragraph runs, preserving run-level formatting."""
-    for key, val in values.items():
-        for ph in (f"{{{{{key}}}}}", f"<<{key}>>", f"[{key}]", f"${{{key}}}"):
-            if ph not in para.text:
-                continue
-            # Strategy 1: single-run hit — preserves each run's own formatting
-            for run in para.runs:
-                if ph in run.text:
-                    run.text = run.text.replace(ph, val)
-            # Strategy 2: cross-run placeholder — merge all into first run (preserves its format)
-            if ph in para.text:
-                full = "".join(r.text for r in para.runs)
-                if ph in full:
-                    new_full = full.replace(ph, val)
-                    if para.runs:
-                        para.runs[0].text = new_full
-                        for r in para.runs[1:]:
-                            r.text = ""
 
 
 def _apply_contract_field_shading(doc, remove_shading: bool = True) -> None:
@@ -719,9 +710,6 @@ def default_output_dir(base_dir: Path) -> Path:
     return base_dir / "out"
 
 
-def safe_contract_output_path(out_path: Path) -> Path:
-    return out_path.with_suffix(".txt")
-
 
 def a1_to_rc(addr: str) -> Tuple[int, int]:
     m = re.fullmatch(r"([A-Z]+)(\d+)", addr.upper())
@@ -733,14 +721,6 @@ def a1_to_rc(addr: str) -> Tuple[int, int]:
         col = col * 26 + (ord(ch) - 64)
     return int(row_s) - 1, col - 1
 
-
-def rc_to_a1(row: int, col: int) -> str:
-    c = col + 1
-    out = ""
-    while c:
-        c, rem = divmod(c - 1, 26)
-        out = chr(65 + rem) + out
-    return f"{out}{row + 1}"
 
 
 class _NullLog:
@@ -1737,92 +1717,8 @@ def valid_date_text(value: str) -> bool:
     return bool(re.search(r"\b\d{1,2}\b.+\b\d{4}\b", value))
 
 
-def preview_blocks_for_act(payload: Dict[str, str]) -> list[tuple[str, list[tuple[str, str]]]]:
-    return [
-        ("Реквізити акта", [("Номер", payload.get("Number", "")), ("Дата", payload.get("Data", ""))]),
-        (
-            "Покупець",
-            [
-                ("ПІБ", payload.get("C15", "")),
-                ("Адреса", payload.get("C16", "")),
-                ("Паспорт", payload.get("C17", "")),
-                ("ІПН", payload.get("C18", "")),
-            ],
-        ),
-        (
-            "Транспортний засіб",
-            [
-                ("Марка / модель", payload.get("C20", "")),
-                ("Тип", payload.get("C21", "")),
-                ("Рік", payload.get("C29", "")),
-                ("Колір", payload.get("C28", "")),
-                ("VIN / рама", payload.get("cuzov", "")),
-                ("Номер двигуна", payload.get("C41", "")),
-            ],
-        ),
-        ("Підписні дані", [("Скорочений ПІБ", payload.get("fio_short", "")), ("Дата набуття права", payload.get("C51", ""))]),
-    ]
 
 
-def preview_blocks_for_contract(payload: Dict[str, str]) -> list[tuple[str, list[tuple[str, str]]]]:
-    return [
-        ("Договір", [("Номер", payload.get("Number", "")), ("Дата", payload.get("Data", "")), ("Ціна", payload.get("price", "")), ("Сума прописом", payload.get("sumtext", ""))]),
-        (
-            "Покупець",
-            [
-                ("ПІБ", payload.get("FIO", "")),
-                ("Дата народження", payload.get("BirthDay", "")),
-                ("Паспорт", payload.get("pasport", "")),
-                ("ІПН", payload.get("TaxNumber", "")),
-                ("Адреса", payload.get("adres", "")),
-            ],
-        ),
-        (
-            "Мотоцикл",
-            [
-                ("Модель", payload.get("model", "")),
-                ("Рік", payload.get("year", "")),
-                ("Колір", payload.get("color", "")),
-                ("Рама / кузов", payload.get("cuzov", "")),
-                ("Двигун", payload.get("numberdv", "")),
-                ("Об'єм", payload.get("cub", "")),
-                ("Номерні знаки", payload.get("znak", "")),
-            ],
-        ),
-        ("Митні дані", [("Декларація", payload.get("decl", ""))]),
-    ]
-
-
-def preview_blocks_for_vidatkova(payload: Dict[str, str]) -> list[tuple[str, list[tuple[str, str]]]]:
-    return [
-        ("Видаткова накладна", [("Дата / номер", payload.get("A3", "")), ("Одержувач", payload.get("C15", "")), ("Платник (телефон)", payload.get("PHONE_FMT", ""))]),
-        (
-            "Позиція",
-            [
-                ("Тип ТЗ", payload.get("C21", "")),
-                ("Марка, модель", payload.get("C20", "")),
-                ("Номер рами", payload.get("cuzov", "")),
-                ("Кількість", "1"),
-            ],
-        ),
-        (
-            "Суми",
-            [
-                ("Ціна без ПДВ", payload.get("C44", "")),
-                ("ПДВ", payload.get("C45", "")),
-                ("Всього", payload.get("C46", "")),
-                ("Сума прописом", payload.get("sumtext", "")),
-            ],
-        ),
-    ]
-
-
-def preview_blocks(kind: str, payload: Dict[str, str]) -> list[tuple[str, list[tuple[str, str]]]]:
-    if kind == "act":
-        return preview_blocks_for_act(payload)
-    if kind == "contract":
-        return preview_blocks_for_contract(payload)
-    return preview_blocks_for_vidatkova(payload)
 
 
 def validate_state(state: Dict[str, str]) -> Tuple[Dict[str, object], list[str], list[str]]:
@@ -1924,23 +1820,6 @@ def validate_state(state: Dict[str, str]) -> Tuple[Dict[str, object], list[str],
     return payload, errors, warnings
 
 
-def preview_text_for_act(payload: Dict[str, str]) -> str:
-    return "\n".join([
-        "ЧОРНОВИК АКТА 6055",
-        "",
-        f"Номер: {payload.get('Number', '')}",
-        f"Дата: {payload.get('Data', '')}",
-        f"Покупець: {payload.get('C15', '')}",
-        f"Адреса: {payload.get('C16', '')}",
-        f"Паспорт: {payload.get('C17', '')}",
-        f"ІПН / код: {payload.get('C18', '')}",
-        f"Модель: {payload.get('C20', '')}",
-        f"Рік: {payload.get('C29', '')}",
-        f"Рама / VIN: {payload.get('cuzov', '')}",
-        f"Колір: {payload.get('C28', '')}",
-        f"Скорочений ПІБ: {payload.get('fio_short', '')}",
-    ])
-
 
 def preview_text_for_contract(payload: Mapping[str, object]) -> str:
     lines = ["ЧОРНОВИК ДОГОВОРУ", ""]
@@ -1967,20 +1846,6 @@ def preview_text_for_contract(payload: Mapping[str, object]) -> str:
         lines.append(f"{key[0]}: {payload.get(key[1], '')}")
     return "\n".join(lines)
 
-
-def preview_text_for_vidatkova(payload: Dict[str, str]) -> str:
-    return "\n".join([
-        "ЧОРНОВИК ВИДАТКОВОЇ",
-        "",
-        f"Одержувач: {payload.get('C15', '')}",
-        f"Дата / номер: {payload.get('A3', '')}",
-        f"Марка, модель: {payload.get('C20', '')}",
-        f"Номер рами: {payload.get('cuzov', '')}",
-        f"Ціна без ПДВ: {payload.get('C44', '')}",
-        f"ПДВ: {payload.get('C45', '')}",
-        f"Всього: {payload.get('C46', '')}",
-        f"Сума прописом: {payload.get('sumtext', '')}",
-    ])
 
 
 def transit_summary_text(payload: Mapping[str, object]) -> str:
@@ -2948,15 +2813,6 @@ def build_case_folder_name(state: Dict[str, str]) -> str:
     return slugify_case_name(short_fio)
 
 
-def ensure_case_dir(base_out_dir: Path, state: Dict[str, str], unique: bool = False) -> Path:
-    folder_name = build_case_folder_name(state)
-    case_dir = base_out_dir / folder_name
-    if unique and case_dir.exists():
-        stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        case_dir = base_out_dir / f"{folder_name}_{stamp}"
-    case_dir.mkdir(parents=True, exist_ok=True)
-    return case_dir
-
 
 # ---------------------------------------------------------------------------
 # Autocomplete widget
@@ -3652,10 +3508,10 @@ class App:
         else:
             self.write_log("LibreOffice CLI не знайдено (для конвертацій xls/xlsx/doc/docx)")
         if IS_WINDOWS:
+            # Do not Dispatch Word at startup (slow); probe import only.
             try:
-                import win32com.client as _w32  # type: ignore
-                _w32.Dispatch("Word.Application").Quit()
-                self.write_log("Microsoft Word COM: доступний")
+                import win32com.client  # type: ignore  # noqa: F401
+                self.write_log("Microsoft Word COM: модуль доступний (перевірка при генерації)")
             except Exception:
                 self.write_log("Microsoft Word COM: недоступний")
         if not IS_WINDOWS:
