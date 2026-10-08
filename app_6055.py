@@ -774,13 +774,17 @@ def _xls_resave_via_excel_com(path: Path) -> Path:
     out = tmp_dir / f"{path.stem}_fixed.xls"
     excel = None
     wb = None
+    may_quit = False
+    prev_auto_sec = None
     try:
+        excel, may_quit = _com_office_app(win32, "Excel.Application")
+        if may_quit:
+            excel.Visible = False
+            excel.DisplayAlerts = False
         try:
-            excel = win32.DispatchEx("Excel.Application")
+            prev_auto_sec = excel.AutomationSecurity
         except Exception:
-            excel = win32.Dispatch("Excel.Application")
-        excel.Visible = False
-        excel.DisplayAlerts = False
+            prev_auto_sec = None
         try:
             excel.AutomationSecurity = 3
         except Exception:
@@ -795,11 +799,12 @@ def _xls_resave_via_excel_com(path: Path) -> Path:
                 wb.Close(SaveChanges=False)
         except Exception:
             pass
-        try:
-            if excel is not None:
-                excel.Quit()
-        except Exception:
-            pass
+        if excel is not None and prev_auto_sec is not None:
+            try:
+                excel.AutomationSecurity = prev_auto_sec
+            except Exception:
+                pass
+        _com_quit_if_owned(excel, may_quit)
     if not out.is_file():
         raise RuntimeError("Excel не зберіг тимчасову копію файлу")
     return out
@@ -1015,6 +1020,50 @@ def _com_value_needs_text_format(value: object) -> bool:
     return bool(re.fullmatch(r"[\d\s.,/:-]+", s))
 
 
+def _com_office_app(win32, prog_id: str):
+    """Return ``(app, may_quit)`` for Word/Excel COM.
+
+    Prefer ``DispatchEx`` (isolated process — always safe to Quit). If that
+    fails, ``Dispatch`` may attach to the user's already-running instance: in
+    that case set ``may_quit=False`` when documents/workbooks were already open
+    so generation never kills the user's other files.
+    """
+    try:
+        return win32.DispatchEx(prog_id), True
+    except Exception:
+        pass
+
+    preexisting = None
+    try:
+        preexisting = win32.GetActiveObject(prog_id)
+    except Exception:
+        preexisting = None
+
+    docs_before = 0
+    if preexisting is not None:
+        try:
+            if "Word" in prog_id:
+                docs_before = int(preexisting.Documents.Count)
+            else:
+                docs_before = int(preexisting.Workbooks.Count)
+        except Exception:
+            docs_before = 1  # assume shared / busy
+
+    app = win32.Dispatch(prog_id)
+    may_quit = preexisting is None or docs_before == 0
+    return app, may_quit
+
+
+def _com_quit_if_owned(app, may_quit: bool) -> None:
+    """Quit an Office app only when this process owns the instance."""
+    if app is None or not may_quit:
+        return
+    try:
+        app.Quit()
+    except Exception:
+        pass
+
+
 def write_xls_cells_excel_com(path: Path, sheet_name: str, updates: Mapping[str, object], log_fn=None) -> None:
     """Write cell values into an .xls through Microsoft Excel (COM, Windows only).
 
@@ -1027,13 +1076,17 @@ def write_xls_cells_excel_com(path: Path, sheet_name: str, updates: Mapping[str,
 
     excel = None
     wb = None
+    may_quit = False
+    prev_auto_sec = None
     try:
+        excel, may_quit = _com_office_app(win32, "Excel.Application")
+        if may_quit:
+            excel.Visible = False
+            excel.DisplayAlerts = False
         try:
-            excel = win32.DispatchEx("Excel.Application")
+            prev_auto_sec = excel.AutomationSecurity
         except Exception:
-            excel = win32.Dispatch("Excel.Application")
-        excel.Visible = False
-        excel.DisplayAlerts = False
+            prev_auto_sec = None
         try:
             excel.AutomationSecurity = 3  # msoAutomationSecurityForceDisable: never run template macros
         except Exception:
@@ -1059,11 +1112,12 @@ def write_xls_cells_excel_com(path: Path, sheet_name: str, updates: Mapping[str,
                 wb.Close(SaveChanges=False)
         except Exception:
             pass
-        try:
-            if excel is not None:
-                excel.Quit()
-        except Exception:
-            pass
+        if excel is not None and prev_auto_sec is not None:
+            try:
+                excel.AutomationSecurity = prev_auto_sec
+            except Exception:
+                pass
+        _com_quit_if_owned(excel, may_quit)
 
 
 def write_xls_cells_auto(
@@ -1271,13 +1325,17 @@ def windows_transfer_all(source_6055: Path, moto_template: Path, dogovir_templat
     import win32com.client as win32  # type: ignore
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    excel = win32.Dispatch("Excel.Application")
-    excel.Visible = False
-    excel.DisplayAlerts = False
+    excel, excel_may_quit = _com_office_app(win32, "Excel.Application")
+    word, word_may_quit = _com_office_app(win32, "Word.Application")
+    if excel_may_quit:
+        excel.Visible = False
+        excel.DisplayAlerts = False
+    if word_may_quit:
+        word.Visible = False
 
-    word = win32.Dispatch("Word.Application")
-    word.Visible = False
-
+    wb_src = None
+    wb_dst = None
+    doc = None
     try:
         wb_src = excel.Workbooks.Open(str(source_6055.resolve()))
         wb_dst = excel.Workbooks.Open(str(moto_template.resolve()))
@@ -1341,18 +1399,30 @@ def windows_transfer_all(source_6055: Path, moto_template: Path, dogovir_templat
         out_doc = out_dir / f"DOGOVIR_6055_filled_{ts}.doc"
         doc.SaveAs(str(out_doc.resolve()))
         doc.Close(SaveChanges=False)
+        doc = None
 
         wb_dst.Close(SaveChanges=False)
+        wb_dst = None
         wb_src.Close(SaveChanges=True)
+        wb_src = None
     finally:
         try:
-            excel.Quit()
+            if doc is not None:
+                doc.Close(SaveChanges=False)
         except Exception:
             pass
         try:
-            word.Quit()
+            if wb_dst is not None:
+                wb_dst.Close(SaveChanges=False)
         except Exception:
             pass
+        try:
+            if wb_src is not None:
+                wb_src.Close(SaveChanges=False)
+        except Exception:
+            pass
+        _com_quit_if_owned(excel, excel_may_quit)
+        _com_quit_if_owned(word, word_may_quit)
 
 
 FIELD_SECTIONS = [
@@ -2243,10 +2313,18 @@ def diagnose_word_template(template_path: Path, allow_com: bool = True) -> str:
     # ── COM path (Windows only, works for .doc and .docx) ───────────────────
     if IS_WINDOWS and allow_com:
         _com_word = None
+        _cdoc = None
+        _may_quit = False
+        _prev_auto_sec = None
         try:
             import win32com.client as _win32  # type: ignore
-            _com_word = _win32.Dispatch("Word.Application")
-            _com_word.Visible = False
+            _com_word, _may_quit = _com_office_app(_win32, "Word.Application")
+            if _may_quit:
+                _com_word.Visible = False
+            try:
+                _prev_auto_sec = _com_word.Application.AutomationSecurity
+            except Exception:
+                _prev_auto_sec = None
             _com_word.Application.AutomationSecurity = 3  # ForceDisable macros
             _cdoc = _com_word.Documents.Open(str(template_path.resolve()))
 
@@ -2288,16 +2366,21 @@ def diagnose_word_template(template_path: Path, allow_com: bool = True) -> str:
                 lines.append(f"VBA: {_e}")
 
             _cdoc.Close(SaveChanges=False)
-            _com_word.Application.AutomationSecurity = 1
-            _com_word.Quit()
+            _cdoc = None
         except Exception as _e:
             lines.append(f"COM помилка: {_e}")
         finally:
-            if _com_word is not None:
+            try:
+                if _cdoc is not None:
+                    _cdoc.Close(SaveChanges=False)
+            except Exception:
+                pass
+            if _com_word is not None and _prev_auto_sec is not None:
                 try:
-                    _com_word.Quit()
+                    _com_word.Application.AutomationSecurity = _prev_auto_sec
                 except Exception:
                     pass
+            _com_quit_if_owned(_com_word, _may_quit)
     elif IS_WINDOWS and not allow_com:
         lines.append("COM діагностика пропущена: інтеграція Microsoft Office вимкнена в налаштуваннях")
 
@@ -2471,14 +2554,23 @@ def generate_contract_doc_windows_from_state(
 
     word = None
     doc = None
+    may_quit = False
+    prev_auto_sec = None
     try:
         import win32com.client as win32  # type: ignore
 
-        word = win32.Dispatch("Word.Application")
-        word.Visible = False
-        word.DisplayAlerts = 0
+        # Isolated Word process when possible — never Quit a shared instance that
+        # already had the user's other documents open (Dispatch + Quit anti-pattern).
+        word, may_quit = _com_office_app(win32, "Word.Application")
+        if may_quit:
+            word.Visible = False
+            word.DisplayAlerts = 0
         # Disable macros BEFORE opening: prevents AutoOpen/AutoNew from running
         # and potentially overriding our fill or hanging on UI prompts.
+        try:
+            prev_auto_sec = word.Application.AutomationSecurity
+        except Exception:
+            prev_auto_sec = None
         word.Application.AutomationSecurity = 3  # msoAutomationSecurityForceDisable
         doc = word.Documents.Open(str(out_path.resolve()))
 
@@ -2607,10 +2699,6 @@ def generate_contract_doc_windows_from_state(
             doc.SaveAs(str(out_path.resolve()), FileFormat=0)
         doc.Close(SaveChanges=False)
         doc = None
-        try:
-            word.Application.AutomationSecurity = 1  # restore
-        except Exception:
-            pass
         return out_path
     except Exception as exc:
         raise RuntimeError(
@@ -2619,10 +2707,16 @@ def generate_contract_doc_windows_from_state(
         ) from exc
     finally:
         try:
-            if word is not None:
-                word.Quit()
+            if doc is not None:
+                doc.Close(SaveChanges=False)
         except Exception:
             pass
+        if word is not None and prev_auto_sec is not None:
+            try:
+                word.Application.AutomationSecurity = prev_auto_sec
+            except Exception:
+                pass
+        _com_quit_if_owned(word, may_quit)
 
 
 def save_text_preview(path: Path, title: str, body: str) -> Path:
@@ -4679,24 +4773,36 @@ class App:
         excel = None
         word = None
         wb_moto = None
+        doc = None
+        excel_may_quit = False
+        word_may_quit = False
+        word_was_running = False
         success = False
         try:
             import win32com.client as win32  # type: ignore
 
+            # Snapshot Word before VBA opens a contract — if the user already had
+            # Word open, we must Close only the macro document and never Quit.
             try:
-                excel = win32.DispatchEx("Excel.Application")
-            except Exception as exc_dispatch_ex:
-                self.write_log(f"Macro COM: DispatchEx(Excel.Application) не вдався: {exc_dispatch_ex}")
-                try:
-                    excel = win32.Dispatch("Excel.Application")
-                    self.write_log("Macro COM: fallback на Dispatch(Excel.Application) успішний")
-                except Exception as exc_dispatch:
-                    raise RuntimeError(
-                        "Macro COM: Excel COM недоступний. Перевірте встановлення Microsoft Excel/Office."
-                    ) from exc_dispatch
+                _w0 = win32.GetActiveObject("Word.Application")
+                word_was_running = _w0 is not None
+            except Exception:
+                word_was_running = False
 
-            excel.Visible = False
-            excel.DisplayAlerts = False
+            try:
+                excel, excel_may_quit = _com_office_app(win32, "Excel.Application")
+            except Exception as exc_dispatch:
+                raise RuntimeError(
+                    "Macro COM: Excel COM недоступний. Перевірте встановлення Microsoft Excel/Office."
+                ) from exc_dispatch
+            if not excel_may_quit:
+                self.write_log(
+                    "Macro COM: Excel уже був відкритий — закрию лише нашу книгу, без Quit()"
+                )
+
+            if excel_may_quit:
+                excel.Visible = False
+                excel.DisplayAlerts = False
             wb_moto = excel.Workbooks.Open(str(work_moto.resolve()))
             self.write_log("Macro COM: запущено Excel, відкрито 6055_MOTO_template.xls")
 
@@ -4744,24 +4850,32 @@ class App:
             else:
                 doc.SaveAs(str(out_contract.resolve()), FileFormat=0)
             doc.Close(SaveChanges=False)
+            doc = None
             self.write_log(f"Macro COM: збережено договір {out_contract}")
+            # Quit Word only if VBA started a fresh instance and nothing remains.
+            try:
+                remaining = int(word.Documents.Count)
+            except Exception:
+                remaining = 1 if word_was_running else 0
+            word_may_quit = (not word_was_running) and remaining == 0
+            if word_was_running:
+                self.write_log(
+                    "Macro COM: Word уже був відкритий — закрито лише згенерований договір, без Quit()"
+                )
             success = True
         finally:
+            try:
+                if doc is not None:
+                    doc.Close(SaveChanges=False)
+            except Exception:
+                pass
             try:
                 if wb_moto is not None:
                     wb_moto.Close(SaveChanges=False)
             except Exception:
                 pass
-            try:
-                if excel is not None:
-                    excel.Quit()
-            except Exception:
-                pass
-            try:
-                if word is not None:
-                    word.Quit()
-            except Exception:
-                pass
+            _com_quit_if_owned(excel, excel_may_quit)
+            _com_quit_if_owned(word, word_may_quit)
 
             if success:
                 shutil.rmtree(work_dir, ignore_errors=True)
